@@ -68,6 +68,8 @@ def main():
     sdf = open(glob.glob(os.path.join(src_dir, "model.sdf"))[0]).read()
     sdf = re.sub(r"<visual name=\"[^\"]+\">.*?</visual>", "\n".join(visuals), sdf, count=1, flags=re.S)
     sdf = re.sub(r'<model name="[^"]+">', f'<model name="{name}">', sdf, count=1)
+    if name.startswith("enclosure"):  # scenery only: conveyors run through the walls
+        sdf = re.sub(r"\s*<collision name=\"[^\"]+\">.*?</collision>", "", sdf, flags=re.S)
     if "<static>" not in sdf and name != "tray_rmf":
         sdf = sdf.replace(f'<model name="{name}">', f'<model name="{name}">\n        <static>true</static>', 1)
     if name == "tray_rmf" and "<inertial>" not in sdf:

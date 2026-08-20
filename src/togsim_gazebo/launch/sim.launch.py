@@ -211,6 +211,10 @@ def generate_launch_description():
             AppendEnvironmentVariable(
                 "IGN_GAZEBO_RESOURCE_PATH", PathJoinSubstitution([FindPackageShare("togsim_gazebo"), "models"])
             ),
+            # robot meshes: package://togsim_description/... becomes model://togsim_description/... inside Gazebo
+            AppendEnvironmentVariable(
+                "IGN_GAZEBO_RESOURCE_PATH", PathJoinSubstitution([FindPackageShare("togsim_description"), ".."])
+            ),
             OpaqueFunction(function=_expand_world),
             rsp,
             bridge,

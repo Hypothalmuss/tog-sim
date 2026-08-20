@@ -77,10 +77,8 @@ struct IkResult {
   Joints q{};
 };
 
-// Closed-form inverse kinematics. `seed` is used to pick the elbow configuration (when `elbow_from_seed`)
-// and to unwrap J1/J4 continuously.
-inline IkResult inverse(const TcpPose& t, const Joints& seed, const KinematicParams& p = {},
-                        bool elbow_from_seed = true) {
+// Closed-form IK for one elbow configuration (no limit fallback).
+inline IkResult inverseElbow(const TcpPose& t, const Joints& seed, const KinematicParams& p, bool right) {
   IkResult r;
   const double theta = t.tilt;
   if (theta < p.tilt_min || theta > p.tilt_max) { r.status = IkStatus::OutOfLimits; return r; }
@@ -97,8 +95,6 @@ inline IkResult inverse(const TcpPose& t, const Joints& seed, const KinematicPar
   const double c2c = std::max(-1.0, std::min(1.0, c2));
   if (c2c > 0.995) { r.status = IkStatus::Unreachable; return r; }  // near full extension: singular
   const double s2mag = std::sqrt(std::max(0.0, 1.0 - c2c * c2c));
-  bool right = p.elbow_right;
-  if (elbow_from_seed && std::fabs(seed[1]) > 1e-6) right = seed[1] >= 0.0;
   const double s2 = right ? s2mag : -s2mag;
   const double j2 = std::atan2(s2, c2c);
   const double j1 = std::atan2(py, px) - std::atan2(p.l2 * s2, p.l1 + p.l2 * c2c);
@@ -111,7 +107,7 @@ inline IkResult inverse(const TcpPose& t, const Joints& seed, const KinematicPar
   q[2] = j3;
   q[3] = unwrapNear(j4, seed[3]);
   q[4] = theta;
-  // J1 range is asymmetric (-62°..242°): if the unwrapped value is outside, try the other representative
+  // J1 range is asymmetric (-62..242 deg on the GX8): if the unwrapped value is outside, try the other representative
   if (q[0] < p.j1_min || q[0] > p.j1_max) {
     const double alt = q[0] + (q[0] < p.j1_min ? 2.0 * M_PI : -2.0 * M_PI);
     if (alt >= p.j1_min && alt <= p.j1_max) { q[3] -= (alt - q[0]); q[0] = alt; }
@@ -123,6 +119,21 @@ inline IkResult inverse(const TcpPose& t, const Joints& seed, const KinematicPar
     return r;
   }
   r.status = IkStatus::Ok;
+  return r;
+}
+
+// Closed-form inverse kinematics. The elbow configuration is taken from `seed` (when `elbow_from_seed`) or from
+// params; if that configuration violates joint limits the other elbow is tried, because the asymmetric J1 range
+// makes one side of the workspace reachable only with one elbow.
+inline IkResult inverse(const TcpPose& t, const Joints& seed, const KinematicParams& p = {},
+                        bool elbow_from_seed = true) {
+  bool right = p.elbow_right;
+  if (elbow_from_seed && std::fabs(seed[1]) > 1e-6) right = seed[1] >= 0.0;
+  IkResult r = inverseElbow(t, seed, p, right);
+  if (r.status == IkStatus::OutOfLimits) {
+    IkResult r2 = inverseElbow(t, seed, p, !right);
+    if (r2.status == IkStatus::Ok) return r2;
+  }
   return r;
 }
 

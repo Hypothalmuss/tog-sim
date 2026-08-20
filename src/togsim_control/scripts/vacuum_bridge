@@ -64,8 +64,9 @@ class VacuumBridge(Node):
         else:
             data = "off"
         self.cmd_pub.publish(String(data=data))
-        deadline = time.monotonic() + max(0.0, req.timeout_s)
-        while time.monotonic() < deadline:
+        # wait in simulation time (the seal delay is simulated; wall-clock waits break at RTF < 1)
+        t0 = self.get_clock().now()
+        while (self.get_clock().now() - t0).nanoseconds * 1e-9 < max(0.0, req.timeout_s):
             with self.lock:
                 if req.on and self.sealed:
                     break

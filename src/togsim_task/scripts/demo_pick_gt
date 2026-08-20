@@ -4,6 +4,7 @@
 Uses /world/cell/pose/info (TFMessage, world frame), the ExecuteMotion action, and the SetVacuum service.
 Perception is replaced by Gazebo truth; everything else (kinematics, Ruckig, vacuum, trays) is the real stack.
 """
+
 import math
 import threading
 import time
@@ -25,6 +26,12 @@ from togsim_msgs.srv import SetVacuum
 from togsim_task.trays import TraySpec
 
 PRODUCT_HEIGHT = {"product_bar": 0.0186, "product_carton": 0.025}
+REACH_MIN, REACH_MAX = 0.22, 0.62  # Epson GX8-C653S: 0.65 m reach minus margin; base at the world origin
+
+
+def reachable(x, y):
+    return REACH_MIN < math.hypot(x, y) < REACH_MAX
+
 PRODUCT_FITS = {"tray_2x4": ["product_carton"], "tray_bar_2x3": ["product_bar"]}
 
 
@@ -52,14 +59,15 @@ class DemoPick(Node):
         super().__init__("demo_pick_gt")
         self.declare_parameter("tray_model", "tray_2x4")
         self.declare_parameter("cycles", 20)
-        self.declare_parameter("pick_x_min", 0.15)
-        self.declare_parameter("pick_x_max", 0.55)
+        self.declare_parameter("pick_x_min", 0.10)
+        self.declare_parameter("pick_x_max", 0.50)
         self.declare_parameter("hover", 0.06)
         self.declare_parameter("belt_speed", 0.0)  # 0 = stop the belts for the static demo
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
         self.cb = ReentrantCallbackGroup()
         self.poses = {}
+        self.seen = {}
         self.lock = threading.Lock()
         self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_poses, 10, callback_group=self.cb)
         self.motion = ActionClient(self, ExecuteMotion, "/togsim/execute_motion", callback_group=self.cb)
@@ -74,6 +82,11 @@ class DemoPick(Node):
                 if n.startswith(("product_", "tray_")):
                     tr, q = t.transform.translation, t.transform.rotation
                     self.poses[n] = ((tr.x, tr.y, tr.z), yaw_of(q))
+                    self.seen[n] = time.monotonic()
+            # forget models that disappeared (despawned)
+            for n in [k for k, ts in self.seen.items() if time.monotonic() - ts > 2.0]:
+                self.poses.pop(n, None)
+                self.seen.pop(n, None)
 
     # ---------------- helpers ----------------
     def snapshot(self):
@@ -96,15 +109,24 @@ class DemoPick(Node):
         goal = ExecuteMotion.Goal()
         goal.segments = segments
         fut = self.motion.send_goal_async(goal)
+        t0 = time.monotonic()
         while not fut.done():
             time.sleep(0.002)
+            if time.monotonic() - t0 > 5.0:
+                self.get_logger().error(f"{label}: goal not accepted within 5 s")
+                return False
         gh = fut.result()
         if not gh.accepted:
             self.get_logger().error(f"{label}: goal rejected")
             return False
         rf = gh.get_result_async()
+        t0 = time.monotonic()
         while not rf.done():
             time.sleep(0.002)
+            if time.monotonic() - t0 > 30.0:
+                self.get_logger().error(f"{label}: no result within 30 s, cancelling")
+                gh.cancel_goal_async()
+                return False
         res = rf.result().result
         if not res.success:
             self.get_logger().warn(f"{label}: {res.message} (code {res.error_code})")
@@ -129,7 +151,10 @@ class DemoPick(Node):
                 if idx is not None and abs(pxyz[2] - txyz[2]) < 0.06:
                     occupied.add(idx)
         for i in range(self.tray.n_pockets):
-            if i not in occupied:
+            if i in occupied:
+                continue
+            px, py, _ = self.tray.pocket_world(txyz, tyaw, i)
+            if reachable(px, py):
                 return i
         return None
 
@@ -137,8 +162,10 @@ class DemoPick(Node):
     def run(self):
         """Indexed operation: belts run until a pickable product and a tray with a free pocket are in their windows,
         then the belts stop for the pick & place. (Continuous picking from moving belts comes with M4.)"""
+        self.get_logger().info("waiting for motion server / vacuum service ...")
         self.motion.wait_for_server()
         self.vac.wait_for_service()
+        self.get_logger().info("servers ready; homing")
         belt_speed = float(self.get_parameter("belt_speed").value) or 0.10
         hover = float(self.get_parameter("hover").value)
         xmin, xmax = self.get_parameter("pick_x_min").value, self.get_parameter("pick_x_max").value
@@ -146,16 +173,35 @@ class DemoPick(Node):
         done = 0
         t_start = None
         cycle_times = []
+        blacklist = {}  # product name -> time until which it is skipped
         self.run_motion([seg(MotionSegment.PTP_CART, 0.35, 0.0, 0.75, 0.0)], "home")
+        self.get_logger().info("home done; waiting for a product in the pick window and a tray in the place window")
         self.belts(belt_speed)
+        last_report = 0.0
         while rclpy.ok() and done < int(self.get_parameter("cycles").value):
             snap = self.snapshot()
+            now = time.monotonic()
             trays = [n for n in snap if n.startswith("tray_") and 0.05 < snap[n][0][0] < 0.55]
             trays = [n for n in trays if self.free_pocket(snap, n) is not None]
-            cands = [n for n, (p, _) in snap.items()
-                     if n.startswith("product_") and self.class_of(n) in fits
-                     and xmin < p[0] < xmax and -0.6 < p[1] < -0.1 and p[2] < 0.6]
+            cands = [
+                n
+                for n, (p, _) in snap.items()
+                if n.startswith("product_")
+                and self.class_of(n) in fits
+                and xmin < p[0] < xmax
+                and -0.6 < p[1] < -0.1
+                and p[2] < 0.6
+                and reachable(p[0], p[1])
+                and blacklist.get(n, 0.0) < now
+            ]
             if not trays or not cands:
+                if time.monotonic() - last_report > 5.0:
+                    last_report = time.monotonic()
+                    n_p = len([n for n in snap if n.startswith("product_")])
+                    n_t = len([n for n in snap if n.startswith("tray_")])
+                    self.get_logger().info(
+                        f"waiting: {n_p} products / {n_t} trays known, {len(cands)} pickable, {len(trays)} trays with free pocket in window"
+                    )
                 self.belts(belt_speed)
                 time.sleep(0.1)
                 continue
@@ -178,11 +224,13 @@ class DemoPick(Node):
                 seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top - 0.002, pyaw),
             ]
             if not self.run_motion(pick, f"pick {name}"):
+                blacklist[name] = time.monotonic() + 15.0
                 self.belts(belt_speed)
                 continue
-            r = self.vacuum(True, 0.3)
+            r = self.vacuum(True, 0.5)
             if not r.sealed:
                 self.get_logger().warn(f"no seal on {name}")
+                blacklist[name] = time.monotonic() + 15.0
                 self.vacuum(False, 0.1)
                 self.run_motion([seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top + hover, pyaw)], "retreat")
                 continue

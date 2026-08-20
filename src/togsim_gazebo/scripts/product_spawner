@@ -5,6 +5,7 @@ Talks to Gazebo through `ign service` (EntityFactory / Entity remove) and tracks
 `/world/<world>/pose/info` topic (tf2_msgs/TFMessage). Also exposes togsim_msgs/SpawnProducts and publishes
 the initial belt speeds.
 """
+
 import math
 import random
 import subprocess
@@ -70,6 +71,7 @@ class ProductSpawner(Node):
         self.counter = 0
         self.tray_counter = 0
         self.last_tray_x = None
+        self.last_tray_t = 0.0
         self.create_sub(TFMessage, f"/world/{self.world}/pose/info", self.on_poses, 10)
         self.infeed_pub = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
         self.outfeed_pub = self.create_publisher(Float64, "/togsim/conveyor/outfeed/cmd_vel", 10)
@@ -92,21 +94,42 @@ class ProductSpawner(Node):
             f"orientation: {{x: {qx:.6f}, y: {qy:.6f}, z: {qz:.6f}, w: {qw:.6f}}}}}"
         )
         cmd = [
-            "ign", "service", "-s", f"/world/{self.world}/create",
-            "--reqtype", "ignition.msgs.EntityFactory", "--reptype", "ignition.msgs.Boolean",
-            "--timeout", "2000", "--req", req,
+            "ign",
+            "service",
+            "-s",
+            f"/world/{self.world}/create",
+            "--reqtype",
+            "ignition.msgs.EntityFactory",
+            "--reptype",
+            "ignition.msgs.Boolean",
+            "--timeout",
+            "2000",
+            "--req",
+            req,
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
         ok = r.returncode == 0 and "data: true" in r.stdout
         if not ok:
             self.get_logger().warn(f"create {name} failed: {r.stdout.strip()} {r.stderr.strip()}")
+        else:
+            with self.lock:  # pose feedback lags the create call; count the new model right away
+                self.poses[name] = (x, y, z)
         return ok
 
     def ign_remove(self, name):
         cmd = [
-            "ign", "service", "-s", f"/world/{self.world}/remove",
-            "--reqtype", "ignition.msgs.Entity", "--reptype", "ignition.msgs.Boolean",
-            "--timeout", "2000", "--req", f'name: "{name}", type: MODEL',
+            "ign",
+            "service",
+            "-s",
+            f"/world/{self.world}/remove",
+            "--reqtype",
+            "ignition.msgs.Entity",
+            "--reptype",
+            "ignition.msgs.Boolean",
+            "--timeout",
+            "2000",
+            "--req",
+            f'name: "{name}", type: MODEL',
         ]
         subprocess.run(cmd, capture_output=True, text=True)
         with self.lock:
@@ -164,8 +187,11 @@ class ProductSpawner(Node):
         self.tray_counter += 1
         name = f"tray_{self.tray_counter}"
         return self.ign_create(
-            f"model://{self.cfg['trays.model']}", name, float(self.cfg["trays.spawn_x"]),
-            float(self.cfg["trays.y_center"]), float(self.cfg["belts.surface_z"]) + 0.005,
+            f"model://{self.cfg['trays.model']}",
+            name,
+            float(self.cfg["trays.spawn_x"]),
+            float(self.cfg["trays.y_center"]),
+            float(self.cfg["belts.surface_z"]) + 0.005,
         )
 
     def tick(self):
@@ -181,8 +207,10 @@ class ProductSpawner(Node):
         for n, (x, _y, z) in trays.items():
             if x > float(self.cfg["trays.despawn_x"]) or z < 0.3:
                 self.ign_remove(n)
-        # products
-        if self.cfg["products.enabled"] and now >= self.next_product_t:
+        # products: only when the spawn zone is clear (belts may be stopped by the task layer)
+        sx = float(self.cfg["products.spawn_x"])
+        zone_clear = all(abs(p[0] - sx) > 0.22 for p in products.values())
+        if self.cfg["products.enabled"] and now >= self.next_product_t and zone_clear:
             if len(products) < int(self.cfg["products.max_alive"]):
                 self.spawn_product(self.pick_class())
             self.next_product_t = now + self.product_period * random.uniform(0.6, 1.4)
@@ -190,8 +218,14 @@ class ProductSpawner(Node):
         if self.cfg["trays.enabled"] and len(trays) < int(self.cfg["trays.max_alive"]):
             xs = [p[0] for p in trays.values()]
             last_x = min(xs) if xs else float("inf")
-            if last_x - float(self.cfg["trays.spawn_x"]) >= float(self.cfg["trays.pitch"]):
-                self.spawn_tray()
+            speed = max(float(self.cfg["belts.outfeed_speed"]), 1e-3)
+            min_interval = float(self.cfg["trays.pitch"]) / speed  # one tray pitch of belt travel
+            if (
+                last_x - float(self.cfg["trays.spawn_x"]) >= float(self.cfg["trays.pitch"])
+                and now - self.last_tray_t >= min_interval
+            ):
+                if self.spawn_tray():
+                    self.last_tray_t = now
 
 
 def main():

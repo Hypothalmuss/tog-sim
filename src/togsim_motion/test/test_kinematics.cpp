@@ -72,6 +72,21 @@ TEST(Kinematics, UnreachableAndLimits) {
   EXPECT_EQ(inverse(tooTilted, Joints{}, p).status, IkStatus::OutOfLimits);
 }
 
+TEST(Kinematics, OtherElbowFallbackOnAsymmetricJ1Range) {
+  KinematicParams p;  // GX8: J1 in [-62 deg, 242 deg]
+  TcpPose t;
+  t.x = 0.15; t.y = -0.45; t.z = -0.15; t.yaw = 0.0; t.tilt = 0.0;
+  Joints rightySeed{0.0, 1.2, -0.05, 0.0, 0.0};
+  auto r = inverse(t, rightySeed, p, true);
+  ASSERT_EQ(r.status, IkStatus::Ok);
+  EXPECT_GE(r.q[0], p.j1_min);
+  EXPECT_LE(r.q[0], p.j1_max);
+  auto fk = forward(r.q, p);
+  EXPECT_NEAR(fk.x, t.x, 1e-9);
+  EXPECT_NEAR(fk.y, t.y, 1e-9);
+  EXPECT_NEAR(fk.z, t.z, 1e-9);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

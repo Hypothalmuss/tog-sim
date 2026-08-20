@@ -1,0 +1,63 @@
+<?xml version="1.0"?>
+<!--
+  tog-sim robot: Epson GX8-C653S SCARA on a pedestal + tilt module (5th axis) + OnRobot VGC10 vacuum gripper.
+  Args:
+    sim             true -> ign_ros2_control hardware + Gazebo plugins; false -> mock hardware (RViz only)
+    pedestal_height height of the robot mounting surface above the cell floor (world z = 0)
+    controllers_file ros2_control controller parameters (used by the Gazebo plugin)
+-->
+<robot name="togsim_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="sim" default="true"/>
+  <xacro:arg name="prefix" default=""/>
+  <xacro:arg name="pedestal_height" default="0.72"/>
+  <xacro:arg name="controllers_file" default="$(find togsim_control)/config/controllers.yaml"/>
+  <xacro:arg name="initial_positions_file" default="$(find togsim_description)/config/initial_positions.yaml"/>
+  <xacro:arg name="vacuum_plugin" default="true"/>
+
+  <xacro:include filename="$(find togsim_description)/urdf/epson_gx8_c653s.xacro"/>
+  <xacro:include filename="$(find togsim_description)/urdf/tilt_module.xacro"/>
+  <xacro:include filename="$(find togsim_description)/urdf/onrobot_vgc10.xacro"/>
+  <xacro:include filename="$(find togsim_description)/urdf/togsim.ros2_control.xacro"/>
+  <xacro:include filename="$(find togsim_description)/urdf/togsim.gazebo.xacro"/>
+
+  <xacro:property name="prefix" value="$(arg prefix)"/>
+  <xacro:property name="pedestal_h" value="$(arg pedestal_height)"/>
+  <xacro:property name="initial_positions" value="${xacro.load_yaml('$(arg initial_positions_file)')['initial_positions']}"/>
+
+  <link name="world"/>
+
+  <!-- pedestal: a steel column bolted to the cell floor -->
+  <joint name="${prefix}pedestal_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="world"/>
+    <child link="${prefix}pedestal"/>
+  </joint>
+  <link name="${prefix}pedestal">
+    <visual>
+      <origin xyz="0 0 ${pedestal_h/2}" rpy="0 0 0"/>
+      <geometry><box size="0.26 0.26 ${pedestal_h}"/></geometry>
+      <material name="pedestal_grey"><color rgba="0.35 0.37 0.4 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${pedestal_h/2}" rpy="0 0 0"/>
+      <geometry><box size="0.26 0.26 ${pedestal_h}"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 ${pedestal_h/2}" rpy="0 0 0"/>
+      <mass value="60"/>
+      <inertia ixx="3.0" ixy="0" ixz="0" iyy="3.0" iyz="0" izz="0.7"/>
+    </inertial>
+  </link>
+
+  <xacro:epson_gx8_c653s prefix="${prefix}" parent="${prefix}pedestal">
+    <origin xyz="0 0 ${pedestal_h}" rpy="0 0 0"/>
+  </xacro:epson_gx8_c653s>
+
+  <xacro:tilt_module prefix="${prefix}" parent="${prefix}j4_link"/>
+  <xacro:onrobot_vgc10 prefix="${prefix}" parent="${prefix}tool_mount"/>
+
+  <xacro:togsim_ros2_control prefix="${prefix}" sim="$(arg sim)" initial_positions="${initial_positions}"/>
+  <xacro:if value="$(arg sim)">
+    <xacro:togsim_gazebo prefix="${prefix}" controllers_file="$(arg controllers_file)" vacuum_plugin="$(arg vacuum_plugin)"/>
+  </xacro:if>
+</robot>

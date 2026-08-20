@@ -1,0 +1,11 @@
+# Geometric constants of the tog-sim arm (must match the xacros).
+# Frame convention: base_link at the robot mounting surface, z up.
+kinematics:
+  l1: 0.40            # J1 -> J2 horizontal offset (Epson GX8-C653S)
+  l2: 0.25            # J2 -> J3 horizontal offset
+  z_flange0: 0.299    # height of the quill tip (j4_link origin) above base_link at J3 = 0 (= 0.318 + 0.057 - 0.076)
+  tilt_pivot_drop: 0.045   # flange -> tilt axis (along -z)
+  tool_length: 0.1992      # tilt axis -> cup face along the tool axis (= 0.020 + 0.094901 + 0.0843)
+  j3_min: -0.33
+  j3_max: 0.0
+  elbow: right        # preferred configuration: 'right' (J2 >= 0) or 'left'

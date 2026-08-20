@@ -1,0 +1,4 @@
+string weights_path
+---
+bool ok
+string message

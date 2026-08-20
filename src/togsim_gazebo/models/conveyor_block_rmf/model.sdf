@@ -1,0 +1,32 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+    <model name="conveyor_block_rmf">
+        <static>true</static>
+        <link name="conveyor_block_link">
+                        <visual name="visual_0">
+                <geometry><mesh><uri>model://conveyor_block_rmf/meshes/conveyor_block_rmf_0.obj</uri></mesh></geometry>
+                <material><ambient>0.200 0.200 0.200 1.000</ambient><diffuse>0.200 0.200 0.200 1.000</diffuse><specular>0.2 0.2 0.2 1</specular></material>
+            </visual>
+            <visual name="visual_1">
+                <geometry><mesh><uri>model://conveyor_block_rmf/meshes/conveyor_block_rmf_1.obj</uri></mesh></geometry>
+                <material><ambient>0.800 0.800 0.800 0.051</ambient><diffuse>0.800 0.800 0.800 0.051</diffuse><specular>0.2 0.2 0.2 1</specular></material>
+            </visual>
+            <visual name="visual_2">
+                <geometry><mesh><uri>model://conveyor_block_rmf/meshes/conveyor_block_rmf_2.obj</uri></mesh></geometry>
+                <material><ambient>0.031 0.031 0.031 1.000</ambient><diffuse>0.031 0.031 0.031 1.000</diffuse><specular>0.2 0.2 0.2 1</specular></material>
+            </visual>
+            <visual name="visual_3">
+                <geometry><mesh><uri>model://conveyor_block_rmf/meshes/conveyor_block_rmf_3.obj</uri></mesh></geometry>
+                <material><ambient>0.020 0.020 0.020 1.000</ambient><diffuse>0.020 0.020 0.020 1.000</diffuse><specular>0.2 0.2 0.2 1</specular></material>
+            </visual>
+            <collision name="conveyor_block_collider_box">
+                <pose>0.0 0.0 0.251262 0.0 0.0 0.0</pose>
+                <geometry>
+                    <box>
+                        <size>0.501994 0.505 0.504526</size>
+                    </box>
+                </geometry>
+            </collision>
+        </link>
+    </model>
+</sdf>

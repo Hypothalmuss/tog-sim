@@ -1,0 +1,6 @@
+string class_name                  # "" = random mix
+uint16 count
+string region                      # "infeed" | "crate"
+---
+uint16 spawned
+string message

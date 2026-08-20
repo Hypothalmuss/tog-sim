@@ -1,0 +1,30 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 500  # Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    # Default: Ruckig streams joint positions at the controller rate.
+    arm_position_controller:
+      type: position_controllers/JointGroupPositionController
+
+    # Optional: classic trajectory interface (MoveIt / manual), loaded inactive.
+    arm_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+arm_position_controller:
+  ros__parameters:
+    joints: [j1_joint, j2_joint, j3_joint, j4_joint, tilt_joint]
+
+arm_trajectory_controller:
+  ros__parameters:
+    joints: [j1_joint, j2_joint, j3_joint, j4_joint, tilt_joint]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    state_publish_rate: 100.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    constraints:
+      stopped_velocity_tolerance: 0.05
+      goal_time: 0.5

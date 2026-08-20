@@ -1,0 +1,26 @@
+# build
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# data / weights (kept in ~/togsim_data)
+*.engine
+*.onnx
+*.pt
+runs/
+datasets/
+# third-party clones are vendored selectively (see scripts/fetch_assets.sh)
+third_party/*/.git/
+# misc
+*.bag
+.vscode/
+.idea/
+*.swp
+# local-only
+.secrets/
+docs/PROGRESS.md
+notes/

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Bridge between ROS (togsim_msgs/SetVacuum + VacuumState) and the togsim::VacuumGripperSystem gz plugin
+(String command/state topics relayed by ros_gz_bridge).
+
+  service  /togsim/vacuum        togsim_msgs/srv/SetVacuum  (optionally waits for the seal)
+  topic    /togsim/vacuum/state  togsim_msgs/msg/VacuumState @ plugin rate
+"""
+import threading
+import time
+
+import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from std_msgs.msg import String
+
+from togsim_msgs.msg import VacuumState
+from togsim_msgs.srv import SetVacuum
+
+
+class VacuumBridge(Node):
+    def __init__(self):
+        super().__init__("vacuum_bridge")
+        cb = ReentrantCallbackGroup()
+        self.cmd_pub = self.create_publisher(String, "/togsim/vacuum/cmd", 10)
+        self.state_pub = self.create_publisher(VacuumState, "/togsim/vacuum/state_msg", 10)
+        self.create_subscription(String, "/togsim/vacuum/state", self.on_state, 10, callback_group=cb)
+        self.create_service(SetVacuum, "/togsim/vacuum", self.on_set, callback_group=cb)
+        self.lock = threading.Lock()
+        self.commanded = False
+        self.sealed = False
+        self.model = ""
+        self.was_sealed = False
+        self.dropped = False
+        self.last_state_t = 0.0
+        self.get_logger().info("vacuum_bridge ready")
+
+    def on_state(self, msg: String):
+        fields = dict(kv.split("=", 1) for kv in msg.data.split() if "=" in kv)
+        with self.lock:
+            self.commanded = fields.get("commanded") == "1"
+            sealed = fields.get("sealed") == "1"
+            if self.commanded and self.was_sealed and not sealed:
+                self.dropped = True
+            self.was_sealed = sealed
+            self.sealed = sealed
+            self.model = "" if fields.get("model", "-") == "-" else fields["model"]
+            self.last_state_t = time.monotonic()
+        out = VacuumState()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.commanded = self.commanded
+        out.sealed = self.sealed
+        out.dropped = self.dropped
+        out.attached_model = self.model
+        out.pressure_kpa_sim = -60.0 if self.sealed else (-10.0 if self.commanded else 0.0)
+        self.state_pub.publish(out)
+
+    def on_set(self, req: SetVacuum.Request, res: SetVacuum.Response):
+        if req.on:
+            target = req.target_model.strip()
+            data = "on" if target in ("", "auto") else f"on:{target}"
+            with self.lock:
+                self.dropped = False
+        else:
+            data = "off"
+        self.cmd_pub.publish(String(data=data))
+        deadline = time.monotonic() + max(0.0, req.timeout_s)
+        while time.monotonic() < deadline:
+            with self.lock:
+                if req.on and self.sealed:
+                    break
+                if not req.on and not self.sealed:
+                    break
+            time.sleep(0.005)
+        with self.lock:
+            res.sealed = self.sealed
+            res.attached_model = self.model
+            res.success = (self.sealed if req.on else not self.sealed) if req.timeout_s > 0 else True
+            res.message = "ok" if res.success else ("no seal within timeout" if req.on else "still attached")
+        return res
+
+
+def main():
+    rclpy.init()
+    node = VacuumBridge()
+    ex = MultiThreadedExecutor(num_threads=3)
+    ex.add_node(node)
+    try:
+        ex.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

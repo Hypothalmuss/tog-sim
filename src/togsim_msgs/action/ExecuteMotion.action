@@ -1,0 +1,16 @@
+MotionSegment[] segments
+---
+uint8 SUCCESS=0
+uint8 IK_UNREACHABLE=1
+uint8 LIMITS=2
+uint8 PREEMPTED=3
+uint8 TRACKING_LOST=4
+uint8 CONTROLLER_ERROR=5
+
+bool success
+uint8 error_code
+float32 duration_s
+string message
+---
+uint8 segment_index
+float32 progress

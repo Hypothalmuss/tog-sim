@@ -1,0 +1,9 @@
+# Shared by togsim_motion (Ruckig) and the controllers.
+# Position and velocity limits: Epson GX8-C653S datasheet values (via epson-robot-ros2).
+# Acceleration / jerk: tog-sim choices (not Epson data), tuned for simulation.
+joint_limits:
+  j1_joint:   {min_position: -1.0821, max_position: 4.2237,  max_velocity: 10.053, max_acceleration: 40.0, max_jerk: 400.0}
+  j2_joint:   {min_position: -2.57,   max_position: 2.57,    max_velocity: 11.729, max_acceleration: 50.0, max_jerk: 500.0}
+  j3_joint:   {min_position: -0.33,   max_position: 0.0,     max_velocity: 2.387,  max_acceleration: 20.0, max_jerk: 300.0}
+  j4_joint:   {min_position: -6.2832, max_position: 6.2832,  max_velocity: 49.368, max_acceleration: 200.0, max_jerk: 2000.0}
+  tilt_joint: {min_position: -0.7854, max_position: 0.7854,  max_velocity: 17.45,  max_acceleration: 100.0, max_jerk: 1000.0}

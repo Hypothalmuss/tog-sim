@@ -1,0 +1,41 @@
+# Pocket trays. Units: metres. pocket (0,0) = corner at -x,-y of the tray centre; rows along +y, cols along +x.
+trays:
+  tray_2x4:
+    rows: 2
+    cols: 4
+    pitch_x: 0.090
+    pitch_y: 0.070
+    pocket_x: 0.080
+    pocket_y: 0.060
+    pocket_depth: 0.025
+    wall: 0.004
+    base_thickness: 0.004
+    margin: 0.012
+    mass: 0.25
+    label: 3
+    color: "0.86 0.83 0.76 1"
+  tray_3x5:
+    rows: 3
+    cols: 5
+    pitch_x: 0.090
+    pitch_y: 0.070
+    pocket_x: 0.080
+    pocket_y: 0.060
+    pocket_depth: 0.025
+    mass: 0.35
+    label: 3
+  # bar tray: 2 rows x 3 columns, bars lie along x (168 x 42 mm)
+  tray_bar_2x3:
+    rows: 2
+    cols: 3
+    pitch_x: 0.200
+    pitch_y: 0.065
+    pocket_x: 0.186
+    pocket_y: 0.054
+    pocket_depth: 0.025
+    wall: 0.004
+    base_thickness: 0.004
+    margin: 0.010
+    mass: 0.30
+    label: 3
+    color: "0.86 0.83 0.76 1"

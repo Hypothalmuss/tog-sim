@@ -1,0 +1,4 @@
+float32 fraction                   # 0.05..1.0
+---
+bool ok
+string message

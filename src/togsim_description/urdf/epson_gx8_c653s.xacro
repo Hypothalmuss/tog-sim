@@ -1,0 +1,139 @@
+<?xml version="1.0"?>
+<!--
+  Epson GX8-C653S SCARA as a reusable xacro macro.
+  Link/joint geometry, mesh placement and joint limits are taken from the official
+  Epson-Robots/epson-robot-ros2 package (Apache-2.0). Inertial properties are added by tog-sim
+  (estimates for simulation; not Epson data).
+  Frames: base_link at the robot mounting surface; j4_link origin is the quill tip (tool flange) at J3 = 0 (top of stroke).
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Datasheet-derived limits (epson_gx8_c653s_property.orig.xacro) -->
+  <xacro:property name="gx8_j1_min"  value="-1.08210456234225"/>
+  <xacro:property name="gx8_j1_max"  value="4.22369721593205"/>
+  <xacro:property name="gx8_j2_min"  value="-2.57"/>
+  <xacro:property name="gx8_j2_max"  value="2.57"/>
+  <xacro:property name="gx8_j3_min"  value="-0.33"/>
+  <xacro:property name="gx8_j3_max"  value="0.0"/>
+  <xacro:property name="gx8_j4_min"  value="-6.28318623410345"/>
+  <xacro:property name="gx8_j4_max"  value="6.28318623410345"/>
+  <xacro:property name="gx8_j1_vel"  value="10.0530964914873"/>
+  <xacro:property name="gx8_j2_vel"  value="11.7286133723502"/>
+  <xacro:property name="gx8_j3_vel"  value="2.38720092773437"/>
+  <xacro:property name="gx8_j4_vel"  value="49.367894529721"/>
+  <!-- Kinematic constants used by togsim_motion (keep in sync with config/kinematics.yaml) -->
+  <xacro:property name="gx8_l1"      value="0.40"/>
+  <xacro:property name="gx8_l2"      value="0.25"/>
+  <xacro:property name="gx8_z_j1"    value="0.318"/>
+  <xacro:property name="gx8_z_j2"    value="0.057"/>
+  <xacro:property name="gx8_z_j3"    value="-0.076"/>
+
+  <xacro:macro name="box_inertial" params="mass x y z *origin">
+    <inertial>
+      <xacro:insert_block name="origin"/>
+      <mass value="${mass}"/>
+      <inertia ixx="${mass/12.0*(y*y+z*z)}" ixy="0" ixz="0"
+               iyy="${mass/12.0*(x*x+z*z)}" iyz="0"
+               izz="${mass/12.0*(x*x+y*y)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="epson_gx8_c653s" params="prefix:='' parent *origin mesh_pkg:='togsim_description' effort:=1000.0">
+    <xacro:property name="M" value="package://${mesh_pkg}/meshes/epson_gx8_c653s"/>
+
+    <joint name="${prefix}base_joint" type="fixed">
+      <xacro:insert_block name="origin"/>
+      <parent link="${parent}"/>
+      <child link="${prefix}base_link"/>
+    </joint>
+
+    <link name="${prefix}base_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="1.57 0 0"/>
+        <geometry><mesh filename="${M}/base.stl" scale="0.001 0.001 0.001"/></geometry>
+        <material name="epson_white"><color rgba="0.93 0.93 0.93 1"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="1.57 0 0"/>
+        <geometry><mesh filename="${M}/base.stl" scale="0.001 0.001 0.001"/></geometry>
+      </collision>
+      <xacro:box_inertial mass="14.0" x="0.19" y="0.19" z="0.31"><origin xyz="0 0 0.155" rpy="0 0 0"/></xacro:box_inertial>
+    </link>
+
+    <joint name="${prefix}j1_joint" type="revolute">
+      <origin xyz="0 0 ${gx8_z_j1}" rpy="0 0 0"/>
+      <parent link="${prefix}base_link"/>
+      <child link="${prefix}j1_link"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${gx8_j1_min}" upper="${gx8_j1_max}" velocity="${gx8_j1_vel}" effort="${effort}"/>
+      <dynamics damping="0.5" friction="0.0"/>
+    </joint>
+    <link name="${prefix}j1_link">
+      <visual>
+        <origin xyz="0 0 -0.318" rpy="1.57 0 -1.57"/>
+        <geometry><mesh filename="${M}/j1.stl" scale="0.001 0.001 0.001"/></geometry>
+        <material name="epson_white"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 -0.318" rpy="1.57 0 -1.57"/>
+        <geometry><mesh filename="${M}/j1.stl" scale="0.001 0.001 0.001"/></geometry>
+      </collision>
+      <xacro:box_inertial mass="9.0" x="0.50" y="0.12" z="0.10"><origin xyz="0.2 0 0.02" rpy="0 0 0"/></xacro:box_inertial>
+    </link>
+
+    <joint name="${prefix}j2_joint" type="revolute">
+      <origin xyz="${gx8_l1} 0 ${gx8_z_j2}" rpy="0 0 0"/>
+      <parent link="${prefix}j1_link"/>
+      <child link="${prefix}j2_link"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${gx8_j2_min}" upper="${gx8_j2_max}" velocity="${gx8_j2_vel}" effort="${effort}"/>
+      <dynamics damping="0.3" friction="0.0"/>
+    </joint>
+    <link name="${prefix}j2_link">
+      <visual>
+        <origin xyz="-0.4 0 -0.375" rpy="1.57 0 -1.57"/>
+        <geometry><mesh filename="${M}/j2.stl" scale="0.001 0.001 0.001"/></geometry>
+        <material name="epson_white"/>
+      </visual>
+      <collision>
+        <origin xyz="-0.4 0 -0.375" rpy="1.57 0 -1.57"/>
+        <geometry><mesh filename="${M}/j2.stl" scale="0.001 0.001 0.001"/></geometry>
+      </collision>
+      <xacro:box_inertial mass="5.0" x="0.35" y="0.16" z="0.12"><origin xyz="0.12 0 0.0" rpy="0 0 0"/></xacro:box_inertial>
+    </link>
+
+    <!-- J3: vertical quill, prismatic. Epson models j3_link as a massless dummy; the quill mesh hangs on j4_link. -->
+    <joint name="${prefix}j3_joint" type="prismatic">
+      <origin xyz="${gx8_l2} 0 ${gx8_z_j3}" rpy="0 0 0"/>
+      <parent link="${prefix}j2_link"/>
+      <child link="${prefix}j3_link"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${gx8_j3_min}" upper="${gx8_j3_max}" velocity="${gx8_j3_vel}" effort="${effort}"/>
+      <dynamics damping="5.0" friction="0.0"/>
+    </joint>
+    <link name="${prefix}j3_link">
+      <xacro:box_inertial mass="0.2" x="0.04" y="0.04" z="0.04"><origin xyz="0 0 0" rpy="0 0 0"/></xacro:box_inertial>
+    </link>
+
+    <joint name="${prefix}j4_joint" type="revolute">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <parent link="${prefix}j3_link"/>
+      <child link="${prefix}j4_link"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${gx8_j4_min}" upper="${gx8_j4_max}" velocity="${gx8_j4_vel}" effort="${effort}"/>
+      <dynamics damping="0.05" friction="0.0"/>
+    </joint>
+    <link name="${prefix}j4_link">
+      <visual>
+        <origin xyz="0 -0.65 -0.299" rpy="1.57 0 0"/>
+        <geometry><mesh filename="${M}/j4.stl" scale="0.001 0.001 0.001"/></geometry>
+        <material name="epson_steel"><color rgba="0.75 0.75 0.75 1"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.27" rpy="0 0 0"/>
+        <geometry><cylinder radius="0.02" length="0.54"/></geometry>
+      </collision>
+      <xacro:box_inertial mass="1.2" x="0.04" y="0.04" z="0.54"><origin xyz="0 0 0.27" rpy="0 0 0"/></xacro:box_inertial>
+    </link>
+  </xacro:macro>
+</robot>

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="togsim_gazebo" params="prefix:='' controllers_file vacuum_plugin:=true">
+    <gazebo>
+      <plugin filename="ign_ros2_control-system" name="ign_ros2_control::IgnitionROS2ControlPlugin">
+        <parameters>${controllers_file}</parameters>
+        <controller_manager_node_name>controller_manager</controller_manager_node_name>
+      </plugin>
+      <xacro:if value="${vacuum_plugin}">
+        <!-- tog-sim vacuum gripper: dynamically welds the nearest product to the cup (see togsim_gazebo) -->
+        <plugin filename="togsim_vacuum_gripper_system" name="togsim::VacuumGripperSystem">
+          <cup_link>${prefix}vgc10_suction</cup_link>
+          <cup_collision>${prefix}vgc10_suction_collision</cup_collision>
+          <seal_delay>0.030</seal_delay>
+          <release_delay>0.020</release_delay>
+          <max_payload>1.0</max_payload>
+          <model_prefix>product_</model_prefix>
+          <cmd_topic>/togsim/vacuum/cmd</cmd_topic>
+          <state_topic>/togsim/vacuum/state</state_topic>
+        </plugin>
+      </xacro:if>
+    </gazebo>
+    <!-- the arm is position-tracked; keep it from fighting contacts with itself -->
+    <gazebo reference="${prefix}j4_link"><self_collide>false</self_collide></gazebo>
+    <gazebo reference="${prefix}vgc10_suction"><self_collide>false</self_collide></gazebo>
+  </xacro:macro>
+</robot>

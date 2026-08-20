@@ -1,0 +1,26 @@
+<?xml version="1.0" ?>
+<sdf version="1.8">
+  <model name="product_bar">
+    <link name="link">
+      <inertial>
+        <pose>0 0 0.0093 0 0 0</pose>
+        <mass>0.06</mass>
+        <inertia><ixx>1.05e-5</ixx><iyy>1.43e-4</iyy><izz>1.5e-4</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+      </inertial>
+      <visual name="visual">
+        <geometry>
+          <mesh><uri>model://product_bar/meshes/bar.obj</uri></mesh>
+        </geometry>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label">
+          <label>1</label>
+        </plugin>
+      </visual>
+      <collision name="collision">
+        <pose>0 0 0.0093 0 0 0</pose>
+        <geometry><box><size>0.168 0.042 0.0186</size></box></geometry>
+        <surface><friction><ode><mu>0.8</mu><mu2>0.8</mu2></ode></friction>
+          <contact><ode><kp>1e6</kp><kd>100</kd><min_depth>0.0005</min_depth></ode></contact></surface>
+      </collision>
+    </link>
+  </model>
+</sdf>

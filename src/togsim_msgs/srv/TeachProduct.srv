@@ -1,0 +1,6 @@
+string class_name
+string[] image_paths
+string mesh_path
+---
+bool ok
+string report

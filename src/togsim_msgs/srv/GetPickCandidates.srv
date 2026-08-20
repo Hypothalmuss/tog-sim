@@ -1,0 +1,6 @@
+builtin_interfaces/Time newer_than # block until a frame observed after this stamp is processed
+string class_filter                # "" = any
+float32 timeout_s
+---
+bool success
+PickCandidateArray candidates

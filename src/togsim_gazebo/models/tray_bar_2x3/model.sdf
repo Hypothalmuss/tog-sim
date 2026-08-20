@@ -1,0 +1,100 @@
+<?xml version="1.0" ?>
+<sdf version="1.8">
+  <model name="tray_bar_2x3">
+    <link name="link">
+      <inertial>
+        <pose>0 0 0.0145 0 0 0</pose>
+        <mass>0.3</mass>
+        <inertia><ixx>0.000584</ixx><iyy>0.009631</iyy><izz>0.010173</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+      </inertial>
+      <visual name="base_v">
+        <pose>0.0000 0.0000 0.0020 0 0 0</pose>
+        <geometry><box><size>0.6200 0.1500 0.0040</size></box></geometry>
+        <material><ambient>0.86 0.83 0.76 1</ambient><diffuse>0.86 0.83 0.76 1</diffuse></material>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label"><label>3</label></plugin>
+      </visual>
+      <collision name="base_c">
+        <pose>0.0000 0.0000 0.0020 0 0 0</pose>
+        <geometry><box><size>0.6200 0.1500 0.0040</size></box></geometry>
+        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+      </collision>
+      <visual name="wx0_v">
+        <pose>-0.3000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.0140 0.1500 0.0250</size></box></geometry>
+        <material><ambient>0.86 0.83 0.76 1</ambient><diffuse>0.86 0.83 0.76 1</diffuse></material>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label"><label>3</label></plugin>
+      </visual>
+      <collision name="wx0_c">
+        <pose>-0.3000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.0140 0.1500 0.0250</size></box></geometry>
+        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+      </collision>
+      <visual name="wx1_v">
+        <pose>-0.1000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.0140 0.1500 0.0250</size></box></geometry>
+        <material><ambient>0.86 0.83 0.76 1</ambient><diffuse>0.86 0.83 0.76 1</diffuse></material>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label"><label>3</label></plugin>
+      </visual>
+      <collision name="wx1_c">
+        <pose>-0.1000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.0140 0.1500 0.0250</size></box></geometry>
+        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+      </collision>
+      <visual name="wx2_v">
+        <pose>0.1000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.0140 0.1500 0.0250</size></box></geometry>
+        <material><ambient>0.86 0.83 0.76 1</ambient><diffuse>0.86 0.83 0.76 1</diffuse></material>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label"><label>3</label></plugin>
+      </visual>
+      <collision name="wx2_c">
+        <pose>0.1000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.0140 0.1500 0.0250</size></box></geometry>
+        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+      </collision>
+      <visual name="wx3_v">
+        <pose>0.3000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.0140 0.1500 0.0250</size></box></geometry>
+        <material><ambient>0.86 0.83 0.76 1</ambient><diffuse>0.86 0.83 0.76 1</diffuse></material>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label"><label>3</label></plugin>
+      </visual>
+      <collision name="wx3_c">
+        <pose>0.3000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.0140 0.1500 0.0250</size></box></geometry>
+        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+      </collision>
+      <visual name="wy0_v">
+        <pose>0.0000 -0.0650 0.0165 0 0 0</pose>
+        <geometry><box><size>0.6200 0.0110 0.0250</size></box></geometry>
+        <material><ambient>0.86 0.83 0.76 1</ambient><diffuse>0.86 0.83 0.76 1</diffuse></material>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label"><label>3</label></plugin>
+      </visual>
+      <collision name="wy0_c">
+        <pose>0.0000 -0.0650 0.0165 0 0 0</pose>
+        <geometry><box><size>0.6200 0.0110 0.0250</size></box></geometry>
+        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+      </collision>
+      <visual name="wy1_v">
+        <pose>0.0000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.6200 0.0110 0.0250</size></box></geometry>
+        <material><ambient>0.86 0.83 0.76 1</ambient><diffuse>0.86 0.83 0.76 1</diffuse></material>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label"><label>3</label></plugin>
+      </visual>
+      <collision name="wy1_c">
+        <pose>0.0000 0.0000 0.0165 0 0 0</pose>
+        <geometry><box><size>0.6200 0.0110 0.0250</size></box></geometry>
+        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+      </collision>
+      <visual name="wy2_v">
+        <pose>0.0000 0.0650 0.0165 0 0 0</pose>
+        <geometry><box><size>0.6200 0.0110 0.0250</size></box></geometry>
+        <material><ambient>0.86 0.83 0.76 1</ambient><diffuse>0.86 0.83 0.76 1</diffuse></material>
+        <plugin filename="ignition-gazebo-label-system" name="ignition::gazebo::systems::Label"><label>3</label></plugin>
+      </visual>
+      <collision name="wy2_c">
+        <pose>0.0000 0.0650 0.0165 0 0 0</pose>
+        <geometry><box><size>0.6200 0.0110 0.0250</size></box></geometry>
+        <surface><friction><ode><mu>0.9</mu><mu2>0.9</mu2></ode></friction></surface>
+      </collision>
+    </link>
+  </model>
+</sdf>

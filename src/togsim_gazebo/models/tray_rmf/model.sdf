@@ -1,0 +1,52 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+    <model name="tray_rmf">
+        <link name="tray_link">
+            <inertial><mass>0.4</mass><inertia><ixx>0.01</ixx><iyy>0.01</iyy><izz>0.02</izz></inertia></inertial>
+                        <visual name="visual_0">
+                <geometry><mesh><uri>model://tray_rmf/meshes/tray_rmf_0.obj</uri></mesh></geometry>
+                <material><ambient>0.016 0.016 0.016 1.000</ambient><diffuse>0.016 0.016 0.016 1.000</diffuse><specular>0.2 0.2 0.2 1</specular></material>
+            </visual>
+            <collision name="cube007_collider_box">
+                <pose>0.0 0.0 0.002951 0.0 0.0 0.0</pose>
+                <geometry>
+                    <box>
+                        <size>0.469008 0.469008 0.005902</size>
+                    </box>
+                </geometry>
+            </collision>
+            <collision name="cube007_collider_box.001">
+                <pose>0.209303 0.0 0.025803 0.0 -0.942211 0.0</pose>
+                <geometry>
+                    <box>
+                        <size>0.074084 0.469008 0.012815</size>
+                    </box>
+                </geometry>
+            </collision>
+            <collision name="cube007_collider_box.002">
+                <pose>0.0 -0.209303 0.025803 0.0 -0.942211 -1.570796</pose>
+                <geometry>
+                    <box>
+                        <size>0.074084 0.469008 0.012815</size>
+                    </box>
+                </geometry>
+            </collision>
+            <collision name="cube007_collider_box.003">
+                <pose>0.0 0.209303 0.025803 0.0 -0.942211 -4.712389</pose>
+                <geometry>
+                    <box>
+                        <size>0.074084 0.469008 0.012815</size>
+                    </box>
+                </geometry>
+            </collision>
+            <collision name="cube007_collider_box.004">
+                <pose>-0.209303 0.0 0.025803 0.0 -0.942211 -3.141593</pose>
+                <geometry>
+                    <box>
+                        <size>0.074084 0.469008 0.012815</size>
+                    </box>
+                </geometry>
+            </collision>
+        </link>
+    </model>
+</sdf>

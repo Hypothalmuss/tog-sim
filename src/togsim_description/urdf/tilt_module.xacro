@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<!--
+  tog-sim tilt module: a compact 1-DOF wrist inserted between the SCARA flange and the vacuum gripper.
+  It tilts the tool about the flange-local X axis so products can be grasped/placed at an angle
+  (the capability the tog.519 gets from its patented 5th axis).
+  Geometry: flange plate -> pivot block (pivot 0.045 m below the flange) -> tool plate (0.02 m below pivot).
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:property name="tilt_pivot_drop" value="0.045"/>
+  <xacro:property name="tilt_tool_drop"  value="0.020"/>
+
+  <xacro:macro name="tilt_module" params="prefix:='' parent tilt_limit_deg:=45 tilt_vel:=17.45 effort:=50.0">
+    <!-- static housing bolted to the flange -->
+    <joint name="${prefix}tilt_housing_joint" type="fixed">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <parent link="${parent}"/>
+      <child link="${prefix}tilt_housing"/>
+    </joint>
+    <link name="${prefix}tilt_housing">
+      <visual>
+        <origin xyz="0 0 ${-tilt_pivot_drop/2}" rpy="0 0 0"/>
+        <geometry><box size="0.07 0.05 ${tilt_pivot_drop}"/></geometry>
+        <material name="tilt_dark"><color rgba="0.2 0.2 0.22 1"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${-tilt_pivot_drop/2}" rpy="0 0 0"/>
+        <geometry><box size="0.07 0.05 ${tilt_pivot_drop}"/></geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0 0 ${-tilt_pivot_drop/2}" rpy="0 0 0"/>
+        <mass value="0.25"/>
+        <inertia ixx="1.2e-4" ixy="0" ixz="0" iyy="1.5e-4" iyz="0" izz="1.5e-4"/>
+      </inertial>
+    </link>
+
+    <!-- the tilt axis -->
+    <joint name="${prefix}tilt_joint" type="revolute">
+      <origin xyz="0 0 ${-tilt_pivot_drop}" rpy="0 0 0"/>
+      <parent link="${prefix}tilt_housing"/>
+      <child link="${prefix}tilt_link"/>
+      <axis xyz="1 0 0"/>
+      <limit lower="${-tilt_limit_deg*pi/180}" upper="${tilt_limit_deg*pi/180}" velocity="${tilt_vel}" effort="${effort}"/>
+      <dynamics damping="0.02" friction="0.0"/>
+    </joint>
+    <link name="${prefix}tilt_link">
+      <visual>
+        <origin xyz="0 0 ${-tilt_tool_drop/2}" rpy="0 0 0"/>
+        <geometry><box size="0.05 0.04 ${tilt_tool_drop}"/></geometry>
+        <material name="tilt_orange"><color rgba="0.95 0.45 0.1 1"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${-tilt_tool_drop/2}" rpy="0 0 0"/>
+        <geometry><box size="0.05 0.04 ${tilt_tool_drop}"/></geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0 0 ${-tilt_tool_drop/2}" rpy="0 0 0"/>
+        <mass value="0.15"/>
+        <inertia ixx="4e-5" ixy="0" ixz="0" iyy="5e-5" iyz="0" izz="5e-5"/>
+      </inertial>
+    </link>
+
+    <!-- tool mounting frame (z down = tool axis) -->
+    <joint name="${prefix}tool_mount_joint" type="fixed">
+      <origin xyz="0 0 ${-tilt_tool_drop}" rpy="0 0 0"/>
+      <parent link="${prefix}tilt_link"/>
+      <child link="${prefix}tool_mount"/>
+    </joint>
+    <link name="${prefix}tool_mount"/>
+  </xacro:macro>
+</robot>

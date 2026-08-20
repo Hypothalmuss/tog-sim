@@ -1,0 +1,21 @@
+motion_server:
+  ros__parameters:
+    control_rate: 500.0
+    joints: [j1_joint, j2_joint, j3_joint, j4_joint, tilt_joint]
+    command_topic: /arm_position_controller/commands
+    base_frame: base_link
+    # limits (Epson GX8-C653S datasheet for position/velocity; accel/jerk chosen for sim)
+    max_velocity:     [10.053, 11.729, 2.387, 49.368, 17.45]
+    max_acceleration: [40.0, 50.0, 20.0, 200.0, 100.0]
+    max_jerk:         [400.0, 500.0, 300.0, 2000.0, 1000.0]
+    min_position:     [-1.0821, -2.57, -0.33, -6.2832, -0.7854]
+    max_position:     [4.2237, 2.57, 0.0, 6.2832, 0.7854]
+    home: [0.0, 1.2, -0.05, 0.0, 0.0]
+    # kinematics (must match togsim_description)
+    l1: 0.40
+    l2: 0.25
+    z_flange0: 0.299
+    tilt_pivot_drop: 0.045
+    tool_length: 0.1992
+    elbow_right: true
+    settle_tolerance: 0.002

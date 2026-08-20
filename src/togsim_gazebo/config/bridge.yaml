@@ -1,0 +1,55 @@
+# ros_gz_bridge parameter_bridge configuration for the tog-sim cell
+- ros_topic_name: "/clock"
+  gz_topic_name: "/clock"
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+  gz_type_name: "ignition.msgs.Clock"
+  direction: GZ_TO_ROS
+# ground-truth poses of every model (used by the spawner and, with gt_perception:=true, by the task layer)
+- ros_topic_name: "/world/cell/pose/info"
+  gz_topic_name: "/world/cell/pose/info"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "ignition.msgs.Pose_V"
+  direction: GZ_TO_ROS
+# conveyors
+- ros_topic_name: "/togsim/conveyor/infeed/cmd_vel"
+  gz_topic_name: "/togsim/conveyor/infeed/cmd_vel"
+  ros_type_name: "std_msgs/msg/Float64"
+  gz_type_name: "ignition.msgs.Double"
+  direction: ROS_TO_GZ
+- ros_topic_name: "/togsim/conveyor/infeed/state"
+  gz_topic_name: "/togsim/conveyor/infeed/state"
+  ros_type_name: "std_msgs/msg/Float64"
+  gz_type_name: "ignition.msgs.Double"
+  direction: GZ_TO_ROS
+- ros_topic_name: "/togsim/conveyor/outfeed/cmd_vel"
+  gz_topic_name: "/togsim/conveyor/outfeed/cmd_vel"
+  ros_type_name: "std_msgs/msg/Float64"
+  gz_type_name: "ignition.msgs.Double"
+  direction: ROS_TO_GZ
+- ros_topic_name: "/togsim/conveyor/outfeed/state"
+  gz_topic_name: "/togsim/conveyor/outfeed/state"
+  ros_type_name: "std_msgs/msg/Float64"
+  gz_type_name: "ignition.msgs.Double"
+  direction: GZ_TO_ROS
+# vacuum gripper
+- ros_topic_name: "/togsim/vacuum/cmd"
+  gz_topic_name: "/togsim/vacuum/cmd"
+  ros_type_name: "std_msgs/msg/String"
+  gz_type_name: "ignition.msgs.StringMsg"
+  direction: ROS_TO_GZ
+- ros_topic_name: "/togsim/vacuum/state"
+  gz_topic_name: "/togsim/vacuum/state"
+  ros_type_name: "std_msgs/msg/String"
+  gz_type_name: "ignition.msgs.StringMsg"
+  direction: GZ_TO_ROS
+# cameras: camera_info here, images through ros_gz_image (see launch)
+- ros_topic_name: "/cam_pick/camera_info"
+  gz_topic_name: "/cam_pick/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "ignition.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+- ros_topic_name: "/cam_place/camera_info"
+  gz_topic_name: "/cam_place/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "ignition.msgs.CameraInfo"
+  direction: GZ_TO_ROS

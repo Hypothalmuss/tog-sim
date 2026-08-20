@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- 5 actuated joints: Epson J1..J4 + tog-sim tilt axis. Position command, position+velocity state. -->
+  <xacro:macro name="togsim_ros2_control" params="prefix:='' sim:=true initial_positions">
+    <ros2_control name="togsim_arm" type="system">
+      <hardware>
+        <xacro:if value="${sim}">
+          <plugin>ign_ros2_control/IgnitionSystem</plugin>
+        </xacro:if>
+        <xacro:unless value="${sim}">
+          <plugin>mock_components/GenericSystem</plugin>
+          <param name="calculate_dynamics">true</param>
+        </xacro:unless>
+      </hardware>
+      <xacro:macro name="ctrl_joint" params="name init">
+        <joint name="${name}">
+          <command_interface name="position"/>
+          <state_interface name="position"><param name="initial_value">${init}</param></state_interface>
+          <state_interface name="velocity"/>
+        </joint>
+      </xacro:macro>
+      <xacro:ctrl_joint name="${prefix}j1_joint"   init="${initial_positions['j1_joint']}"/>
+      <xacro:ctrl_joint name="${prefix}j2_joint"   init="${initial_positions['j2_joint']}"/>
+      <xacro:ctrl_joint name="${prefix}j3_joint"   init="${initial_positions['j3_joint']}"/>
+      <xacro:ctrl_joint name="${prefix}j4_joint"   init="${initial_positions['j4_joint']}"/>
+      <xacro:ctrl_joint name="${prefix}tilt_joint" init="${initial_positions['tilt_joint']}"/>
+    </ros2_control>
+  </xacro:macro>
+</robot>

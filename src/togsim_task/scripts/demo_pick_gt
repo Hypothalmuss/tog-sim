@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""M2 closed-loop demo using GROUND-TRUTH poses: pick products from the infeed belt and place them into tray pockets.
+
+Uses /world/cell/pose/info (TFMessage, world frame), the ExecuteMotion action, and the SetVacuum service.
+Perception is replaced by Gazebo truth; everything else (kinematics, Ruckig, vacuum, trays) is the real stack.
+"""
+import math
+import threading
+import time
+
+import rclpy
+import yaml
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import PoseStamped
+from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from std_msgs.msg import Float64
+from tf2_msgs.msg import TFMessage
+
+from togsim_msgs.action import ExecuteMotion
+from togsim_msgs.msg import MotionSegment
+from togsim_msgs.srv import SetVacuum
+from togsim_task.trays import TraySpec
+
+PRODUCT_HEIGHT = {"product_bar": 0.0186, "product_carton": 0.025}
+PRODUCT_FITS = {"tray_2x4": ["product_carton"], "tray_bar_2x3": ["product_bar"]}
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0, frame="world", scale=0.0):
+    s = MotionSegment()
+    s.type = type_
+    s.pose = PoseStamped()
+    s.pose.header.frame_id = frame
+    s.pose.pose.position.x, s.pose.pose.position.y, s.pose.pose.position.z = float(x), float(y), float(z)
+    s.pose.pose.orientation.z = math.sin(yaw / 2)
+    s.pose.pose.orientation.w = math.cos(yaw / 2)
+    s.tilt_deg = float(tilt)
+    s.via_speed_mps = float(via_speed)
+    s.dwell_s = float(dwell)
+    s.velocity_scale = float(scale)
+    return s
+
+
+class DemoPick(Node):
+    def __init__(self):
+        super().__init__("demo_pick_gt")
+        self.declare_parameter("tray_model", "tray_2x4")
+        self.declare_parameter("cycles", 20)
+        self.declare_parameter("pick_x_min", 0.15)
+        self.declare_parameter("pick_x_max", 0.55)
+        self.declare_parameter("hover", 0.06)
+        self.declare_parameter("belt_speed", 0.0)  # 0 = stop the belts for the static demo
+        cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
+        self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
+        self.cb = ReentrantCallbackGroup()
+        self.poses = {}
+        self.lock = threading.Lock()
+        self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_poses, 10, callback_group=self.cb)
+        self.motion = ActionClient(self, ExecuteMotion, "/togsim/execute_motion", callback_group=self.cb)
+        self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
+        self.infeed = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
+        self.outfeed = self.create_publisher(Float64, "/togsim/conveyor/outfeed/cmd_vel", 10)
+
+    def on_poses(self, msg):
+        with self.lock:
+            for t in msg.transforms:
+                n = t.child_frame_id
+                if n.startswith(("product_", "tray_")):
+                    tr, q = t.transform.translation, t.transform.rotation
+                    self.poses[n] = ((tr.x, tr.y, tr.z), yaw_of(q))
+
+    # ---------------- helpers ----------------
+    def snapshot(self):
+        with self.lock:
+            return dict(self.poses)
+
+    @staticmethod
+    def class_of(name):
+        """product_<class>_<n> -> product_<class>"""
+        parts = name.split("_")
+        return f"product_{parts[1]}" if len(parts) >= 3 else None
+
+    def belts(self, speed):
+        for _ in range(2):
+            self.infeed.publish(Float64(data=float(speed)))
+            self.outfeed.publish(Float64(data=float(speed)))
+            time.sleep(0.05)
+
+    def run_motion(self, segments, label):
+        goal = ExecuteMotion.Goal()
+        goal.segments = segments
+        fut = self.motion.send_goal_async(goal)
+        while not fut.done():
+            time.sleep(0.002)
+        gh = fut.result()
+        if not gh.accepted:
+            self.get_logger().error(f"{label}: goal rejected")
+            return False
+        rf = gh.get_result_async()
+        while not rf.done():
+            time.sleep(0.002)
+        res = rf.result().result
+        if not res.success:
+            self.get_logger().warn(f"{label}: {res.message} (code {res.error_code})")
+        return res.success
+
+    def vacuum(self, on, timeout=0.25):
+        req = SetVacuum.Request()
+        req.on = on
+        req.target_model = "auto"
+        req.timeout_s = float(timeout)
+        fut = self.vac.call_async(req)
+        while not fut.done():
+            time.sleep(0.002)
+        return fut.result()
+
+    def free_pocket(self, snap, tray_name):
+        (txyz, tyaw) = snap[tray_name]
+        occupied = set()
+        for n, (pxyz, _) in snap.items():
+            if n.startswith("product_"):
+                idx = self.tray.pocket_of_point(txyz, tyaw, pxyz[0], pxyz[1])
+                if idx is not None and abs(pxyz[2] - txyz[2]) < 0.06:
+                    occupied.add(idx)
+        for i in range(self.tray.n_pockets):
+            if i not in occupied:
+                return i
+        return None
+
+    # ---------------- main loop ----------------
+    def run(self):
+        """Indexed operation: belts run until a pickable product and a tray with a free pocket are in their windows,
+        then the belts stop for the pick & place. (Continuous picking from moving belts comes with M4.)"""
+        self.motion.wait_for_server()
+        self.vac.wait_for_service()
+        belt_speed = float(self.get_parameter("belt_speed").value) or 0.10
+        hover = float(self.get_parameter("hover").value)
+        xmin, xmax = self.get_parameter("pick_x_min").value, self.get_parameter("pick_x_max").value
+        fits = PRODUCT_FITS[self.tray.name]
+        done = 0
+        t_start = None
+        cycle_times = []
+        self.run_motion([seg(MotionSegment.PTP_CART, 0.35, 0.0, 0.75, 0.0)], "home")
+        self.belts(belt_speed)
+        while rclpy.ok() and done < int(self.get_parameter("cycles").value):
+            snap = self.snapshot()
+            trays = [n for n in snap if n.startswith("tray_") and 0.05 < snap[n][0][0] < 0.55]
+            trays = [n for n in trays if self.free_pocket(snap, n) is not None]
+            cands = [n for n, (p, _) in snap.items()
+                     if n.startswith("product_") and self.class_of(n) in fits
+                     and xmin < p[0] < xmax and -0.6 < p[1] < -0.1 and p[2] < 0.6]
+            if not trays or not cands:
+                self.belts(belt_speed)
+                time.sleep(0.1)
+                continue
+            self.belts(0.0)
+            time.sleep(0.25)  # let things settle
+            snap = self.snapshot()
+            tray_name = trays[0]
+            pocket = self.free_pocket(snap, tray_name)
+            name = max(cands, key=lambda n: snap[n][0][0])
+            if name not in snap or pocket is None:
+                continue
+            (pxyz, pyaw) = snap[name]
+            h = PRODUCT_HEIGHT[self.class_of(name)]
+            top = pxyz[2] + h
+            if t_start is None:
+                t_start = time.monotonic()
+            tc = time.monotonic()
+            pick = [
+                seg(MotionSegment.VIA_CART, pxyz[0], pxyz[1], top + hover, pyaw, via_speed=0.5),
+                seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top - 0.002, pyaw),
+            ]
+            if not self.run_motion(pick, f"pick {name}"):
+                self.belts(belt_speed)
+                continue
+            r = self.vacuum(True, 0.3)
+            if not r.sealed:
+                self.get_logger().warn(f"no seal on {name}")
+                self.vacuum(False, 0.1)
+                self.run_motion([seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top + hover, pyaw)], "retreat")
+                continue
+            (txyz, tyaw) = self.snapshot()[tray_name]
+            px, py, zf = self.tray.pocket_world(txyz, tyaw, pocket)
+            place_z = zf + h + 0.004
+            place = [
+                seg(MotionSegment.VIA_CART, pxyz[0], pxyz[1], top + hover, pyaw, via_speed=0.5),
+                seg(MotionSegment.VIA_CART, px, py, place_z + hover, tyaw, via_speed=0.5),
+                seg(MotionSegment.PTP_CART, px, py, place_z, tyaw),
+            ]
+            ok = self.run_motion(place, f"place {name} -> {tray_name}[{pocket}]")
+            self.vacuum(False, 0.1)
+            self.run_motion([seg(MotionSegment.VIA_CART, px, py, place_z + hover, tyaw, via_speed=0.5)], "lift")
+            if ok:
+                done += 1
+                cycle_times.append(time.monotonic() - tc)
+                el = time.monotonic() - t_start
+                self.get_logger().info(
+                    f"cycle {done}: {cycle_times[-1]:.2f} s  |  {60.0 * done / el:.1f} cycles/min incl. indexing  "
+                    f"| mean motion cycle {sum(cycle_times) / len(cycle_times):.2f} s"
+                )
+        self.belts(belt_speed)
+        self.get_logger().info("demo finished")
+
+
+def main():
+    rclpy.init()
+    node = DemoPick()
+    ex = MultiThreadedExecutor(num_threads=4)
+    ex.add_node(node)
+    th = threading.Thread(target=ex.spin, daemon=True)
+    th.start()
+    try:
+        node.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

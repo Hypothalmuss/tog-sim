@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Spawns products on the infeed belt and trays on the outfeed belt, recycles them at the belt end.
+
+Talks to Gazebo through `ign service` (EntityFactory / Entity remove) and tracks poses from the bridged
+`/world/<world>/pose/info` topic (tf2_msgs/TFMessage). Also exposes togsim_msgs/SpawnProducts and publishes
+the initial belt speeds.
+"""
+import math
+import random
+import subprocess
+import threading
+import time
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64
+from tf2_msgs.msg import TFMessage
+
+from togsim_msgs.srv import SpawnProducts
+
+
+def quat_from_rpy(roll, pitch, yaw):
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+class ProductSpawner(Node):
+    def __init__(self):
+        super().__init__("product_spawner")
+        p = self.declare_parameters(
+            "",
+            [
+                ("world", "cell"),
+                ("seed", 0),
+                ("products.enabled", True),
+                ("products.classes", ["product_bar", "product_carton"]),
+                ("products.class_weights", [0.7, 0.3]),
+                ("products.rate_per_min", 30.0),
+                ("products.max_alive", 12),
+                ("products.spawn_x", -1.05),
+                ("products.y_center", -0.35),
+                ("products.y_spread", 0.12),
+                ("products.drop_height", 0.56),
+                ("products.lean_fraction", 0.2),
+                ("products.despawn_x", 1.15),
+                ("trays.enabled", True),
+                ("trays.model", "tray_2x4"),
+                ("trays.spawn_x", -1.05),
+                ("trays.y_center", 0.35),
+                ("trays.pitch", 0.55),
+                ("trays.despawn_x", 1.15),
+                ("trays.max_alive", 5),
+                ("belts.infeed_speed", 0.10),
+                ("belts.outfeed_speed", 0.08),
+                ("belts.surface_z", 0.52),
+            ],
+        )
+        self.cfg = {d.name: d.value for d in p}
+        random.seed(int(self.cfg["seed"]))
+        self.world = self.cfg["world"]
+        self.poses = {}  # name -> (x, y, z)
+        self.lock = threading.Lock()
+        self.counter = 0
+        self.tray_counter = 0
+        self.last_tray_x = None
+        self.create_sub(TFMessage, f"/world/{self.world}/pose/info", self.on_poses, 10)
+        self.infeed_pub = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
+        self.outfeed_pub = self.create_publisher(Float64, "/togsim/conveyor/outfeed/cmd_vel", 10)
+        self.create_service(SpawnProducts, "/togsim/spawn_products", self.on_spawn_srv)
+        self.product_period = 60.0 / max(self.cfg["products.rate_per_min"], 1e-3)
+        self.next_product_t = time.monotonic() + 2.0
+        self.timer = self.create_timer(0.2, self.tick)
+        self.belt_timer = self.create_timer(1.0, self.publish_belts)
+        self.get_logger().info("product_spawner ready")
+
+    def create_sub(self, *a):
+        return self.create_subscription(*a)
+
+    # ---------------- Gazebo helpers ----------------
+    def ign_create(self, model_uri, name, x, y, z, roll=0.0, pitch=0.0, yaw=0.0):
+        qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
+        req = (
+            f'sdf_filename: "{model_uri}", name: "{name}", allow_renaming: false, '
+            f"pose: {{position: {{x: {x:.4f}, y: {y:.4f}, z: {z:.4f}}}, "
+            f"orientation: {{x: {qx:.6f}, y: {qy:.6f}, z: {qz:.6f}, w: {qw:.6f}}}}}"
+        )
+        cmd = [
+            "ign", "service", "-s", f"/world/{self.world}/create",
+            "--reqtype", "ignition.msgs.EntityFactory", "--reptype", "ignition.msgs.Boolean",
+            "--timeout", "2000", "--req", req,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        ok = r.returncode == 0 and "data: true" in r.stdout
+        if not ok:
+            self.get_logger().warn(f"create {name} failed: {r.stdout.strip()} {r.stderr.strip()}")
+        return ok
+
+    def ign_remove(self, name):
+        cmd = [
+            "ign", "service", "-s", f"/world/{self.world}/remove",
+            "--reqtype", "ignition.msgs.Entity", "--reptype", "ignition.msgs.Boolean",
+            "--timeout", "2000", "--req", f'name: "{name}", type: MODEL',
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+        with self.lock:
+            self.poses.pop(name, None)
+
+    # ---------------- callbacks ----------------
+    def on_poses(self, msg: TFMessage):
+        with self.lock:
+            for t in msg.transforms:
+                n = t.child_frame_id
+                if n.startswith("product_") or n.startswith("tray_"):
+                    tr = t.transform.translation
+                    self.poses[n] = (tr.x, tr.y, tr.z)
+
+    def publish_belts(self):
+        self.infeed_pub.publish(Float64(data=float(self.cfg["belts.infeed_speed"])))
+        self.outfeed_pub.publish(Float64(data=float(self.cfg["belts.outfeed_speed"])))
+
+    def on_spawn_srv(self, req, res):
+        n = 0
+        for _ in range(req.count):
+            cls = req.class_name if req.class_name else self.pick_class()
+            if self.spawn_product(cls, crate=(req.region == "crate")):
+                n += 1
+        res.spawned = n
+        res.message = f"spawned {n}"
+        return res
+
+    # ---------------- spawning logic ----------------
+    def pick_class(self):
+        classes = list(self.cfg["products.classes"])
+        weights = list(self.cfg["products.class_weights"])
+        return random.choices(classes, weights=weights[: len(classes)] or None)[0]
+
+    def spawn_product(self, cls, crate=False):
+        self.counter += 1
+        name = f"product_{cls.replace('product_', '')}_{self.counter}"  # class is recoverable from the name
+        x = float(self.cfg["products.spawn_x"]) + random.uniform(-0.04, 0.04)
+        y = float(self.cfg["products.y_center"]) + random.uniform(-1, 1) * float(self.cfg["products.y_spread"])
+        z = float(self.cfg["products.drop_height"])
+        yaw = random.uniform(-math.pi, math.pi)
+        roll = pitch = 0.0
+        if random.random() < float(self.cfg["products.lean_fraction"]):
+            # leaning / overlapping: drop from higher with a small tilt so it may land on a neighbour
+            roll = random.uniform(-0.4, 0.4)
+            pitch = random.uniform(-0.4, 0.4)
+            z += 0.05
+        if crate:
+            x = 0.0
+            y = -0.8
+            z = 0.9
+        return self.ign_create(f"model://{cls}", name, x, y, z, roll, pitch, yaw)
+
+    def spawn_tray(self):
+        self.tray_counter += 1
+        name = f"tray_{self.tray_counter}"
+        return self.ign_create(
+            f"model://{self.cfg['trays.model']}", name, float(self.cfg["trays.spawn_x"]),
+            float(self.cfg["trays.y_center"]), float(self.cfg["belts.surface_z"]) + 0.005,
+        )
+
+    def tick(self):
+        now = time.monotonic()
+        with self.lock:
+            snapshot = dict(self.poses)
+        products = {n: p for n, p in snapshot.items() if n.startswith("product_")}
+        trays = {n: p for n, p in snapshot.items() if n.startswith("tray_")}
+        # recycle objects that left the belts (or fell off)
+        for n, (x, _y, z) in products.items():
+            if x > float(self.cfg["products.despawn_x"]) or z < 0.3:
+                self.ign_remove(n)
+        for n, (x, _y, z) in trays.items():
+            if x > float(self.cfg["trays.despawn_x"]) or z < 0.3:
+                self.ign_remove(n)
+        # products
+        if self.cfg["products.enabled"] and now >= self.next_product_t:
+            if len(products) < int(self.cfg["products.max_alive"]):
+                self.spawn_product(self.pick_class())
+            self.next_product_t = now + self.product_period * random.uniform(0.6, 1.4)
+        # trays: keep a constant pitch along the outfeed
+        if self.cfg["trays.enabled"] and len(trays) < int(self.cfg["trays.max_alive"]):
+            xs = [p[0] for p in trays.values()]
+            last_x = min(xs) if xs else float("inf")
+            if last_x - float(self.cfg["trays.spawn_x"]) >= float(self.cfg["trays.pitch"]):
+                self.spawn_tray()
+
+
+def main():
+    rclpy.init()
+    node = ProductSpawner()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

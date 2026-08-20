@@ -1,0 +1,37 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.10" }
+      - run: pip install ruff==0.6.9
+      - run: ruff check . && ruff format --check .
+  build-and-test:
+    runs-on: ubuntu-22.04
+    container: osrf/ros:humble-desktop
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        shell: bash
+        run: |
+          apt-get update
+          rosdep update --rosdistro humble || true
+          rosdep install --from-paths . --ignore-src -y --rosdistro humble \
+            --skip-keys "ign_ros2_control ros_gz_bridge ros_gz_sim ignition-gazebo6 ultralytics torch"
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build --event-handlers console_cohesion+ --cmake-args -DCMAKE_BUILD_TYPE=Release \
+            --packages-skip togsim_gazebo
+      - name: Test
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash && source install/setup.bash
+          colcon test --event-handlers console_cohesion+ --packages-skip togsim_gazebo
+          colcon test-result --verbose

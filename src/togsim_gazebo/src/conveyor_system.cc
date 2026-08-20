@@ -1,9 +1,11 @@
 // tog-sim ConveyorSystem — a deterministic conveyor belt for Gazebo Fortress.
 //
 // Attach to a STATIC belt model. Every dynamic model whose origin lies inside the belt footprint and within
-// <capture_height> above the belt surface is carried along <direction> at the commanded speed (x/y velocity is
-// imposed, the vertical velocity is passed through so objects can still settle or fall). Models currently held by a
-// DetachableJoint (e.g. the vacuum gripper) are ignored. The commanded speed is ramped with <max_acceleration>.
+// <capture_height> above the belt surface is driven along <direction> towards the commanded speed by a horizontal
+// force F = m * clamp(gain * (v_belt - v_xy), +-max_drive_accel) applied to its canonical link. Using a force (not a
+// velocity override) keeps the contact solver fully in charge, so bodies still settle, stack and get blocked
+// physically. Models currently held by a DetachableJoint (vacuum gripper) are ignored. The commanded speed is ramped
+// with <max_acceleration>.
 //
 // Why not TrackController: on Fortress/DART 6.12 the contact-surface-velocity mechanism does not move objects
 // reliably (verified with the stock conveyor.sdf example); a kinematic belt link is not supported by DART here either.
@@ -15,7 +17,9 @@
 //   <direction>         travel direction in the belt link frame (default 1 0 0)
 //   <capture_height>    band above the surface in which models are carried (default 0.08)
 //   <initial_velocity>  m/s (default 0)
-//   <max_acceleration>  m/s^2 ramp (default 2.0)
+//   <max_acceleration>  m/s^2 ramp of the belt speed (default 2.0)
+//   <drive_gain>        1/s, velocity-error gain of the drive force (default 40)
+//   <max_drive_accel>   m/s^2 cap of the drive acceleration (default 6 ~ mu 0.6; make the belt collision itself nearly frictionless)
 //   <cmd_topic>         ignition.msgs.Double (default /model/<model>/conveyor/cmd_vel)
 //   <state_topic>       ignition.msgs.Double, actual belt speed @ 50 Hz (default /model/<model>/conveyor/state)
 //   <model_prefix>      only carry models whose name starts with this (default "" = any dynamic model)
@@ -24,12 +28,14 @@
 #include <ignition/gazebo/System.hh>
 #include <ignition/gazebo/Util.hh>
 #include <ignition/gazebo/components/DetachableJoint.hh>
-#include <ignition/gazebo/components/LinearVelocityCmd.hh>
+#include <ignition/gazebo/components/ExternalWorldWrenchCmd.hh>
+#include <ignition/gazebo/components/Inertial.hh>
 #include <ignition/gazebo/components/Model.hh>
 #include <ignition/gazebo/components/Name.hh>
 #include <ignition/gazebo/components/ParentEntity.hh>
 #include <ignition/gazebo/components/Pose.hh>
 #include <ignition/gazebo/components/Static.hh>
+#include <ignition/msgs/Utility.hh>
 #include <ignition/msgs/double.pb.h>
 #include <ignition/plugin/Register.hh>
 #include <ignition/transport/Node.hh>
@@ -68,6 +74,8 @@ class ConveyorSystem : public gz::System, public gz::ISystemConfigure, public gz
     captureHeight_ = sdf->Get<double>("capture_height", 0.08).first;
     targetVel_ = sdf->Get<double>("initial_velocity", 0.0).first;
     maxAccel_ = sdf->Get<double>("max_acceleration", 2.0).first;
+    driveGain_ = sdf->Get<double>("drive_gain", 40.0).first;
+    maxDriveAccel_ = sdf->Get<double>("max_drive_accel", 6.0).first;
     modelPrefix_ = sdf->Get<std::string>("model_prefix", "").first;
     const std::string cmdTopic = sdf->Get<std::string>("cmd_topic", "/model/" + modelName + "/conveyor/cmd_vel").first;
     const std::string stateTopic =
@@ -131,22 +139,37 @@ class ConveyorSystem : public gz::System, public gz::ISystemConfigure, public gz
           gz::Entity canonical = m.CanonicalLink(ecm);
           gz::Link link(canonical);
           link.EnableVelocityChecks(ecm, true);
-          double vz = 0.0;
-          if (auto wv = link.WorldLinearVelocity(ecm)) vz = wv->Z();
-          ignition::math::Vector3d cmdWorld(vWorld.X(), vWorld.Y(), vz);
-          // LinearVelocityCmd on a model is expressed in the model frame
-          ignition::math::Vector3d cmdLocal = mp.Rot().RotateVectorReverse(cmdWorld);
-          auto comp = ecm.Component<gz::components::LinearVelocityCmd>(e);
-          if (comp)
-            comp->Data() = cmdLocal;
-          else
-            ecm.CreateComponent(e, gz::components::LinearVelocityCmd(cmdLocal));
+          ignition::math::Vector3d v(0, 0, 0);
+          if (auto wv = link.WorldLinearVelocity(ecm)) v = *wv;
+          double mass = 0.1;
+          if (auto in = ecm.Component<gz::components::Inertial>(canonical)) mass = in->Data().MassMatrix().Mass();
+          // velocity error in the belt plane
+          ignition::math::Vector3d dv = vWorld - v;
+          dv.Z(0.0);
+          ignition::math::Vector3d accel = dv * driveGain_;
+          if (accel.Length() > maxDriveAccel_) accel = accel.Normalized() * maxDriveAccel_;
+          ignition::math::Vector3d force = accel * mass;
+          auto wrench = ecm.Component<gz::components::ExternalWorldWrenchCmd>(canonical);
+          if (!wrench) {
+            gz::components::ExternalWorldWrenchCmd w;
+            ecm.CreateComponent(canonical, w);
+            wrench = ecm.Component<gz::components::ExternalWorldWrenchCmd>(canonical);
+          }
+          ignition::msgs::Set(wrench->Data().mutable_force(), force);
+          ignition::msgs::Set(wrench->Data().mutable_torque(), ignition::math::Vector3d::Zero);
           return true;
         });
 
-    // release models that left the belt so normal dynamics resume
+    // bodies that left the belt: stop driving them
     for (auto e : carried_) {
-      if (!onBelt.count(e) && ecm.HasEntity(e)) ecm.RemoveComponent<gz::components::LinearVelocityCmd>(e);
+      if (!onBelt.count(e) && ecm.HasEntity(e)) {
+        gz::Model m(e);
+        gz::Entity canonical = m.CanonicalLink(ecm);
+        if (auto w = ecm.Component<gz::components::ExternalWorldWrenchCmd>(canonical)) {
+          ignition::msgs::Set(w->Data().mutable_force(), ignition::math::Vector3d::Zero);
+          ignition::msgs::Set(w->Data().mutable_torque(), ignition::math::Vector3d::Zero);
+        }
+      }
     }
     carried_.swap(onBelt);
   }
@@ -162,7 +185,7 @@ class ConveyorSystem : public gz::System, public gz::ISystemConfigure, public gz
   std::string beltLinkName_, modelPrefix_;
   double halfLen_{1.0}, halfWid_{0.25}, captureHeight_{0.08};
   ignition::math::Vector3d offset_{0, 0, 0}, dir_{1, 0, 0};
-  double targetVel_{0.0}, currentVel_{0.0}, maxAccel_{2.0};
+  double targetVel_{0.0}, currentVel_{0.0}, maxAccel_{2.0}, driveGain_{40.0}, maxDriveAccel_{8.0};
   bool valid_{false};
   std::mutex mutex_;
   ignition::transport::Node node_;

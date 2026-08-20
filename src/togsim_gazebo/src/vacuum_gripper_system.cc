@@ -15,13 +15,21 @@
 #include <ignition/gazebo/System.hh>
 #include <ignition/gazebo/Util.hh>
 #include <ignition/gazebo/components/Collision.hh>
+#include <ignition/gazebo/components/Geometry.hh>
 #include <ignition/gazebo/components/ContactSensorData.hh>
 #include <ignition/gazebo/components/DetachableJoint.hh>
 #include <ignition/gazebo/components/Inertial.hh>
+#include <ignition/gazebo/components/Joint.hh>
+#include <ignition/gazebo/components/JointForceCmd.hh>
+#include <ignition/gazebo/components/JointPosition.hh>
+#include <ignition/gazebo/components/JointVelocity.hh>
 #include <ignition/gazebo/components/Link.hh>
 #include <ignition/gazebo/components/Model.hh>
 #include <ignition/gazebo/components/Name.hh>
 #include <ignition/gazebo/components/ParentEntity.hh>
+#include <ignition/gazebo/components/Pose.hh>
+#include <ignition/gazebo/components/PoseCmd.hh>
+#include <sdf/Box.hh>
 #include <ignition/msgs/stringmsg.pb.h>
 #include <ignition/plugin/Register.hh>
 #include <ignition/transport/Node.hh>
@@ -47,6 +55,13 @@ class VacuumGripperSystem : public gz::System,
     sealDelay_ = sdf->Get<double>("seal_delay", 0.03).first;
     releaseDelay_ = sdf->Get<double>("release_delay", 0.02).first;
     maxPayload_ = sdf->Get<double>("max_payload", 1.0).first;
+    cupFaceOffset_ = sdf->Get<double>("cup_face_offset", 0.0843).first;
+    cupRadius_ = sdf->Get<double>("cup_radius", 0.02).first;
+    maxGap_ = sdf->Get<double>("max_gap", 0.004).first;
+    liftOnSeal_ = sdf->Get<double>("lift_on_seal", 0.002).first;
+    bellowsJointName_ = sdf->Get<std::string>("bellows_joint", "").first;
+    bellowsK_ = sdf->Get<double>("bellows_stiffness", 2000.0).first;
+    bellowsC_ = sdf->Get<double>("bellows_damping", 5.0).first;
     const std::string cmdTopic = sdf->Get<std::string>("cmd_topic", "/togsim/vacuum/cmd").first;
     const std::string stateTopic = sdf->Get<std::string>("state_topic", "/togsim/vacuum/state").first;
     node_.Subscribe(cmdTopic, &VacuumGripperSystem::OnCmd, this);
@@ -55,8 +70,32 @@ class VacuumGripperSystem : public gz::System,
            << "] cmd " << cmdTopic << "\n";
   }
 
+  // Passive bellows: URDF->SDF drops joint springs, so the spring-damper is applied here as a joint force.
+  void UpdateBellows(gz::EntityComponentManager& ecm) {
+    if (bellowsJointName_.empty()) return;
+    if (bellowsJoint_ == gz::kNullEntity) {
+      bellowsJoint_ = model_.JointByName(ecm, bellowsJointName_);
+      if (bellowsJoint_ == gz::kNullEntity) return;
+      if (!ecm.Component<gz::components::JointPosition>(bellowsJoint_))
+        ecm.CreateComponent(bellowsJoint_, gz::components::JointPosition());
+      if (!ecm.Component<gz::components::JointVelocity>(bellowsJoint_))
+        ecm.CreateComponent(bellowsJoint_, gz::components::JointVelocity());
+      ignmsg << "[VacuumGripperSystem] bellows spring on joint [" << bellowsJointName_ << "] k=" << bellowsK_ << "\n";
+    }
+    auto pos = ecm.Component<gz::components::JointPosition>(bellowsJoint_);
+    auto vel = ecm.Component<gz::components::JointVelocity>(bellowsJoint_);
+    if (!pos || !vel || pos->Data().empty() || vel->Data().empty()) return;
+    const double f = -bellowsK_ * pos->Data()[0] - bellowsC_ * vel->Data()[0];
+    auto cmd = ecm.Component<gz::components::JointForceCmd>(bellowsJoint_);
+    if (!cmd)
+      ecm.CreateComponent(bellowsJoint_, gz::components::JointForceCmd({f}));
+    else
+      cmd->Data()[0] = f;
+  }
+
   void PreUpdate(const gz::UpdateInfo& info, gz::EntityComponentManager& ecm) override {
     if (info.paused) return;
+    UpdateBellows(ecm);
     if (cupLink_ == gz::kNullEntity) {
       cupLink_ = model_.LinkByName(ecm, cupLinkName_);
       if (cupLink_ == gz::kNullEntity) {
@@ -91,8 +130,23 @@ class VacuumGripperSystem : public gz::System,
     }
     const double t = std::chrono::duration<double>(info.simTime).count();
 
-    if (cmdOn && joint_ == gz::kNullEntity) {
+    // phase 2 of the seal: weld a few steps after the lift
+    if (cmdOn && joint_ == gz::kNullEntity && pendingLink_ != gz::kNullEntity) {
+      if (!ecm.HasEntity(pendingLink_)) { pendingLink_ = gz::kNullEntity; }
+      else if (++pendingSteps_ >= 3) {
+        joint_ = ecm.CreateEntity();
+        ecm.CreateComponent(joint_, gz::components::DetachableJoint({cupLink_, pendingLink_, "fixed"}));
+        attachedModel_ = ecm.Component<gz::components::Name>(pendingModel_)->Data();
+        attachedLink_ = pendingLink_;
+        pendingLink_ = gz::kNullEntity;
+        ignmsg << "[VacuumGripperSystem] sealed on " << attachedModel_ << "\n";
+      }
+    }
+    if (!cmdOn) pendingLink_ = gz::kNullEntity;
+
+    if (cmdOn && joint_ == gz::kNullEntity && pendingLink_ == gz::kNullEntity) {
       gz::Entity touching = TouchedProductLink(ecm, cmdTarget);
+      if (touching == gz::kNullEntity) touching = NearProductLink(ecm, cmdTarget);
       if (touching == gz::kNullEntity) {
         sealStart_ = -1.0;
       } else {
@@ -105,13 +159,17 @@ class VacuumGripperSystem : public gz::System,
               ignwarn << "[VacuumGripperSystem] product too heavy (" << mass << " kg > " << maxPayload_ << ")\n";
               payloadWarned_ = true;
             }
-          } else {
-            joint_ = ecm.CreateEntity();
-            ecm.CreateComponent(joint_, gz::components::DetachableJoint({cupLink_, touching, "fixed"}));
+          } else if (pendingLink_ == gz::kNullEntity) {
+            // phase 1: lift the product 2 mm off whatever it rests on, so that the weld does not close an
+            // over-constrained loop (kinematic arm - weld - product - belt contact) that makes the solver spike
             auto modelEnt = ecm.Component<gz::components::ParentEntity>(touching)->Data();
-            attachedModel_ = ecm.Component<gz::components::Name>(modelEnt)->Data();
-            attachedLink_ = touching;
-            ignmsg << "[VacuumGripperSystem] sealed on " << attachedModel_ << "\n";
+            ignition::math::Pose3d mp = gz::worldPose(modelEnt, ecm);
+            mp.Pos().Z() += liftOnSeal_;
+            auto cmd = ecm.Component<gz::components::WorldPoseCmd>(modelEnt);
+            if (cmd) cmd->Data() = mp; else ecm.CreateComponent(modelEnt, gz::components::WorldPoseCmd(mp));
+            pendingLink_ = touching;
+            pendingModel_ = modelEnt;
+            pendingSteps_ = 0;
           }
         }
       }
@@ -171,6 +229,38 @@ class VacuumGripperSystem : public gz::System,
     return gz::kNullEntity;
   }
 
+  // Proximity sealing: the cup face hovering within max_gap above (or slightly into) the top face of a product's box
+  // collision counts as sealed. Avoids commanding penetration with an infinitely stiff position-controlled arm.
+  gz::Entity NearProductLink(gz::EntityComponentManager& ecm, const std::string& target) {
+    const ignition::math::Pose3d cupPose = gz::worldPose(cupLink_, ecm);
+    const ignition::math::Vector3d face = cupPose.Pos() + cupPose.Rot().RotateVector({0, 0, cupFaceOffset_});
+    gz::Entity best = gz::kNullEntity;
+    double bestGap = 1e9;
+    ecm.Each<gz::components::Collision, gz::components::Geometry, gz::components::Pose, gz::components::ParentEntity>(
+        [&](const gz::Entity&, const gz::components::Collision*, const gz::components::Geometry* geom,
+            const gz::components::Pose* pose, const gz::components::ParentEntity* parent) {
+          const sdf::Box* box = geom->Data().BoxShape();
+          if (!box) return true;
+          const gz::Entity link = parent->Data();
+          auto modelComp = ecm.Component<gz::components::ParentEntity>(link);
+          if (!modelComp) return true;
+          auto nameComp = ecm.Component<gz::components::Name>(modelComp->Data());
+          if (!nameComp || nameComp->Data().rfind(modelPrefix_, 0) != 0) return true;
+          if (!target.empty() && target != "auto" && nameComp->Data() != target) return true;
+          const ignition::math::Pose3d colPose = gz::worldPose(link, ecm) * pose->Data();
+          const ignition::math::Vector3d size = box->Size();
+          const ignition::math::Vector3d local = colPose.Rot().RotateVectorReverse(face - colPose.Pos());
+          const double gap = local.Z() - size.Z() / 2.0;  // >0 above the top face
+          if (gap > maxGap_ || gap < -maxGap_) return true;
+          if (std::fabs(local.X()) > size.X() / 2.0 + cupRadius_ * 0.5 ||
+              std::fabs(local.Y()) > size.Y() / 2.0 + cupRadius_ * 0.5)
+            return true;
+          if (std::fabs(gap) < bestGap) { bestGap = std::fabs(gap); best = link; }
+          return true;
+        });
+    return best;
+  }
+
   void OnCmd(const ignition::msgs::StringMsg& msg) {
     std::lock_guard<std::mutex> lk(mutex_);
     const std::string& s = msg.data();
@@ -186,7 +276,12 @@ class VacuumGripperSystem : public gz::System,
   gz::Model model_{gz::kNullEntity};
   gz::Entity cupLink_{gz::kNullEntity}, cupCollision_{gz::kNullEntity};
   gz::Entity joint_{gz::kNullEntity}, attachedLink_{gz::kNullEntity};
-  std::string cupLinkName_, cupCollisionName_, modelPrefix_, attachedModel_;
+  std::string cupLinkName_, cupCollisionName_, modelPrefix_, attachedModel_, bellowsJointName_;
+  gz::Entity bellowsJoint_{gz::kNullEntity};
+  double bellowsK_{2000.0}, bellowsC_{5.0};
+  double cupFaceOffset_{0.0843}, cupRadius_{0.02}, maxGap_{0.004}, liftOnSeal_{0.002};
+  gz::Entity pendingLink_{gz::kNullEntity}, pendingModel_{gz::kNullEntity};
+  int pendingSteps_{0};
   double sealDelay_{0.03}, releaseDelay_{0.02}, maxPayload_{1.0};
   double sealStart_{-1.0}, releaseStart_{-1.0};
   bool warned_{false}, payloadWarned_{false};

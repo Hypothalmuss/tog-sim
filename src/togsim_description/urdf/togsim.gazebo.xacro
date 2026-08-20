@@ -11,6 +11,10 @@
         <plugin filename="togsim_vacuum_gripper_system" name="togsim::VacuumGripperSystem">
           <cup_link>${prefix}vgc10_suction</cup_link>
           <cup_collision>${prefix}vgc10_suction_collision</cup_collision>
+          <!-- proximity sealing: cup face within max_gap of a product's top face (box collisions) -->
+          <cup_face_offset>0.0843</cup_face_offset>
+          <cup_radius>0.020</cup_radius>
+          <max_gap>0.004</max_gap>
           <seal_delay>0.030</seal_delay>
           <release_delay>0.020</release_delay>
           <max_payload>1.0</max_payload>

@@ -245,10 +245,12 @@ class DemoPick(Node):
             tc = time.monotonic()
             pick = [
                 seg(MotionSegment.VIA_CART, pxyz[0], pxyz[1], top + hover, pyaw, via_speed=0.5),
-                seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top - 0.001, pyaw),
+                seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top + 0.001, pyaw),
             ]
             if not self.run_motion(pick, f"pick {name}"):
                 blacklist[name] = time.monotonic() + 15.0
+                self.vacuum(False, 0.0)
+                self.run_motion([seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top + hover, pyaw)], "retreat")
                 self.belts(belt_speed)
                 continue
             r = self.vacuum(True, 0.5)

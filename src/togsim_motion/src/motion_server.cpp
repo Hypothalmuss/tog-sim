@@ -113,13 +113,15 @@ class MotionServer : public rclcpp::Node {
 
   void onJointState(const sensor_msgs::msg::JointState& m) {
     std::lock_guard<std::mutex> lk(mutex_);
-    if (synced_) return;
     size_t found = 0;
     std::array<double, DOF> q{};
     for (size_t i = 0; i < DOF; ++i)
       for (size_t k = 0; k < m.name.size(); ++k)
         if (m.name[k] == joints_[i] && k < m.position.size()) { q[i] = m.position[k]; ++found; }
     if (found != DOF) return;
+    actual_ = q;
+    haveActual_ = true;
+    if (synced_) return;
     input_.current_position = q;
     input_.current_velocity.fill(0.0);
     input_.current_acceleration.fill(0.0);
@@ -284,6 +286,27 @@ class MotionServer : public rclcpp::Node {
       }
     }
 
+    // Jam guard: the arm is position-tracked, so a persistent error between command and measurement means it is
+    // physically blocked (e.g. pressing a product into a tray). Abort the goal and brake instead of thrashing.
+    if (goal_ && haveActual_) {
+      // joint_states lag the command by a few ms: scale the tolerance with the commanded vertical speed
+      const double err = std::fabs(actual_[2] - input_.current_position[2]);
+      const double tol = jamTolerance_ + 0.015 * std::fabs(input_.current_velocity[2]);
+      // readings outside the joint limits are solver glitches (e.g. at weld creation), not jams: ignore them
+      bool plausible = true;
+      for (size_t i = 0; i < DOF; ++i)
+        if (actual_[i] < pmin_[i] - 0.02 || actual_[i] > pmax_[i] + 0.02) plausible = false;
+      jamTicks_ = (plausible && err > tol) ? jamTicks_ + 1 : 0;
+      if (jamTicks_ > static_cast<int>(0.1 * rate_)) {
+        jamTicks_ = 0;
+        // resync the generator to where the arm really is, then fail the goal
+        input_.current_position = actual_;
+        input_.current_velocity.fill(0.0);
+        input_.current_acceleration.fill(0.0);
+        fail(ExecuteMotion::Result::CONTROLLER_ERROR, "jam detected: vertical tracking error " + std::to_string(err) + " m");
+      }
+    }
+
     auto res = otg_->update(input_, output_);
     if (res == ruckig::Result::Error || res == ruckig::Result::ErrorInvalidInput) {
       RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "ruckig error %d", static_cast<int>(res));
@@ -291,6 +314,8 @@ class MotionServer : public rclcpp::Node {
       output_.new_velocity.fill(0.0);
       output_.new_acceleration.fill(0.0);
     }
+    // never publish a command outside the joint limits (the controller would apply it verbatim)
+    for (size_t i = 0; i < DOF; ++i) output_.new_position[i] = std::clamp(output_.new_position[i], pmin_[i], pmax_[i]);
     std_msgs::msg::Float64MultiArray cmd;
     cmd.data.assign(output_.new_position.begin(), output_.new_position.end());
     cmdPub_->publish(cmd);
@@ -334,6 +359,10 @@ class MotionServer : public rclcpp::Node {
   ruckig::InputParameter<DOF> input_;
   ruckig::OutputParameter<DOF> output_;
   bool synced_{false};
+  std::array<double, DOF> actual_{};
+  bool haveActual_{false};
+  int jamTicks_{0};
+  double jamTolerance_{0.010};
   std::mutex mutex_;
 
   std::shared_ptr<GoalHandle> goal_;

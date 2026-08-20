@@ -9,7 +9,7 @@ trays:
     pocket_y: 0.060
     pocket_depth: 0.025
     wall: 0.004
-    base_thickness: 0.004
+    base_thickness: 0.010
     margin: 0.012
     mass: 0.25
     label: 3
@@ -34,7 +34,7 @@ trays:
     pocket_y: 0.054
     pocket_depth: 0.025
     wall: 0.004
-    base_thickness: 0.004
+    base_thickness: 0.010
     margin: 0.010
     mass: 0.30
     label: 3

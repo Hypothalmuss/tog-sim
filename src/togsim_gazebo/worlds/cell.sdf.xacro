@@ -40,7 +40,9 @@
       <link name="belt">
         <collision name="belt_collision">
           <geometry><box><size>${belt_len} ${belt_w} 0.03</size></box></geometry>
-          <surface><friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction></surface>
+          <!-- the belt surface itself is (nearly) frictionless: the ConveyorSystem drive force plays the role of
+               friction with the moving belt (saturating at max_drive_accel ~ mu*g) -->
+          <surface><friction><ode><mu>0.05</mu><mu2>0.05</mu2></ode></friction></surface>
         </collision>
         <visual name="belt_visual">
           <geometry><box><size>${belt_len} ${belt_w} 0.03</size></box></geometry>
@@ -62,6 +64,8 @@
         <capture_height>0.10</capture_height>
         <initial_velocity>${speed}</initial_velocity>
         <max_acceleration>1.0</max_acceleration>
+        <drive_gain>40.0</drive_gain>
+        <max_drive_accel>6.0</max_drive_accel>
         <cmd_topic>/togsim/conveyor/${name}/cmd_vel</cmd_topic>
         <state_topic>/togsim/conveyor/${name}/state</state_topic>
       </plugin>

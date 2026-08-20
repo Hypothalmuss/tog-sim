@@ -197,7 +197,7 @@ class ProductSpawner(Node):
             name,
             float(self.cfg["trays.spawn_x"]),
             float(self.cfg["trays.y_center"]),
-            float(self.cfg["belts.surface_z"]) + 0.005,
+            float(self.cfg["belts.surface_z"]) + 0.012,
         )
 
     def tick(self):

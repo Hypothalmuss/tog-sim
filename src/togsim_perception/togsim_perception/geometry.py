@@ -6,6 +6,16 @@ import cv2
 import numpy as np
 
 
+def intrinsics_from_info(width: int, height: int, k_flat, hfov_rad: float) -> np.ndarray:
+    """3x3 K from a CameraInfo; falls back to an ideal pinhole from the HFOV when the message is inconsistent
+    (Gazebo Fortress' depth camera publishes a 320x240-default K on the shared camera_info topic)."""
+    k = np.array(k_flat, dtype=float).reshape(3, 3)
+    if abs(k[0, 2] - width / 2.0) > 2.0 or abs(k[1, 2] - height / 2.0) > 2.0 or k[0, 0] < 1.0:
+        f = (width / 2.0) / math.tan(hfov_rad / 2.0)
+        k = np.array([[f, 0.0, width / 2.0], [0.0, f, height / 2.0], [0.0, 0.0, 1.0]])
+    return k
+
+
 def pixel_to_point(u: float, v: float, depth: float, k: np.ndarray) -> np.ndarray:
     """Back-project a pixel with depth (metres along the optical z axis) using the 3x3 intrinsic matrix."""
     fx, fy, cx, cy = k[0, 0], k[1, 1], k[0, 2], k[1, 2]

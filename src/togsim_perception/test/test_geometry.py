@@ -35,3 +35,13 @@ def test_polygon_coverage():
     poly = np.array([[10, 10], [30, 10], [30, 30], [10, 30]], float)
     assert 0.9 < polygon_coverage(m, poly) <= 1.0
     assert polygon_coverage(m, poly + 30) == 0.0
+
+
+def test_intrinsics_fallback():
+    from togsim_perception.geometry import intrinsics_from_info
+
+    bad = [277.0, 0, 160.0, 0, 277.0, 120.0, 0, 0, 1]
+    k = intrinsics_from_info(848, 480, bad, 1.2043)
+    assert abs(k[0, 2] - 424) < 1e-9 and abs(k[1, 2] - 240) < 1e-9 and 600 < k[0, 0] < 630
+    good = [615.0, 0, 424.0, 0, 615.0, 240.0, 0, 0, 1]
+    assert abs(intrinsics_from_info(848, 480, good, 1.2043)[0, 0] - 615.0) < 1e-9

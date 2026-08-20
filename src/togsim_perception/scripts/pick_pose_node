@@ -25,6 +25,7 @@ from vision_msgs.msg import Detection2DArray
 from togsim_msgs.msg import PickCandidate, PickCandidateArray
 from togsim_msgs.srv import GetPickCandidates
 from togsim_perception.geometry import (
+    intrinsics_from_info,
     median_depth,
     pixel_to_point,
     plane_normal,
@@ -42,12 +43,14 @@ class PickPoseNode(Node):
         super().__init__("pick_pose_node")
         self.declare_parameter("cam", "cam_pick")
         self.declare_parameter("world_frame", "world")
+        self.declare_parameter("hfov_rad", 1.2043)  # D435 RGB, must match the world SDF
         self.declare_parameter("cup_radius_m", 0.02)
         self.declare_parameter("tilt_threshold_deg", 8.0)
         self.declare_parameter("max_tilt_deg", 40.0)
         self.declare_parameter("belt_velocity_topic", "/togsim/conveyor/infeed/state")
         cam = self.get_parameter("cam").value
         self.world = self.get_parameter("world_frame").value
+        self.hfov = float(self.get_parameter("hfov_rad").value)
         self.cup_r = float(self.get_parameter("cup_radius_m").value)
         self.tilt_thr = math.radians(float(self.get_parameter("tilt_threshold_deg").value))
         self.max_tilt = math.radians(float(self.get_parameter("max_tilt_deg").value))
@@ -77,7 +80,7 @@ class PickPoseNode(Node):
         self.get_logger().info("pick_pose_node ready")
 
     def on_info(self, msg):
-        self.k = np.array(msg.k, dtype=float).reshape(3, 3)
+        self.k = intrinsics_from_info(msg.width, msg.height, msg.k, self.hfov)
         self.optical_frame = msg.header.frame_id
 
     def on_depth(self, msg):

@@ -9,6 +9,7 @@ Publishes togsim_msgs/TrayState on /togsim/tray_state (one message per visible t
 import math
 import threading
 
+import cv2
 import numpy as np
 import rclpy
 import yaml
@@ -26,6 +27,7 @@ from vision_msgs.msg import Detection2DArray
 
 from togsim_msgs.msg import TrayState
 from togsim_perception.geometry import (
+    intrinsics_from_info,
     median_depth,
     pixel_to_point,
     point_to_pixel,
@@ -41,11 +43,14 @@ class TrayVacancyNode(Node):
         super().__init__("tray_vacancy_node")
         self.declare_parameter("cam", "cam_place")
         self.declare_parameter("world_frame", "world")
+        self.declare_parameter("hfov_rad", 1.2043)  # D435 RGB, must match the world SDF
         self.declare_parameter("tray_model", "tray_2x4")
         self.declare_parameter("coverage_threshold", 0.30)
         self.declare_parameter("depth_rise_m", 0.008)
+        self.declare_parameter("belt_z", 0.52)
         cam = self.get_parameter("cam").value
         self.world = self.get_parameter("world_frame").value
+        self.hfov = float(self.get_parameter("hfov_rad").value)
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         t = cfg["trays"][self.get_parameter("tray_model").value]
         self.rows, self.cols = t["rows"], t["cols"]
@@ -56,6 +61,7 @@ class TrayVacancyNode(Node):
         self.total = (self.cols * self.pitch[0] + 2 * t.get("margin", 0.01), self.rows * self.pitch[1] + 2 * t.get("margin", 0.01))
         self.cov_thr = float(self.get_parameter("coverage_threshold").value)
         self.rise = float(self.get_parameter("depth_rise_m").value)
+        self.belt_z = float(self.get_parameter("belt_z").value)
         self.br = CvBridge()
         self.cb = ReentrantCallbackGroup()
         self.lock = threading.Lock()
@@ -74,10 +80,13 @@ class TrayVacancyNode(Node):
         self.create_subscription(Detection2DArray, f"/togsim/detections/{cam}", self.on_det, 5, callback_group=self.cb)
         self.create_subscription(Float64, "/togsim/conveyor/outfeed/state", lambda m: setattr(self, "belt_v", m.data), 5)
         self.pub = self.create_publisher(TrayState, "/togsim/tray_state", 10)
+        self.dbg_pub = self.create_publisher(Image, "/togsim/debug/tray_overlay", 2)
+        self.latest_rgb = None
+        self.create_subscription(Image, f"/{cam}/image", lambda m: setattr(self, "latest_rgb", m), qos_profile_sensor_data)
         self.get_logger().info("tray_vacancy_node ready")
 
     def on_info(self, msg):
-        self.k = np.array(msg.k, dtype=float).reshape(3, 3)
+        self.k = intrinsics_from_info(msg.width, msg.height, msg.k, self.hfov)
         self.optical_frame = msg.header.frame_id
 
     def on_depth(self, msg):
@@ -144,17 +153,28 @@ class TrayVacancyNode(Node):
             elif cls in ("bar", "carton"):
                 product_mask |= m
         stamp_s = header.stamp.sec + header.stamp.nanosec * 1e-9
+        dbg = None
+        if self.dbg_pub.get_subscription_count() > 0 and self.latest_rgb is not None:
+            dbg = cv2.cvtColor(self.br.imgmsg_to_cv2(self.latest_rgb, "rgb8"), cv2.COLOR_RGB2BGR)
+            for m in trays:
+                dbg[m] = (dbg[m] * 0.6 + np.array((255, 200, 60)) * 0.4).astype(np.uint8)
+        h_img, w_img = inst_map.shape
         for m in trays:
             if m.sum() < 400:
                 continue
-            z_rim = median_depth(depth, m, erode_px=1)
-            if z_rim is None:
+            ys_, xs_ = np.where(m)
+            partial = xs_.min() <= 1 or ys_.min() <= 1 or xs_.max() >= w_img - 2 or ys_.max() >= h_img - 2
+            # the visible tray pixels are mostly the pocket floor (base top): use them as the floor reference
+            floor_px = m & ~product_mask
+            z_floor = median_depth(depth, floor_px, erode_px=1)
+            if z_floor is None:
                 continue
             cu, cv_, ang, long_px, short_px = principal_axis(m)
-            # tray centre at the rim height; tray origin (bottom) is depth_total lower
-            p_cam = pixel_to_point(cu, cv_, z_rim, self.k)
+            p_cam = pixel_to_point(cu, cv_, z_floor, self.k)
             p_w = transform_points(p_cam[None, :], rot, trans)[0]
-            z_bottom = p_w[2] - self.depth_total
+            z_bottom = p_w[2] - self.base_t
+            if abs(z_bottom - self.belt_z) < 0.03:  # trays ride on the belt: snap to the known belt height
+                z_bottom = self.belt_z
             dir_w = rot @ np.array([math.cos(ang), math.sin(ang), 0.0])
             yaw = math.atan2(dir_w[1], dir_w[0])
             # long side of the tray lies along +x of the tray frame; resolve the 180 deg ambiguity towards 0
@@ -181,14 +201,14 @@ class TrayVacancyNode(Node):
                     cov = polygon_coverage(product_mask, poly)
                     # depth inside the pocket vs the pocket floor
                     pm = np.zeros(inst_map.shape, np.uint8)
-                    import cv2
-
                     cv2.fillPoly(pm, [np.round(poly).astype(np.int32).reshape(-1, 1, 2)], 1)
                     zp = median_depth(depth, pm.astype(bool), erode_px=0)
-                    floor_depth = (rot_inv @ (np.array([p_w[0], p_w[1], z_bottom + self.base_t]) - trans))[2]
-                    rise = (floor_depth - zp) if zp is not None else 0.0
+                    rise = (z_floor - zp) if zp is not None else 0.0
                     occ = cov > self.cov_thr or rise > self.rise
                     occupied.append(bool(occ))
+                    if dbg is not None:
+                        cv2.polylines(dbg, [np.round(poly).astype(np.int32).reshape(-1, 1, 2)], True, (0, 0, 255) if occ else (0, 255, 0), 2)
+                        cv2.putText(dbg, f"{cov:.2f}/{rise * 1000:.0f}", (int(poly[0][0]), int(poly[0][1])), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                     conf.append(float(min(1.0, 0.5 * cov / max(self.cov_thr, 1e-6) + 0.5 * rise / max(self.rise, 1e-6))))
             msg = TrayState()
             msg.header = header
@@ -204,8 +224,15 @@ class TrayVacancyNode(Node):
             msg.pitch_x, msg.pitch_y = float(self.pitch[0]), float(self.pitch[1])
             msg.occupied = occupied
             msg.confidence = conf
-            msg.tracked = True
+            msg.tracked = not partial
             self.pub.publish(msg)
+            if dbg is not None:
+                cv2.circle(dbg, (int(cu), int(cv_)), 6, (255, 0, 255), 2)
+                cv2.putText(dbg, f"tray {tid} yaw {math.degrees(yaw):.0f} z {z_bottom:.3f}", (int(cu) + 8, int(cv_)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+        if dbg is not None:
+            o = self.br.cv2_to_imgmsg(dbg, encoding="bgr8")
+            o.header = header
+            self.dbg_pub.publish(o)
 
 
 def main():

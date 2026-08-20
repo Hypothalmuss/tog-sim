@@ -1,6 +1,7 @@
 """Fortress panoptic label maps -> YOLO-seg polygon labels.
 
-labels_map (rgb8): R = semantic label (Gazebo `Label` plugin value), G/B = instance id (hi/lo byte).
+labels_map (rgb8, panoptic): R/G = instance id (16 bit), B = semantic label (Gazebo `Label` plugin value).
+(Verified empirically on Fortress 6.17: a tray with Label 3 renders as (1, 0, 3), a carton with Label 2 as (1, 0, 2).)
 tog-sim labels: 1 = product_bar, 2 = product_carton, 3 = tray  ->  YOLO class ids 0, 1, 2.
 """
 
@@ -9,6 +10,9 @@ import numpy as np
 
 CLASS_NAMES = ["bar", "carton", "tray"]
 LABEL_TO_CLASS = {1: 0, 2: 1, 3: 2}
+# classes whose models consist of several labelled visuals (tray = floor + walls): merge all their pixels and split by
+# connected blobs instead of by Gazebo instance id, so one physical object = one instance
+MERGE_BY_CLASS = {3}
 
 
 def instances_from_labels_map(labels: np.ndarray, min_area: int = 60):
@@ -17,8 +21,10 @@ def instances_from_labels_map(labels: np.ndarray, min_area: int = 60):
     Instance ids are not guaranteed unique across spawned models, so every (class, id) key is additionally split
     into connected components; each component becomes its own instance.
     """
-    sem = labels[:, :, 0].astype(np.int32)
-    inst = labels[:, :, 1].astype(np.int32) * 256 + labels[:, :, 2].astype(np.int32)
+    sem = labels[:, :, 2].astype(np.int32)
+    inst = labels[:, :, 0].astype(np.int32) * 256 + labels[:, :, 1].astype(np.int32)
+    for label in MERGE_BY_CLASS:
+        inst[sem == label] = 0
     key = sem * 65536 + inst
     for k in np.unique(key):
         label = int(k // 65536)

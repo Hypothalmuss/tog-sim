@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Tray detection and pocket vacancy from the place camera.
+
+Uses the tray instance masks (class `tray`) + depth for the tray pose, projects the pocket grid (trays.yaml) into the
+image and marks a pocket occupied when enough product-mask pixels or a depth rise are found inside it.
+Publishes togsim_msgs/TrayState on /togsim/tray_state (one message per visible tray, world frame).
+"""
+
+import math
+import threading
+
+import numpy as np
+import rclpy
+import yaml
+from ament_index_python.packages import get_package_share_directory
+from cv_bridge import CvBridge
+from geometry_msgs.msg import PoseStamped
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import Float64
+from tf2_ros import Buffer, TransformListener
+from vision_msgs.msg import Detection2DArray
+
+from togsim_msgs.msg import TrayState
+from togsim_perception.geometry import (
+    median_depth,
+    pixel_to_point,
+    point_to_pixel,
+    polygon_coverage,
+    principal_axis,
+    quat_to_rot,
+    transform_points,
+)
+
+
+class TrayVacancyNode(Node):
+    def __init__(self):
+        super().__init__("tray_vacancy_node")
+        self.declare_parameter("cam", "cam_place")
+        self.declare_parameter("world_frame", "world")
+        self.declare_parameter("tray_model", "tray_2x4")
+        self.declare_parameter("coverage_threshold", 0.30)
+        self.declare_parameter("depth_rise_m", 0.008)
+        cam = self.get_parameter("cam").value
+        self.world = self.get_parameter("world_frame").value
+        cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
+        t = cfg["trays"][self.get_parameter("tray_model").value]
+        self.rows, self.cols = t["rows"], t["cols"]
+        self.pitch = (t["pitch_x"], t["pitch_y"])
+        self.pocket = (t["pocket_x"], t["pocket_y"])
+        self.base_t = t.get("base_thickness", 0.004)
+        self.depth_total = self.base_t + t["pocket_depth"]
+        self.total = (self.cols * self.pitch[0] + 2 * t.get("margin", 0.01), self.rows * self.pitch[1] + 2 * t.get("margin", 0.01))
+        self.cov_thr = float(self.get_parameter("coverage_threshold").value)
+        self.rise = float(self.get_parameter("depth_rise_m").value)
+        self.br = CvBridge()
+        self.cb = ReentrantCallbackGroup()
+        self.lock = threading.Lock()
+        self.k = None
+        self.depth = None
+        self.masks = {}
+        self.det = {}
+        self.belt_v = 0.0
+        self.tracks = []  # [id, x, y, stamp]
+        self.next_id = 1
+        self.tf_buf = Buffer()
+        self.tf_listener = TransformListener(self.tf_buf, self, spin_thread=False)
+        self.create_subscription(CameraInfo, f"/{cam}/camera_info", self.on_info, 5, callback_group=self.cb)
+        self.create_subscription(Image, f"/{cam}/depth_image", self.on_depth, qos_profile_sensor_data, callback_group=self.cb)
+        self.create_subscription(Image, f"/togsim/masks/{cam}", self.on_masks, 5, callback_group=self.cb)
+        self.create_subscription(Detection2DArray, f"/togsim/detections/{cam}", self.on_det, 5, callback_group=self.cb)
+        self.create_subscription(Float64, "/togsim/conveyor/outfeed/state", lambda m: setattr(self, "belt_v", m.data), 5)
+        self.pub = self.create_publisher(TrayState, "/togsim/tray_state", 10)
+        self.get_logger().info("tray_vacancy_node ready")
+
+    def on_info(self, msg):
+        self.k = np.array(msg.k, dtype=float).reshape(3, 3)
+        self.optical_frame = msg.header.frame_id
+
+    def on_depth(self, msg):
+        with self.lock:
+            self.depth = self.br.imgmsg_to_cv2(msg, "32FC1")
+
+    def on_det(self, msg):
+        ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        with self.lock:
+            self.det[ns] = msg
+            mask = self.masks.pop(ns, None)
+        if mask is not None:
+            self.process(msg.header, mask, msg)
+
+    def on_masks(self, msg):
+        ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        img = self.br.imgmsg_to_cv2(msg, "mono16")
+        with self.lock:
+            det = self.det.pop(ns, None)
+            if det is None:
+                self.masks[ns] = img
+                for k in sorted(self.masks)[:-5]:
+                    self.masks.pop(k, None)
+                for k in sorted(self.det)[:-5]:
+                    self.det.pop(k, None)
+        if det is not None:
+            self.process(msg.header, img, det)
+
+    def track_id(self, x, y, stamp_s):
+        for tr in self.tracks:
+            dt = max(0.0, stamp_s - tr[3])
+            px = tr[1] + self.belt_v * dt
+            if math.hypot(px - x, tr[2] - y) < 0.08:
+                tr[1], tr[2], tr[3] = x, y, stamp_s
+                return tr[0]
+        self.tracks = [tr for tr in self.tracks if stamp_s - tr[3] < 3.0]
+        self.tracks.append([self.next_id, x, y, stamp_s])
+        self.next_id += 1
+        return self.next_id - 1
+
+    def process(self, header, inst_map, det):
+        if self.k is None:
+            return
+        with self.lock:
+            depth = None if self.depth is None else self.depth.copy()
+        if depth is None or depth.shape != inst_map.shape:
+            return
+        try:
+            tf = self.tf_buf.lookup_transform(self.world, self.optical_frame, rclpy.time.Time())
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"TF: {e}", throttle_duration_sec=2.0)
+            return
+        q, t = tf.transform.rotation, tf.transform.translation
+        rot = quat_to_rot(q.x, q.y, q.z, q.w)
+        trans = np.array([t.x, t.y, t.z])
+        rot_inv = rot.T
+        product_mask = np.zeros(inst_map.shape, bool)
+        trays = []
+        for i, d in enumerate(det.detections):
+            cls = d.results[0].hypothesis.class_id
+            m = inst_map == i + 1
+            if cls == "tray":
+                trays.append(m)
+            elif cls in ("bar", "carton"):
+                product_mask |= m
+        stamp_s = header.stamp.sec + header.stamp.nanosec * 1e-9
+        for m in trays:
+            if m.sum() < 400:
+                continue
+            z_rim = median_depth(depth, m, erode_px=1)
+            if z_rim is None:
+                continue
+            cu, cv_, ang, long_px, short_px = principal_axis(m)
+            # tray centre at the rim height; tray origin (bottom) is depth_total lower
+            p_cam = pixel_to_point(cu, cv_, z_rim, self.k)
+            p_w = transform_points(p_cam[None, :], rot, trans)[0]
+            z_bottom = p_w[2] - self.depth_total
+            dir_w = rot @ np.array([math.cos(ang), math.sin(ang), 0.0])
+            yaw = math.atan2(dir_w[1], dir_w[0])
+            # long side of the tray lies along +x of the tray frame; resolve the 180 deg ambiguity towards 0
+            if yaw > math.pi / 2:
+                yaw -= math.pi
+            if yaw < -math.pi / 2:
+                yaw += math.pi
+            tid = self.track_id(p_w[0], p_w[1], stamp_s)
+            occupied, conf = [], []
+            c, s = math.cos(yaw), math.sin(yaw)
+            for r in range(self.rows):
+                for col in range(self.cols):
+                    ox = -self.cols * self.pitch[0] / 2 + (col + 0.5) * self.pitch[0]
+                    oy = -self.rows * self.pitch[1] / 2 + (r + 0.5) * self.pitch[1]
+                    corners = []
+                    for dx, dy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                        lx = ox + dx * self.pocket[0] * 0.45
+                        ly = oy + dy * self.pocket[1] * 0.45
+                        wx = p_w[0] + c * lx - s * ly
+                        wy = p_w[1] + s * lx + c * ly
+                        pc = rot_inv @ (np.array([wx, wy, z_bottom + self.base_t + 0.012]) - trans)
+                        corners.append(point_to_pixel(pc, self.k))
+                    poly = np.array(corners)
+                    cov = polygon_coverage(product_mask, poly)
+                    # depth inside the pocket vs the pocket floor
+                    pm = np.zeros(inst_map.shape, np.uint8)
+                    import cv2
+
+                    cv2.fillPoly(pm, [np.round(poly).astype(np.int32).reshape(-1, 1, 2)], 1)
+                    zp = median_depth(depth, pm.astype(bool), erode_px=0)
+                    floor_depth = (rot_inv @ (np.array([p_w[0], p_w[1], z_bottom + self.base_t]) - trans))[2]
+                    rise = (floor_depth - zp) if zp is not None else 0.0
+                    occ = cov > self.cov_thr or rise > self.rise
+                    occupied.append(bool(occ))
+                    conf.append(float(min(1.0, 0.5 * cov / max(self.cov_thr, 1e-6) + 0.5 * rise / max(self.rise, 1e-6))))
+            msg = TrayState()
+            msg.header = header
+            msg.header.frame_id = self.world
+            msg.tray_id = tid
+            msg.pose = PoseStamped()
+            msg.pose.header = msg.header
+            msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z = float(p_w[0]), float(p_w[1]), float(z_bottom)
+            msg.pose.pose.orientation.z = math.sin(yaw / 2)
+            msg.pose.pose.orientation.w = math.cos(yaw / 2)
+            msg.velocity.x = float(self.belt_v)
+            msg.rows, msg.cols = self.rows, self.cols
+            msg.pitch_x, msg.pitch_y = float(self.pitch[0]), float(self.pitch[1])
+            msg.occupied = occupied
+            msg.confidence = conf
+            msg.tracked = True
+            self.pub.publish(msg)
+
+
+def main():
+    rclpy.init()
+    node = TrayVacancyNode()
+    ex = MultiThreadedExecutor(num_threads=4)
+    ex.add_node(node)
+    try:
+        ex.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -14,6 +14,7 @@
   <xacro:arg name="step" default="0.001"/>
   <xacro:arg name="cameras" default="true"/>
   <xacro:arg name="conveyor_visuals" default="true"/>
+  <xacro:arg name="segmentation" default="false"/>   <!-- add panoptic segmentation cameras (dataset generation) -->
   <xacro:arg name="cam_width" default="848"/>
   <xacro:arg name="cam_height" default="480"/>
   <xacro:arg name="cam_rate" default="30"/>
@@ -94,6 +95,22 @@
             <clip><near>0.15</near><far>4.0</far></clip>
           </camera>
         </sensor>
+        <xacro:if value="$(arg segmentation)">
+          <!-- ground-truth instance labels, co-located with the RGB camera: used ONLY to auto-label training data -->
+          <sensor name="seg" type="segmentation">
+            <always_on>1</always_on>
+            <update_rate>$(arg cam_rate)</update_rate>
+            <visualize>false</visualize>
+            <topic>${name}/segmentation</topic>
+            <ignition_frame_id>${name}_optical</ignition_frame_id>
+            <camera>
+              <segmentation_type>panoptic</segmentation_type>
+              <horizontal_fov>1.2043</horizontal_fov>
+              <image><width>$(arg cam_width)</width><height>$(arg cam_height)</height></image>
+              <clip><near>0.15</near><far>4.0</far></clip>
+            </camera>
+          </sensor>
+        </xacro:if>
         <sensor name="depth" type="depth_camera">
           <always_on>1</always_on>
           <update_rate>$(arg cam_rate)</update_rate>

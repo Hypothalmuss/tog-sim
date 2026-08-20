@@ -53,3 +53,24 @@
   ros_type_name: "sensor_msgs/msg/CameraInfo"
   gz_type_name: "ignition.msgs.CameraInfo"
   direction: GZ_TO_ROS
+# segmentation cameras (only present with segmentation:=true)
+- ros_topic_name: "/cam_pick/segmentation/labels_map"
+  gz_topic_name: "/cam_pick/segmentation/labels_map"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "ignition.msgs.Image"
+  direction: GZ_TO_ROS
+- ros_topic_name: "/cam_pick/segmentation/colored_map"
+  gz_topic_name: "/cam_pick/segmentation/colored_map"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "ignition.msgs.Image"
+  direction: GZ_TO_ROS
+- ros_topic_name: "/cam_place/segmentation/labels_map"
+  gz_topic_name: "/cam_place/segmentation/labels_map"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "ignition.msgs.Image"
+  direction: GZ_TO_ROS
+- ros_topic_name: "/cam_place/segmentation/colored_map"
+  gz_topic_name: "/cam_place/segmentation/colored_map"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "ignition.msgs.Image"
+  direction: GZ_TO_ROS

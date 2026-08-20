@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Indexed pick-and-place cycle, driven either by ground truth (perception:=gt) or by the vision stack
+(perception:=vision: /togsim/pick_candidates + /togsim/tray_state).
+
+Same motion/vacuum logic as demo_pick_gt; the only difference is where candidates and trays come from.
+"""
+
+import math
+import threading
+import time
+
+import rclpy
+import yaml
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import PoseStamped
+from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from std_msgs.msg import Float64
+from tf2_msgs.msg import TFMessage
+
+from togsim_msgs.action import ExecuteMotion
+from togsim_msgs.msg import MotionSegment, PickCandidateArray, TrayState
+from togsim_msgs.srv import SetVacuum
+from togsim_task.trays import TraySpec
+
+PRODUCT_HEIGHT = {"product_bar": 0.0186, "product_carton": 0.025}
+PRODUCT_FITS = {"tray_2x4": ["product_carton"], "tray_bar_2x3": ["product_bar"]}
+REACH_MIN, REACH_MAX = 0.22, 0.62
+BELT_Z = 0.52
+
+
+def reachable(x, y):
+    return REACH_MIN < math.hypot(x, y) < REACH_MAX
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def tilt_of(q):
+    return math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (q.x * q.x + q.y * q.y))))
+
+
+def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0, frame="world"):
+    s = MotionSegment()
+    s.type = type_
+    s.pose = PoseStamped()
+    s.pose.header.frame_id = frame
+    s.pose.pose.position.x, s.pose.pose.position.y, s.pose.pose.position.z = float(x), float(y), float(z)
+    s.pose.pose.orientation.z = math.sin(yaw / 2)
+    s.pose.pose.orientation.w = math.cos(yaw / 2)
+    s.tilt_deg = float(tilt)
+    s.via_speed_mps = float(via_speed)
+    s.dwell_s = float(dwell)
+    return s
+
+
+class Candidate:
+    __slots__ = ("key", "cls", "x", "y", "top", "yaw", "tilt", "occluded")
+
+    def __init__(self, key, cls, x, y, top, yaw, tilt=0.0, occluded=False):
+        self.key, self.cls, self.x, self.y, self.top, self.yaw, self.tilt, self.occluded = key, cls, x, y, top, yaw, tilt, occluded
+
+
+class Tray:
+    __slots__ = ("key", "x", "y", "z", "yaw", "occupied", "tilt")
+
+    def __init__(self, key, x, y, z, yaw, occupied, tilt=0.0):
+        self.key, self.x, self.y, self.z, self.yaw, self.occupied, self.tilt = key, x, y, z, yaw, occupied, tilt
+
+
+class RunCycle(Node):
+    def __init__(self):
+        super().__init__("run_cycle")
+        self.declare_parameter("perception", "vision")
+        self.declare_parameter("tray_model", "tray_2x4")
+        self.declare_parameter("cycles", 20)
+        self.declare_parameter("pick_x_min", 0.10)
+        self.declare_parameter("pick_x_max", 0.50)
+        self.declare_parameter("hover", 0.06)
+        self.declare_parameter("belt_speed", 0.10)
+        self.mode = self.get_parameter("perception").value
+        cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
+        self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
+        self.cb = ReentrantCallbackGroup()
+        self.lock = threading.Lock()
+        self.gt = {}  # name -> ((x,y,z), yaw, tilt, t)
+        self.vis_cands = None
+        self.vis_trays = {}  # id -> (TrayState, t)
+        self.belt_state = {"infeed": 1.0, "outfeed": 1.0}
+        self.latched = {}  # (tray_key, pocket) -> until
+        if self.mode == "gt":
+            self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_gt, 10, callback_group=self.cb)
+        else:
+            self.create_subscription(PickCandidateArray, "/togsim/pick_candidates", self.on_cands, 5, callback_group=self.cb)
+            self.create_subscription(TrayState, "/togsim/tray_state", self.on_tray, 10, callback_group=self.cb)
+        for b in ("infeed", "outfeed"):
+            self.create_subscription(Float64, f"/togsim/conveyor/{b}/state", lambda m, b=b: self.belt_state.__setitem__(b, m.data), 10)
+        self.motion = ActionClient(self, ExecuteMotion, "/togsim/execute_motion", callback_group=self.cb)
+        self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
+        self.infeed = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
+        self.outfeed = self.create_publisher(Float64, "/togsim/conveyor/outfeed/cmd_vel", 10)
+
+    # ---------------- perception inputs ----------------
+    def on_gt(self, msg):
+        now = time.monotonic()
+        with self.lock:
+            for t in msg.transforms:
+                n = t.child_frame_id
+                if n.startswith(("product_", "tray_")):
+                    tr, q = t.transform.translation, t.transform.rotation
+                    self.gt[n] = ((tr.x, tr.y, tr.z), yaw_of(q), tilt_of(q), now)
+            for n in [k for k, v in self.gt.items() if now - v[3] > 2.0]:
+                self.gt.pop(n, None)
+
+    def on_cands(self, msg):
+        with self.lock:
+            self.vis_cands = (msg, time.monotonic())
+
+    def on_tray(self, msg):
+        with self.lock:
+            self.vis_trays[msg.tray_id] = (msg, time.monotonic())
+
+    def candidates(self, fits):
+        out = []
+        with self.lock:
+            if self.mode == "gt":
+                for n, (p, yaw, tilt, _) in self.gt.items():
+                    if not n.startswith("product_"):
+                        continue
+                    cls = "product_" + n.split("_")[1]
+                    if cls in fits and p[2] < 0.6:
+                        out.append(Candidate(n, cls, p[0], p[1], p[2] + PRODUCT_HEIGHT[cls], yaw, tilt))
+            elif self.vis_cands and time.monotonic() - self.vis_cands[1] < 1.0:
+                for c in self.vis_cands[0].candidates:
+                    if c.class_name in fits:
+                        p = c.grasp_pose.pose.position
+                        out.append(Candidate(f"v{c.id}", c.class_name, p.x, p.y, p.z, math.radians(c.yaw_deg),
+                                             math.radians(c.tilt_deg), c.occluded))
+        return out
+
+    def trays(self):
+        out = []
+        with self.lock:
+            if self.mode == "gt":
+                for n, (p, yaw, tilt, _) in self.gt.items():
+                    if not n.startswith("tray_"):
+                        continue
+                    occ = [False] * self.tray.n_pockets
+                    for m, (pp, _, _, _) in self.gt.items():
+                        if m.startswith("product_") and abs(pp[2] - p[2]) < 0.06:
+                            idx = self.tray.pocket_of_point(p, yaw, pp[0], pp[1])
+                            if idx is not None:
+                                occ[idx] = True
+                    out.append(Tray(n, p[0], p[1], p[2], yaw, occ, tilt))
+            else:
+                now = time.monotonic()
+                for tid, (m, t) in list(self.vis_trays.items()):
+                    if now - t > 1.0:
+                        self.vis_trays.pop(tid, None)
+                        continue
+                    p = m.pose.pose.position
+                    out.append(Tray(f"t{tid}", p.x, p.y, p.z, yaw_of(m.pose.pose.orientation), list(m.occupied)))
+        return out
+
+    # ---------------- actuation helpers ----------------
+    def belts(self, speed):
+        for _ in range(2):
+            self.infeed.publish(Float64(data=float(speed)))
+            self.outfeed.publish(Float64(data=float(speed)))
+            time.sleep(0.05)
+
+    def wait_belts_stopped(self, timeout=2.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if max(abs(v) for v in self.belt_state.values()) < 0.003:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def run_motion(self, segments, label):
+        goal = ExecuteMotion.Goal()
+        goal.segments = segments
+        fut = self.motion.send_goal_async(goal)
+        t0 = time.monotonic()
+        while not fut.done():
+            time.sleep(0.002)
+            if time.monotonic() - t0 > 5.0:
+                self.get_logger().error(f"{label}: goal not accepted")
+                return False
+        gh = fut.result()
+        if not gh.accepted:
+            return False
+        rf = gh.get_result_async()
+        t0 = time.monotonic()
+        while not rf.done():
+            time.sleep(0.002)
+            if time.monotonic() - t0 > 30.0:
+                gh.cancel_goal_async()
+                return False
+        res = rf.result().result
+        if not res.success:
+            self.get_logger().warn(f"{label}: {res.message} (code {res.error_code})")
+        return res.success
+
+    def vacuum(self, on, timeout=0.5):
+        req = SetVacuum.Request()
+        req.on, req.target_model, req.timeout_s = on, "auto", float(timeout)
+        fut = self.vac.call_async(req)
+        while not fut.done():
+            time.sleep(0.002)
+        return fut.result()
+
+    def free_pocket(self, tray):
+        now = time.monotonic()
+        for i in range(self.tray.n_pockets):
+            if tray.occupied[i] or self.latched.get((tray.key, i), 0) > now:
+                continue
+            px, py, _ = self.tray.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
+            if reachable(px, py):
+                return i
+        return None
+
+    # ---------------- main loop ----------------
+    def run(self):
+        self.get_logger().info(f"perception={self.mode}; waiting for motion server / vacuum ...")
+        self.motion.wait_for_server()
+        self.vac.wait_for_service()
+        belt_speed = float(self.get_parameter("belt_speed").value)
+        hover = float(self.get_parameter("hover").value)
+        xmin, xmax = self.get_parameter("pick_x_min").value, self.get_parameter("pick_x_max").value
+        fits = PRODUCT_FITS[self.tray.name]
+        done, attempts = 0, 0
+        cycle_times, t_start = [], None
+        blacklist = {}
+        self.run_motion([seg(MotionSegment.PTP_CART, 0.35, 0.0, 0.75, 0.0)], "home")
+        self.belts(belt_speed)
+        last_report = 0.0
+        while rclpy.ok() and done < int(self.get_parameter("cycles").value):
+            now = time.monotonic()
+            trays = [t for t in self.trays() if 0.05 < t.x < 0.40 and t.tilt < math.radians(3) and abs(t.z - BELT_Z) < 0.012
+                     and self.free_pocket(t) is not None]
+            cands = [c for c in self.candidates(fits) if xmin < c.x < xmax and -0.6 < c.y < -0.1 and reachable(c.x, c.y)
+                     and not c.occluded and c.tilt < math.radians(4) and blacklist.get(c.key, 0) < now]
+            if not trays or not cands:
+                if now - last_report > 5.0:
+                    last_report = now
+                    self.get_logger().info(f"waiting: {len(cands)} pickable, {len(trays)} trays ready")
+                self.belts(belt_speed)
+                time.sleep(0.1)
+                continue
+            self.belts(0.0)
+            self.wait_belts_stopped()
+            time.sleep(0.25 if self.mode == "vision" else 0.15)  # let perception see the stopped scene
+            trays = [t for t in self.trays() if 0.05 < t.x < 0.40 and self.free_pocket(t) is not None]
+            cands = [c for c in self.candidates(fits) if xmin < c.x < xmax and reachable(c.x, c.y) and not c.occluded
+                     and c.tilt < math.radians(4) and blacklist.get(c.key, 0) < now]
+            if not trays or not cands:
+                self.belts(belt_speed)
+                continue
+            tray = trays[0]
+            pocket = self.free_pocket(tray)
+            c = max(cands, key=lambda c: c.x)
+            h = PRODUCT_HEIGHT[c.cls]
+            if t_start is None:
+                t_start = time.monotonic()
+            tc = time.monotonic()
+            attempts += 1
+            pick = [seg(MotionSegment.VIA_CART, c.x, c.y, c.top + hover, c.yaw, via_speed=0.5),
+                    seg(MotionSegment.PTP_CART, c.x, c.y, c.top + 0.001, c.yaw)]
+            if not self.run_motion(pick, f"pick {c.key}"):
+                blacklist[c.key] = time.monotonic() + 15.0
+                self.vacuum(False, 0.0)
+                self.run_motion([seg(MotionSegment.PTP_CART, c.x, c.y, c.top + hover, c.yaw)], "retreat")
+                self.belts(belt_speed)
+                continue
+            r = self.vacuum(True, 0.5)
+            if not r.sealed:
+                self.get_logger().warn(f"no seal on {c.key}")
+                blacklist[c.key] = time.monotonic() + 15.0
+                self.vacuum(False, 0.1)
+                self.run_motion([seg(MotionSegment.PTP_CART, c.x, c.y, c.top + hover, c.yaw)], "retreat")
+                continue
+            px, py, zf = self.tray.pocket_world((tray.x, tray.y, tray.z), tray.yaw, pocket)
+            place_z = zf + h + 0.004
+            place = [seg(MotionSegment.VIA_CART, c.x, c.y, c.top + hover, c.yaw, via_speed=0.5),
+                     seg(MotionSegment.VIA_CART, px, py, place_z + hover, tray.yaw, via_speed=0.5),
+                     seg(MotionSegment.PTP_CART, px, py, place_z, tray.yaw)]
+            ok = self.run_motion(place, f"place {c.key} -> {tray.key}[{pocket}]")
+            self.vacuum(False, 0.1)
+            self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
+            self.run_motion([seg(MotionSegment.VIA_CART, px, py, place_z + hover, tray.yaw, via_speed=0.5)], "lift")
+            if ok:
+                done += 1
+                cycle_times.append(time.monotonic() - tc)
+                el = time.monotonic() - t_start
+                self.get_logger().info(
+                    f"cycle {done}: {cycle_times[-1]:.2f} s | {60.0 * done / el:.1f} cpm incl. indexing | mean motion "
+                    f"{sum(cycle_times) / len(cycle_times):.2f} s | success {done}/{attempts}"
+                )
+        self.belts(belt_speed)
+        self.get_logger().info(f"finished: {done} cycles, {attempts} attempts, mode={self.mode}")
+
+
+def main():
+    rclpy.init()
+    node = RunCycle()
+    ex = MultiThreadedExecutor(num_threads=4)
+    ex.add_node(node)
+    th = threading.Thread(target=ex.spin, daemon=True)
+    th.start()
+    try:
+        node.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

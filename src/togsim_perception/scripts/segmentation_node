@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Instance segmentation for the overhead cameras.
+
+source:=yolo  runs the fine-tuned YOLO-seg model (ultralytics) on each camera's RGB image.
+source:=gt    uses the Gazebo panoptic label map instead (cell launched with segmentation:=true) - for testing the
+              downstream geometry without trained weights, and as an oracle baseline.
+
+Per camera <cam> it publishes
+  /togsim/detections/<cam>   vision_msgs/Detection2DArray   (class id/name, score, bbox), one entry per instance
+  /togsim/masks/<cam>        sensor_msgs/Image mono16        instance map: 0 = background, i+1 = detection i
+  /togsim/debug/<cam>        sensor_msgs/Image bgr8          overlay for the HMI
+  /togsim/perception/latency_ms  std_msgs/Float32
+"""
+
+import os
+import threading
+import time
+
+import cv2
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
+from std_msgs.msg import Float32
+from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
+
+from togsim_perception.datagen.labels import CLASS_NAMES, instances_from_labels_map
+
+COLORS = {0: (0, 200, 255), 1: (60, 60, 255), 2: (255, 200, 60)}  # bgr per class
+
+
+class SegmentationNode(Node):
+    def __init__(self):
+        super().__init__("segmentation_node")
+        self.declare_parameter("cams", ["cam_pick", "cam_place"])
+        self.declare_parameter("source", "yolo")
+        self.declare_parameter("weights", os.path.expanduser("~/togsim_data/weights/togsim_seg.pt"))
+        self.declare_parameter("conf", 0.5)
+        self.declare_parameter("iou", 0.6)
+        self.declare_parameter("imgsz", 640)
+        self.declare_parameter("max_rate", 15.0)
+        self.cams = list(self.get_parameter("cams").value)
+        self.source = self.get_parameter("source").value
+        self.conf = float(self.get_parameter("conf").value)
+        self.iou = float(self.get_parameter("iou").value)
+        self.imgsz = int(self.get_parameter("imgsz").value)
+        self.min_period = 1.0 / max(float(self.get_parameter("max_rate").value), 1e-3)
+        self.br = CvBridge()
+        self.model = None
+        if self.source == "yolo":
+            from ultralytics import YOLO
+
+            self.model = YOLO(os.path.expanduser(self.get_parameter("weights").value))
+            self.get_logger().info(f"YOLO-seg weights: {self.get_parameter('weights').value}")
+        self.lock = threading.Lock()
+        self.pubs = {}
+        self.last_t = {}
+        for cam in self.cams:
+            self.pubs[cam] = (
+                self.create_publisher(Detection2DArray, f"/togsim/detections/{cam}", 5),
+                self.create_publisher(Image, f"/togsim/masks/{cam}", 5),
+                self.create_publisher(Image, f"/togsim/debug/{cam}", 2),
+            )
+            self.last_t[cam] = 0.0
+            if self.source == "gt":
+                self.create_subscription(Image, f"/{cam}/segmentation/labels_map", self._gt_cb(cam), qos_profile_sensor_data)
+                self.latest_rgb = {}
+                self.create_subscription(Image, f"/{cam}/image", self._rgb_cache_cb(cam), qos_profile_sensor_data)
+            else:
+                self.create_subscription(Image, f"/{cam}/image", self._rgb_cb(cam), qos_profile_sensor_data)
+        self.lat_pub = self.create_publisher(Float32, "/togsim/perception/latency_ms", 5)
+        self.get_logger().info(f"segmentation_node ready (source={self.source}, cams={self.cams})")
+
+    # ---------------- helpers ----------------
+    def publish(self, cam, header, rgb, instances):
+        """instances: list of (class_id, score, mask_bool)."""
+        det_pub, mask_pub, dbg_pub = self.pubs[cam]
+        h, w = rgb.shape[:2]
+        inst_map = np.zeros((h, w), np.uint16)
+        arr = Detection2DArray()
+        arr.header = header
+        overlay = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        for i, (cls, score, mask) in enumerate(instances):
+            inst_map[mask] = i + 1
+            ys, xs = np.where(mask)
+            d = Detection2D()
+            d.header = header
+            d.id = str(i)
+            d.bbox.center.position.x = float((xs.min() + xs.max()) / 2)
+            d.bbox.center.position.y = float((ys.min() + ys.max()) / 2)
+            d.bbox.size_x = float(xs.max() - xs.min() + 1)
+            d.bbox.size_y = float(ys.max() - ys.min() + 1)
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = CLASS_NAMES[cls]
+            hyp.hypothesis.score = float(score)
+            d.results.append(hyp)
+            arr.detections.append(d)
+            col = COLORS.get(cls, (255, 255, 255))
+            overlay[mask] = (overlay[mask] * 0.55 + np.array(col) * 0.45).astype(np.uint8)
+            cv2.putText(overlay, f"{CLASS_NAMES[cls]} {score:.2f}", (int(xs.min()), max(12, int(ys.min()) - 3)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+        det_pub.publish(arr)
+        m = self.br.cv2_to_imgmsg(inst_map, encoding="mono16")
+        m.header = header
+        mask_pub.publish(m)
+        if dbg_pub.get_subscription_count() > 0:
+            o = self.br.cv2_to_imgmsg(overlay, encoding="bgr8")
+            o.header = header
+            dbg_pub.publish(o)
+
+    def throttle(self, cam):
+        now = time.monotonic()
+        if now - self.last_t[cam] < self.min_period:
+            return True
+        self.last_t[cam] = now
+        return False
+
+    # ---------------- yolo path ----------------
+    def _rgb_cb(self, cam):
+        def f(msg):
+            if self.throttle(cam):
+                return
+            t0 = time.monotonic()
+            rgb = self.br.imgmsg_to_cv2(msg, "rgb8")
+            with self.lock:
+                res = self.model.predict(rgb, imgsz=self.imgsz, conf=self.conf, iou=self.iou, device=0, verbose=False,
+                                         retina_masks=True)[0]
+            instances = []
+            if res.masks is not None:
+                masks = res.masks.data.cpu().numpy() > 0.5
+                classes = res.boxes.cls.cpu().numpy().astype(int)
+                scores = res.boxes.conf.cpu().numpy()
+                for mk, c, s in zip(masks, classes, scores, strict=False):
+                    if mk.shape != rgb.shape[:2]:
+                        mk = cv2.resize(mk.astype(np.uint8), (rgb.shape[1], rgb.shape[0])) > 0
+                    if mk.sum() >= 60:
+                        instances.append((int(c), float(s), mk))
+            self.publish(cam, msg.header, rgb, instances)
+            self.lat_pub.publish(Float32(data=float((time.monotonic() - t0) * 1000.0)))
+
+        return f
+
+    # ---------------- ground-truth path ----------------
+    def _rgb_cache_cb(self, cam):
+        def f(msg):
+            self.latest_rgb[cam] = msg
+
+        return f
+
+    def _gt_cb(self, cam):
+        def f(msg):
+            if self.throttle(cam):
+                return
+            t0 = time.monotonic()
+            labels = self.br.imgmsg_to_cv2(msg, "rgb8")
+            rgb_msg = self.latest_rgb.get(cam)
+            rgb = self.br.imgmsg_to_cv2(rgb_msg, "rgb8") if rgb_msg is not None else np.zeros_like(labels)
+            instances = [(cls, 1.0, mask) for cls, mask in instances_from_labels_map(labels)]
+            self.publish(cam, msg.header, rgb, instances)
+            self.lat_pub.publish(Float32(data=float((time.monotonic() - t0) * 1000.0)))
+
+        return f
+
+
+def main():
+    rclpy.init()
+    node = SegmentationNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

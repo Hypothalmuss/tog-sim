@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Synthetic instance-segmentation dataset from the running cell.
+
+Launch the cell first with:  ros2 launch togsim_bringup sim_full.launch.py gui:=false products:=false segmentation:=true
+Then:                         ros2 run togsim_perception run_datagen --ros-args -p frames:=400 -p out_dir:=~/togsim_data/seg_v1
+
+Per scene: belts stopped, previous objects removed, random products (some leaning / overlapping) dropped in the pick
+camera's field of view, 0-2 trays with random pocket occupancy in the place camera's field of view, randomised sun and
+lamp colours, settle, then one synchronised RGB + panoptic label frame per camera is saved with YOLO-seg polygons.
+"""
+
+import math
+import os
+import random
+import subprocess
+import threading
+import time
+
+import cv2
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import Float64
+
+from togsim_perception.datagen.labels import CLASS_NAMES, overlay, yolo_seg_lines
+
+WORLD = "cell"
+BELT_Z = 0.52
+TRAY_PITCH = (0.090, 0.070)
+TRAY_GRID = (2, 4)
+PRODUCT_H = {"product_bar": 0.0186, "product_carton": 0.025}
+
+
+def q_from_rpy(r, p, y):
+    cy, sy, cp, sp, cr, sr = math.cos(y / 2), math.sin(y / 2), math.cos(p / 2), math.sin(p / 2), math.cos(r / 2), math.sin(r / 2)
+    return (sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy)
+
+
+class DataGen(Node):
+    def __init__(self):
+        super().__init__("run_datagen")
+        self.declare_parameter("frames", 400)
+        self.declare_parameter("out_dir", os.path.expanduser("~/togsim_data/seg_v1"))
+        self.declare_parameter("cams", ["cam_pick", "cam_place"])
+        self.declare_parameter("seed", 0)
+        self.declare_parameter("settle_s", 0.7)
+        self.frames = int(self.get_parameter("frames").value)
+        self.out = os.path.expanduser(self.get_parameter("out_dir").value)
+        self.cams = list(self.get_parameter("cams").value)
+        self.settle = float(self.get_parameter("settle_s").value)
+        random.seed(int(self.get_parameter("seed").value))
+        for d in ("images", "labels", "labels_raw", "preview"):
+            os.makedirs(os.path.join(self.out, d), exist_ok=True)
+        self.br = CvBridge()
+        self.lock = threading.Lock()
+        self.latest = {}  # (cam, kind) -> (stamp_ns, image)
+        for cam in self.cams:
+            self.create_subscription(Image, f"/{cam}/image", self._cb(cam, "rgb"), 2)
+            self.create_subscription(Image, f"/{cam}/segmentation/labels_map", self._cb(cam, "labels"), 2)
+        self.belt_pubs = [self.create_publisher(Float64, f"/togsim/conveyor/{b}/cmd_vel", 10) for b in ("infeed", "outfeed")]
+        self.spawned = []
+        self.counter = 0
+
+    def _cb(self, cam, kind):
+        def f(m):
+            stamp = m.header.stamp.sec * 1_000_000_000 + m.header.stamp.nanosec
+            img = self.br.imgmsg_to_cv2(m, "rgb8")
+            with self.lock:
+                self.latest[(cam, kind)] = (stamp, img)
+        return f
+
+    # ---------------- gazebo helpers ----------------
+    def ign(self, service, reqtype, req, reptype="ignition.msgs.Boolean"):
+        r = subprocess.run(["ign", "service", "-s", service, "--reqtype", reqtype, "--reptype", reptype, "--timeout", "2000", "--req", req],
+                           capture_output=True, text=True)
+        return "data: true" in r.stdout
+
+    def spawn(self, model, name, x, y, z, roll=0.0, pitch=0.0, yaw=0.0):
+        qx, qy, qz, qw = q_from_rpy(roll, pitch, yaw)
+        req = (f'sdf_filename: "model://{model}", name: "{name}", allow_renaming: false, '
+               f"pose: {{position: {{x: {x:.4f}, y: {y:.4f}, z: {z:.4f}}}, orientation: {{x: {qx:.5f}, y: {qy:.5f}, z: {qz:.5f}, w: {qw:.5f}}}}}")
+        if self.ign(f"/world/{WORLD}/create", "ignition.msgs.EntityFactory", req):
+            self.spawned.append(name)
+
+    def clear(self):
+        for n in self.spawned:
+            self.ign(f"/world/{WORLD}/remove", "ignition.msgs.Entity", f'name: "{n}", type: MODEL')
+        self.spawned = []
+
+    def randomize_lights(self):
+        d = [random.uniform(0.5, 1.0) for _ in range(3)]
+        dx, dy = random.uniform(-0.6, 0.6), random.uniform(-0.6, 0.6)
+        self.ign(f"/world/{WORLD}/light_config", "ignition.msgs.Light",
+                 f'name: "sun", type: DIRECTIONAL, diffuse: {{r: {d[0]:.2f}, g: {d[1]:.2f}, b: {d[2]:.2f}, a: 1}}, '
+                 f"direction: {{x: {dx:.2f}, y: {dy:.2f}, z: -0.9}}, cast_shadows: {random.random() < 0.7}")
+        for lamp in ("lamp_pick", "lamp_place"):
+            i = random.uniform(0.2, 0.9)
+            self.ign(f"/world/{WORLD}/light_config", "ignition.msgs.Light",
+                     f'name: "{lamp}", type: POINT, diffuse: {{r: {i:.2f}, g: {i * random.uniform(0.85, 1.0):.2f}, b: {i * random.uniform(0.8, 1.0):.2f}, a: 1}}')
+
+    # ---------------- scene ----------------
+    def build_scene(self):
+        self.counter += 1
+        k = random.randint(2, 10)
+        for i in range(k):  # infeed: unsorted products in the pick camera FOV
+            cls = random.choice(["product_bar", "product_bar", "product_carton"])
+            x, y = random.uniform(-0.05, 0.72), random.uniform(-0.50, -0.20)
+            yaw = random.uniform(-math.pi, math.pi)
+            lean = random.random() < 0.3
+            z = BELT_Z + 0.02 + (0.06 if lean else 0.0)
+            self.spawn(cls, f"dg_p{self.counter}_{i}", x, y, z,
+                       random.uniform(-0.4, 0.4) if lean else 0.0, random.uniform(-0.4, 0.4) if lean else 0.0, yaw)
+        for t in range(random.randint(0, 2)):  # outfeed: trays with random occupancy
+            tx, ty = random.uniform(0.0, 0.65), 0.35 + random.uniform(-0.03, 0.03)
+            tyaw = random.uniform(-0.08, 0.08)
+            self.spawn("tray_2x4", f"dg_t{self.counter}_{t}", tx, ty, BELT_Z + 0.012, 0, 0, tyaw)
+            rows, cols = TRAY_GRID
+            for r in range(rows):
+                for c in range(cols):
+                    if random.random() < 0.45:
+                        ox = -cols * TRAY_PITCH[0] / 2 + (c + 0.5) * TRAY_PITCH[0]
+                        oy = -rows * TRAY_PITCH[1] / 2 + (r + 0.5) * TRAY_PITCH[1]
+                        px = tx + math.cos(tyaw) * ox - math.sin(tyaw) * oy
+                        py = ty + math.sin(tyaw) * ox + math.cos(tyaw) * oy
+                        self.spawn("product_carton", f"dg_tp{self.counter}_{t}_{r}{c}", px, py, BELT_Z + 0.03, 0, 0, tyaw + random.uniform(-0.15, 0.15))
+        if random.random() < 0.3:  # a loose product on the outfeed
+            self.spawn("product_bar", f"dg_lo{self.counter}", random.uniform(0.0, 0.7), random.uniform(0.2, 0.5), BELT_Z + 0.02, 0, 0, random.uniform(-3, 3))
+
+    def grab_pair(self, cam, after_ns, timeout=3.0):
+        """Return (rgb, labels) captured after `after_ns` with identical stamps."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self.lock:
+                a = self.latest.get((cam, "rgb"))
+                b = self.latest.get((cam, "labels"))
+            if a and b and a[0] == b[0] and a[0] > after_ns:
+                return a[1], b[1]
+            time.sleep(0.02)
+        return None, None
+
+    def run(self):
+        for p in self.belt_pubs:
+            p.publish(Float64(data=0.0))
+        time.sleep(1.0)
+        saved = 0
+        t_start = time.time()
+        for i in range(self.frames):
+            self.clear()
+            self.randomize_lights()
+            self.build_scene()
+            time.sleep(self.settle)
+            with self.lock:
+                now_ns = max([v[0] for v in self.latest.values()] + [0])
+            for cam in self.cams:
+                rgb, labels = self.grab_pair(cam, now_ns)
+                if rgb is None:
+                    self.get_logger().warn(f"{cam}: no synchronised frame")
+                    continue
+                lines = yolo_seg_lines(labels)
+                stem = f"{cam}_{i:05d}"
+                cv2.imwrite(os.path.join(self.out, "images", stem + ".png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(os.path.join(self.out, "labels_raw", stem + ".png"), cv2.cvtColor(labels, cv2.COLOR_RGB2BGR))
+                with open(os.path.join(self.out, "labels", stem + ".txt"), "w") as f:
+                    f.write("\n".join(lines) + ("\n" if lines else ""))
+                if i % 25 == 0:
+                    cv2.imwrite(os.path.join(self.out, "preview", stem + ".jpg"), cv2.cvtColor(overlay(rgb, labels), cv2.COLOR_RGB2BGR))
+                saved += 1
+            if i % 10 == 0:
+                el = time.time() - t_start
+                self.get_logger().info(f"scene {i + 1}/{self.frames}, {saved} images, {el / (i + 1):.1f} s/scene")
+        self.clear()
+        self.write_dataset_yaml()
+        self.get_logger().info(f"done: {saved} images in {self.out}")
+
+    def write_dataset_yaml(self):
+        imgs = sorted(os.listdir(os.path.join(self.out, "images")))
+        random.shuffle(imgs)
+        n_val = max(1, len(imgs) // 10)
+        for split, lst in (("val", imgs[:n_val]), ("train", imgs[n_val:])):
+            with open(os.path.join(self.out, f"{split}.txt"), "w") as f:
+                f.write("\n".join(os.path.join(self.out, "images", s) for s in sorted(lst)) + "\n")
+        with open(os.path.join(self.out, "data.yaml"), "w") as f:
+            f.write(f"path: {self.out}\ntrain: train.txt\nval: val.txt\nnames:\n")
+            for i, n in enumerate(CLASS_NAMES):
+                f.write(f"  {i}: {n}\n")
+
+
+def main():
+    rclpy.init()
+    node = DataGen()
+    th = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    th.start()
+    try:
+        node.run()
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

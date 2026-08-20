@@ -12,6 +12,7 @@ from launch_ros.substitutions import FindPackageShare
 PASS = [
     "product_rate",
     "max_products",
+    "segmentation",
     "gui",
     "products",
     "infeed_speed",
@@ -25,6 +26,7 @@ PASS = [
     "conveyor_visuals",
 ]
 DEFAULTS = {
+    "segmentation": "false",
     "product_rate": "24.0",
     "max_products": "12",
     "gui": "true",

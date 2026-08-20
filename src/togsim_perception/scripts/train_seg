@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Fine-tune YOLO11n-seg on the synthetic dataset and export the weights.
+
+  ros2 run togsim_perception train_seg -- --data ~/togsim_data/seg_v1/data.yaml --epochs 40
+"""
+
+import argparse
+import os
+import shutil
+
+from ultralytics import YOLO
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default=os.path.expanduser("~/togsim_data/seg_v1/data.yaml"))
+    ap.add_argument("--model", default="yolo11n-seg.pt")
+    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--name", default="seg_v1")
+    ap.add_argument("--project", default=os.path.expanduser("~/togsim_data/runs"))
+    ap.add_argument("--out", default=os.path.expanduser("~/togsim_data/weights/togsim_seg.pt"))
+    args = ap.parse_args()
+    model = YOLO(args.model)
+    model.train(data=args.data, epochs=args.epochs, imgsz=args.imgsz, batch=args.batch, device=0, project=args.project,
+                name=args.name, exist_ok=True, mosaic=1.0, copy_paste=0.3, degrees=10.0, flipud=0.5, fliplr=0.5,
+                hsv_h=0.02, hsv_s=0.5, hsv_v=0.4, close_mosaic=5, plots=True, verbose=False)
+    best = os.path.join(args.project, args.name, "weights", "best.pt")
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    shutil.copy(best, args.out)
+    metrics = YOLO(args.out).val(data=args.data, imgsz=args.imgsz, device=0, plots=False, verbose=False)
+    print(f"best weights -> {args.out}")
+    print(f"mask mAP50={metrics.seg.map50:.3f} mAP50-95={metrics.seg.map:.3f} | box mAP50={metrics.box.map50:.3f}")
+
+
+if __name__ == "__main__":
+    main()

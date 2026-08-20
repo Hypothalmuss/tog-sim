@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Masks + depth -> 3D pick candidates for the SCARA (suction point, yaw, tilt, occlusion ordering).
+
+Subscribes /togsim/detections/cam_pick, /togsim/masks/cam_pick, /cam_pick/depth_image, /cam_pick/camera_info and TF.
+Publishes  /togsim/pick_candidates (togsim_msgs/PickCandidateArray, world frame) and serves
+           /togsim/get_pick_candidates (GetPickCandidates: blocks until a frame newer than `newer_than`).
+"""
+
+import math
+import threading
+import time
+
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import PoseStamped
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CameraInfo, Image
+from tf2_ros import Buffer, TransformListener
+from vision_msgs.msg import Detection2DArray
+
+from togsim_msgs.msg import PickCandidate, PickCandidateArray
+from togsim_msgs.srv import GetPickCandidates
+from togsim_perception.geometry import (
+    median_depth,
+    pixel_to_point,
+    plane_normal,
+    principal_axis,
+    quat_to_rot,
+    suction_point,
+    transform_points,
+)
+
+CLASS_TO_PRODUCT = {"bar": "product_bar", "carton": "product_carton"}
+
+
+class PickPoseNode(Node):
+    def __init__(self):
+        super().__init__("pick_pose_node")
+        self.declare_parameter("cam", "cam_pick")
+        self.declare_parameter("world_frame", "world")
+        self.declare_parameter("cup_radius_m", 0.02)
+        self.declare_parameter("tilt_threshold_deg", 8.0)
+        self.declare_parameter("max_tilt_deg", 40.0)
+        self.declare_parameter("belt_velocity_topic", "/togsim/conveyor/infeed/state")
+        cam = self.get_parameter("cam").value
+        self.world = self.get_parameter("world_frame").value
+        self.cup_r = float(self.get_parameter("cup_radius_m").value)
+        self.tilt_thr = math.radians(float(self.get_parameter("tilt_threshold_deg").value))
+        self.max_tilt = math.radians(float(self.get_parameter("max_tilt_deg").value))
+        self.br = CvBridge()
+        self.cb = ReentrantCallbackGroup()
+        self.lock = threading.Lock()
+        self.k = None
+        self.depth = None
+        self.depth_stamp = None
+        self.masks = {}  # stamp_ns -> (mask_img, detections)
+        self.det = {}
+        self.latest = None  # PickCandidateArray
+        self.latest_ns = 0
+        self.belt_v = 0.0
+        self.tf_buf = Buffer()
+        self.tf_listener = TransformListener(self.tf_buf, self, spin_thread=False)
+        self.create_subscription(CameraInfo, f"/{cam}/camera_info", self.on_info, 5, callback_group=self.cb)
+        self.create_subscription(Image, f"/{cam}/depth_image", self.on_depth, qos_profile_sensor_data, callback_group=self.cb)
+        self.create_subscription(Image, f"/togsim/masks/{cam}", self.on_masks, 5, callback_group=self.cb)
+        self.create_subscription(Detection2DArray, f"/togsim/detections/{cam}", self.on_det, 5, callback_group=self.cb)
+        from std_msgs.msg import Float64
+
+        self.create_subscription(Float64, self.get_parameter("belt_velocity_topic").value, lambda m: setattr(self, "belt_v", m.data), 5)
+        self.pub = self.create_publisher(PickCandidateArray, "/togsim/pick_candidates", 5)
+        self.create_service(GetPickCandidates, "/togsim/get_pick_candidates", self.on_get, callback_group=self.cb)
+        self.seq = 0
+        self.get_logger().info("pick_pose_node ready")
+
+    def on_info(self, msg):
+        self.k = np.array(msg.k, dtype=float).reshape(3, 3)
+        self.optical_frame = msg.header.frame_id
+
+    def on_depth(self, msg):
+        with self.lock:
+            self.depth = self.br.imgmsg_to_cv2(msg, "32FC1")
+            self.depth_stamp = msg.header.stamp
+
+    def on_det(self, msg):
+        ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        with self.lock:
+            self.det[ns] = msg
+            mask = self.masks.pop(ns, None)
+        if mask is not None:
+            self.process(msg.header, mask, msg)
+
+    def on_masks(self, msg):
+        ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        img = self.br.imgmsg_to_cv2(msg, "mono16")
+        with self.lock:
+            det = self.det.pop(ns, None)
+            if det is None:
+                self.masks[ns] = img
+                # keep the caches small
+                for k in sorted(self.masks)[:-5]:
+                    self.masks.pop(k, None)
+                for k in sorted(self.det)[:-5]:
+                    self.det.pop(k, None)
+        if det is not None:
+            self.process(msg.header, img, det)
+
+    # ---------------- core ----------------
+    def process(self, header, inst_map, det):
+        if self.k is None:
+            return
+        with self.lock:
+            depth = None if self.depth is None else self.depth.copy()
+        if depth is None or depth.shape != inst_map.shape:
+            return
+        try:
+            tf = self.tf_buf.lookup_transform(self.world, self.optical_frame, rclpy.time.Time())
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"TF {self.world}<-{self.optical_frame}: {e}", throttle_duration_sec=2.0)
+            return
+        q, t = tf.transform.rotation, tf.transform.translation
+        rot = quat_to_rot(q.x, q.y, q.z, q.w)
+        trans = np.array([t.x, t.y, t.z])
+        cam_z_world = rot[:, 2]  # optical z axis in world (points down)
+        gsd_cache = {}
+
+        cands = []
+        n = len(det.detections)
+        masks = [(inst_map == i + 1) for i in range(n)]
+        depths = []
+        for i in range(n):
+            depths.append(median_depth(depth, masks[i]) if masks[i].sum() >= 60 else None)
+        for i, d in enumerate(det.detections):
+            mask, z = masks[i], depths[i]
+            if z is None:
+                continue
+            cls = d.results[0].hypothesis.class_id
+            if cls not in CLASS_TO_PRODUCT:
+                continue
+            su, sv, r_px = suction_point(mask)
+            cu, cv_, ang, long_px, short_px = principal_axis(mask)
+            gsd = gsd_cache.setdefault(round(z, 2), z / self.k[0, 0])  # m per px at this depth
+            margin_mm = (r_px * gsd - self.cup_r) * 1000.0
+            # 3D suction point in world
+            p_cam = pixel_to_point(su, sv, z, self.k)
+            p_w = transform_points(p_cam[None, :], rot, trans)[0]
+            # yaw of the product's long axis in world: image x -> world via rot
+            dir_cam = np.array([math.cos(ang), math.sin(ang), 0.0])
+            dir_w = rot @ dir_cam
+            yaw = math.atan2(dir_w[1], dir_w[0])
+            # tilt from a plane fit
+            n_cam, rms = plane_normal(depth, mask, self.k)
+            tilt = 0.0
+            if n_cam is not None:
+                n_w = rot @ n_cam
+                tilt = math.acos(max(-1.0, min(1.0, abs(n_w[2]))))
+            # occlusion: a neighbouring instance closer to the camera touching this mask
+            occluded = False
+            dil = np.zeros_like(mask)
+            ys, xs = np.where(mask)
+            y0, y1, x0, x1 = max(ys.min() - 3, 0), min(ys.max() + 4, mask.shape[0]), max(xs.min() - 3, 0), min(xs.max() + 4, mask.shape[1])
+            dil[y0:y1, x0:x1] = True
+            for j in range(n):
+                if j != i and depths[j] is not None and depths[j] < z - 0.004 and (masks[j] & dil).any():
+                    occluded = True
+                    break
+            c = PickCandidate()
+            c.header = header
+            c.header.frame_id = self.world
+            c.id = i
+            c.class_name = CLASS_TO_PRODUCT[cls]
+            c.score = float(d.results[0].hypothesis.score)
+            c.grasp_pose = PoseStamped()
+            c.grasp_pose.header = c.header
+            c.grasp_pose.pose.position.x, c.grasp_pose.pose.position.y, c.grasp_pose.pose.position.z = map(float, p_w)
+            c.grasp_pose.pose.orientation.z = math.sin(yaw / 2)
+            c.grasp_pose.pose.orientation.w = math.cos(yaw / 2)
+            c.tilt_deg = float(math.degrees(tilt)) if self.tilt_thr <= tilt <= self.max_tilt else 0.0
+            c.yaw_deg = float(math.degrees(yaw))
+            c.suction_margin_mm = float(margin_mm)
+            c.height_m = float(p_w[2])
+            c.mask_area_px = float(mask.sum())
+            c.occluded = bool(occluded) or tilt > self.max_tilt
+            c.belt_velocity.x = float(self.belt_v)
+            c.observed = header.stamp
+            cands.append(c)
+        # top-most first (closest to the camera), then un-occluded
+        cands.sort(key=lambda c: (c.occluded, -c.height_m))
+        arr = PickCandidateArray()
+        arr.header = header
+        arr.header.frame_id = self.world
+        self.seq += 1
+        arr.frame_seq = self.seq
+        arr.candidates = cands
+        with self.lock:
+            self.latest = arr
+            self.latest_ns = header.stamp.sec * 1_000_000_000 + header.stamp.nanosec
+        self.pub.publish(arr)
+
+    def on_get(self, req, res):
+        want = req.newer_than.sec * 1_000_000_000 + req.newer_than.nanosec
+        deadline = time.monotonic() + max(0.05, req.timeout_s)
+        while time.monotonic() < deadline:
+            with self.lock:
+                if self.latest is not None and self.latest_ns > want:
+                    res.success = True
+                    res.candidates = self.latest
+                    if req.class_filter:
+                        res.candidates.candidates = [c for c in self.latest.candidates if c.class_name == req.class_filter]
+                    return res
+            time.sleep(0.01)
+        res.success = False
+        return res
+
+
+def main():
+    rclpy.init()
+    node = PickPoseNode()
+    ex = MultiThreadedExecutor(num_threads=4)
+    ex.add_node(node)
+    try:
+        ex.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

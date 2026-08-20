@@ -79,6 +79,8 @@ class ProductSpawner(Node):
         self.product_period = 60.0 / max(self.cfg["products.rate_per_min"], 1e-3)
         self.next_product_t = time.monotonic() + 2.0
         self.timer = self.create_timer(0.2, self.tick)
+        # belt speeds are published only during start-up; afterwards the task layer owns the belts
+        self.belt_pubs_left = 5
         self.belt_timer = self.create_timer(1.0, self.publish_belts)
         self.get_logger().info("product_spawner ready")
 
@@ -145,6 +147,10 @@ class ProductSpawner(Node):
                     self.poses[n] = (tr.x, tr.y, tr.z)
 
     def publish_belts(self):
+        if self.belt_pubs_left <= 0:
+            self.belt_timer.cancel()
+            return
+        self.belt_pubs_left -= 1
         self.infeed_pub.publish(Float64(data=float(self.cfg["belts.infeed_speed"])))
         self.outfeed_pub.publish(Float64(data=float(self.cfg["belts.outfeed_speed"])))
 

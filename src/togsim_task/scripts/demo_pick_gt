@@ -39,6 +39,12 @@ def yaw_of(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
+def tilt_of(q):
+    """Angle between the body z axis and the world z axis (0 = lying flat)."""
+    zz = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+    return math.acos(max(-1.0, min(1.0, zz)))
+
+
 def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0, frame="world", scale=0.0):
     s = MotionSegment()
     s.type = type_
@@ -67,6 +73,7 @@ class DemoPick(Node):
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
         self.cb = ReentrantCallbackGroup()
         self.poses = {}
+        self.tilts = {}
         self.seen = {}
         self.lock = threading.Lock()
         self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_poses, 10, callback_group=self.cb)
@@ -74,6 +81,12 @@ class DemoPick(Node):
         self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
         self.infeed = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
         self.outfeed = self.create_publisher(Float64, "/togsim/conveyor/outfeed/cmd_vel", 10)
+        self.belt_state = {"infeed": 1.0, "outfeed": 1.0}
+        for b in ("infeed", "outfeed"):
+            self.create_subscription(
+                Float64, f"/togsim/conveyor/{b}/state", lambda m, b=b: self.belt_state.__setitem__(b, m.data), 10,
+                callback_group=self.cb,
+            )
 
     def on_poses(self, msg):
         with self.lock:
@@ -82,6 +95,7 @@ class DemoPick(Node):
                 if n.startswith(("product_", "tray_")):
                     tr, q = t.transform.translation, t.transform.rotation
                     self.poses[n] = ((tr.x, tr.y, tr.z), yaw_of(q))
+                    self.tilts[n] = tilt_of(q)
                     self.seen[n] = time.monotonic()
             # forget models that disappeared (despawned)
             for n in [k for k, ts in self.seen.items() if time.monotonic() - ts > 2.0]:
@@ -104,6 +118,14 @@ class DemoPick(Node):
             self.infeed.publish(Float64(data=float(speed)))
             self.outfeed.publish(Float64(data=float(speed)))
             time.sleep(0.05)
+
+    def wait_belts_stopped(self, timeout=2.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if max(abs(v) for v in self.belt_state.values()) < 0.003:
+                return True
+            time.sleep(0.02)
+        return False
 
     def run_motion(self, segments, label):
         goal = ExecuteMotion.Goal()
@@ -192,6 +214,7 @@ class DemoPick(Node):
                 and -0.6 < p[1] < -0.1
                 and p[2] < 0.6
                 and reachable(p[0], p[1])
+                and self.tilts.get(n, 0.0) < math.radians(4.0)  # flat products only (angled grasps come with M3)
                 and blacklist.get(n, 0.0) < now
             ]
             if not trays or not cands:
@@ -206,7 +229,8 @@ class DemoPick(Node):
                 time.sleep(0.1)
                 continue
             self.belts(0.0)
-            time.sleep(0.25)  # let things settle
+            self.wait_belts_stopped()
+            time.sleep(0.15)  # let things settle
             snap = self.snapshot()
             tray_name = trays[0]
             pocket = self.free_pocket(snap, tray_name)
@@ -221,7 +245,7 @@ class DemoPick(Node):
             tc = time.monotonic()
             pick = [
                 seg(MotionSegment.VIA_CART, pxyz[0], pxyz[1], top + hover, pyaw, via_speed=0.5),
-                seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top - 0.002, pyaw),
+                seg(MotionSegment.PTP_CART, pxyz[0], pxyz[1], top - 0.001, pyaw),
             ]
             if not self.run_motion(pick, f"pick {name}"):
                 blacklist[name] = time.monotonic() + 15.0

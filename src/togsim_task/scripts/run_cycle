@@ -82,7 +82,7 @@ class RunCycle(Node):
         self.declare_parameter("cycles", 20)
         self.declare_parameter("pick_x_min", 0.10)
         self.declare_parameter("pick_x_max", 0.50)
-        self.declare_parameter("hover", 0.06)
+        self.declare_parameter("hover", 0.04)
         self.declare_parameter("belt_speed", 0.10)
         # waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for every |y| < 1.1, so anywhere else within
         # reach the arm hides products (bar recall 0.5-0.64 with the arm parked over the belt)
@@ -92,7 +92,10 @@ class RunCycle(Node):
         self.declare_parameter("continuous", False)
         self.declare_parameter("pick_lead_s", 0.9)  # time to fly from the previous pose to the product
         self.declare_parameter("place_lead_s", 1.2)  # time from the pick to the pocket
-        self.declare_parameter("track_dwell_s", 0.35)  # hold on the moving product while the cup seals
+        self.declare_parameter("track_dwell_s", 0.25)  # hold on the moving product while the cup seals
+        self.declare_parameter(
+            "pick_direct", True
+        )  # approach the moving product with TRACK segments only (no fly-through)
         self.mode = self.get_parameter("perception").value
         self.continuous = bool(self.get_parameter("continuous").value)
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
@@ -237,6 +240,7 @@ class RunCycle(Node):
                 gh.cancel_goal_async()
                 return False
         res = rf.result().result
+        self.get_logger().info(f"motion {label}: {res.duration_s:.2f} s")
         if not res.success:
             self.get_logger().warn(f"{label}: {res.message} (code {res.error_code})")
         return res.success
@@ -298,6 +302,7 @@ class RunCycle(Node):
                     and xmin < x_arrive < xmax
                     and -0.6 < c.y < -0.1
                     and reachable(x_done, c.y)
+                    and math.hypot(x_arrive, c.y) > 0.28  # not folded against the base
                     and not c.occluded
                     and c.tilt < math.radians(4)
                     and blacklist.get(c.key, 0) < now
@@ -332,21 +337,21 @@ class RunCycle(Node):
             parked = False
             frame = f"prod_{c.tid}"
             seal = {}
+            pick = [
+                seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, 0.0, tracked=frame),
+                seg(MotionSegment.TRACK_CART, 0.0, 0.0, 0.001, 0.0, dwell=dwell, tracked=frame),
+            ]
+            if not bool(self.get_parameter("pick_direct").value):
+                pick.insert(0, seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, c.yaw, via_speed=0.5))
+            hover_idx = len(pick) - 2  # feedback index of the hover segment: start the vacuum once it is reached
 
-            def on_fb(fb, frame=frame):
-                if (
-                    fb.feedback.segment_index == 1 and "t" not in seal
-                ):  # hover reached: descending onto the moving product
+            def on_fb(fb, hover_idx=hover_idx):
+                if fb.feedback.segment_index == hover_idx and "t" not in seal:  # descending onto the moving product
                     seal["t"] = threading.Thread(
                         target=lambda: seal.__setitem__("r", self.vacuum(True, 0.6)), daemon=True
                     )
                     seal["t"].start()
 
-            pick = [
-                seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, c.yaw, via_speed=0.5),
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, 0.0, tracked=frame),
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, 0.001, 0.0, dwell=dwell, tracked=frame),
-            ]
             ok = self.run_motion(pick, f"pick {c.key}", on_feedback=on_fb)
             if "t" in seal:
                 seal["t"].join(timeout=1.0)
@@ -358,7 +363,8 @@ class RunCycle(Node):
                 )
                 blacklist[c.key] = time.monotonic() + 15.0
                 self.vacuum(False, 0.0)
-                self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "retreat")
+                if time.monotonic() - tc > 0.3:  # the arm left the park pose: back off from the product
+                    self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "retreat")
                 continue
             # choose the tray now: the one selected before the pick has moved on
             fresh = []
@@ -414,7 +420,7 @@ class RunCycle(Node):
             if tray.occupied[i] or self.latched.get((tray.key, i), 0) > now:
                 continue
             px, py, _ = self.tray.pocket_world((tray.x + tray.vx * lead, tray.y, tray.z), tray.yaw, i)
-            if reachable(px, py) and px < 0.50:
+            if reachable(px, py) and -0.20 < px < 0.45:  # comfortably inside the arc, not at the reach limit
                 return i
         return None
 

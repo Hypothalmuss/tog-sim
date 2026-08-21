@@ -18,7 +18,6 @@ import threading
 import time
 
 import cv2
-import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
@@ -87,10 +86,17 @@ class DataGen(Node):
         return f
 
     # ---------------- gazebo helpers ----------------
-    def ign(self, service, reqtype, req, reptype="ignition.msgs.Boolean"):
-        r = subprocess.run(["ign", "service", "-s", service, "--reqtype", reqtype, "--reptype", reptype, "--timeout", "2000", "--req", req],
-                           capture_output=True, text=True)
+    def ign(self, service, reqtype, req, reptype="ignition.msgs.Boolean", timeout_ms=4000):
+        r = subprocess.run(["ign", "service", "-s", service, "--reqtype", reqtype, "--reptype", reptype, "--timeout", str(timeout_ms),
+                            "--req", req], capture_output=True, text=True)
         return "data: true" in r.stdout
+
+    def world_models(self, prefix="dg_"):
+        """Names of the models currently in the world (None if the query failed)."""
+        r = subprocess.run(["ign", "model", "--list"], capture_output=True, text=True, timeout=20)
+        if r.returncode != 0 or "Available models" not in r.stdout:
+            return None
+        return [ln.strip()[2:] for ln in r.stdout.splitlines() if ln.strip().startswith("- ") and ln.strip()[2:].startswith(prefix)]
 
     def spawn(self, model, name, x, y, z, roll=0.0, pitch=0.0, yaw=0.0):
         qx, qy, qz, qw = q_from_rpy(roll, pitch, yaw)
@@ -99,9 +105,30 @@ class DataGen(Node):
         if self.ign(f"/world/{WORLD}/create", "ignition.msgs.EntityFactory", req):
             self.spawned.append(name)
 
-    def clear(self):
-        for n in self.spawned:
-            self.ign(f"/world/{WORLD}/remove", "ignition.msgs.Entity", f'name: "{n}", type: MODEL')
+    def clear(self, retries=3):
+        """Remove every model this generator spawned; verify, because removal requests get lost when the server is busy
+        (leftover products pile up on the belts and the real-time factor collapses)."""
+        names = list(self.spawned)
+        for attempt in range(retries + 1):
+            failures = 0
+            for n in names:
+                ok = self.ign(f"/world/{WORLD}/remove", "ignition.msgs.Entity", f'name: "{n}", type: MODEL')
+                failures = 0 if ok else failures + 1
+                if failures >= 5:
+                    self.get_logger().warn("server not answering remove requests, giving up on this pass")
+                    break
+            time.sleep(0.1)
+            left = self.world_models()
+            if left is None:  # could not verify: assume the best once, retry otherwise
+                if attempt:
+                    continue
+                break
+            names = [n for n in left if n.startswith("dg_")]  # also catches leftovers of an earlier run
+            if not names:
+                break
+            self.get_logger().warn(f"{len(names)} models not removed (attempt {attempt + 1}), retrying")
+        else:
+            self.get_logger().error(f"{len(names)} models still in the world: {names[:5]}...")
         self.spawned = []
 
     def randomize_lights(self):
@@ -170,6 +197,8 @@ class DataGen(Node):
 
     def _loop(self, saved, t_start):
         n = self.frames - self.start
+        self.spawned = self.world_models() or []  # leftovers of a previous run in this sim
+        silent = 0
         for j, i in enumerate(range(self.start, self.frames)):
             self.clear()
             self.randomize_lights()
@@ -177,11 +206,13 @@ class DataGen(Node):
             time.sleep(self.settle)
             with self.lock:
                 now_ns = max([v[0] for v in self.latest.values()] + [0])
+            got = 0
             for cam in self.cams:
                 rgb, labels = self.grab_pair(cam, now_ns)
                 if rgb is None:
                     self.get_logger().warn(f"{cam}: no synchronised frame")
                     continue
+                got += 1
                 lines = yolo_seg_lines(labels)
                 stem = f"{cam}_{i:05d}"
                 cv2.imwrite(os.path.join(self.out, "images", stem + ".png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
@@ -196,6 +227,10 @@ class DataGen(Node):
                 self.get_logger().info(f"scene {i + 1}/{self.frames} ({j + 1}/{n} this run), {saved} images, {el / (j + 1):.1f} s/scene")
             if j % 25 == 24:
                 self.write_dataset_yaml()  # keep the split files usable if the run is interrupted
+            silent = silent + 1 if got == 0 else 0
+            if silent >= 3:
+                self.get_logger().error("cameras silent for 3 scenes: the simulator is stalled, exiting (resume after a restart)")
+                raise SystemExit(3)
         self.get_logger().info(f"done: {saved} images this run, {self.frames} scenes in {self.out}")
 
     def write_dataset_yaml(self):

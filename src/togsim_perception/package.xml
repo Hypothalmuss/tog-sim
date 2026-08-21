@@ -17,6 +17,7 @@
   <depend>tf2_msgs</depend>
   <depend>image_geometry</depend>
   <depend>togsim_msgs</depend>
+  <exec_depend>togsim_task</exec_depend>
   <depend>std_msgs</depend>
   <exec_depend>togsim_gazebo</exec_depend>
   <test_depend>ament_cmake_pytest</test_depend>

@@ -43,7 +43,7 @@ def tilt_of(q):
     return math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (q.x * q.x + q.y * q.y))))
 
 
-def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0, frame="world"):
+def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0, frame="world", tracked=""):
     s = MotionSegment()
     s.type = type_
     s.pose = PoseStamped()
@@ -54,6 +54,7 @@ def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0,
     s.tilt_deg = float(tilt)
     s.via_speed_mps = float(via_speed)
     s.dwell_s = float(dwell)
+    s.tracked_frame = tracked
     return s
 
 
@@ -74,10 +75,11 @@ class Candidate:
 
 
 class Tray:
-    __slots__ = ("key", "x", "y", "z", "yaw", "occupied", "tilt")
+    __slots__ = ("key", "x", "y", "z", "yaw", "occupied", "tilt", "vx", "tid")
 
     def __init__(self, key, x, y, z, yaw, occupied, tilt=0.0):
         self.key, self.x, self.y, self.z, self.yaw, self.occupied, self.tilt = key, x, y, z, yaw, occupied, tilt
+        self.vx, self.tid = 0.0, None
 
 
 class RunCycle(Node):
@@ -93,7 +95,14 @@ class RunCycle(Node):
         # waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for every |y| < 1.1, so anywhere else within
         # reach the arm hides products (bar recall 0.5-0.64 with the arm parked over the belt)
         self.declare_parameter("park", [-0.25, -0.25, 0.75])
+        # continuous mode (M4): belts keep running; products/trays come from conveyor_tracker (/togsim/tracks/*) and
+        # pick/place use TRACK_CART segments that follow the prod_<id> / tray_<id> TF frames
+        self.declare_parameter("continuous", False)
+        self.declare_parameter("pick_lead_s", 0.9)  # time to fly from the previous pose to the product
+        self.declare_parameter("place_lead_s", 1.2)  # time from the pick to the pocket
+        self.declare_parameter("track_dwell_s", 0.35)  # hold on the moving product while the cup seals
         self.mode = self.get_parameter("perception").value
+        self.continuous = bool(self.get_parameter("continuous").value)
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
         self.cb = ReentrantCallbackGroup()
@@ -163,6 +172,8 @@ class RunCycle(Node):
                                 math.radians(c.yaw_deg),
                                 math.radians(c.tilt_deg),
                                 c.occluded,
+                                c.belt_velocity.x,
+                                int(c.id),
                             )
                         )
         return out
@@ -188,7 +199,9 @@ class RunCycle(Node):
                         self.vis_trays.pop(tid, None)
                         continue
                     p = m.pose.pose.position
-                    out.append(Tray(f"t{tid}", p.x, p.y, p.z, yaw_of(m.pose.pose.orientation), list(m.occupied)))
+                    tr = Tray(f"t{tid}", p.x, p.y, p.z, yaw_of(m.pose.pose.orientation), list(m.occupied))
+                    tr.vx, tr.tid = m.velocity.x, int(tid)
+                    out.append(tr)
         return out
 
     # ---------------- actuation helpers ----------------
@@ -206,10 +219,10 @@ class RunCycle(Node):
             time.sleep(0.02)
         return False
 
-    def run_motion(self, segments, label):
+    def run_motion(self, segments, label, on_feedback=None):
         goal = ExecuteMotion.Goal()
         goal.segments = segments
-        fut = self.motion.send_goal_async(goal)
+        fut = self.motion.send_goal_async(goal, feedback_callback=on_feedback)
         t0 = time.monotonic()
         while not fut.done():
             time.sleep(0.002)
@@ -249,11 +262,115 @@ class RunCycle(Node):
                 return i
         return None
 
+    # ---------------- continuous (M4) ----------------
+    def run_continuous(self):
+        """Belts never stop: pick the most downstream product that will still be in the window when the cup arrives,
+        seal while tracking it, place into the next free pocket of a moving tray while tracking the tray."""
+        belt_speed = float(self.get_parameter("belt_speed").value)
+        hover = float(self.get_parameter("hover").value)
+        xmin, xmax = self.get_parameter("pick_x_min").value, self.get_parameter("pick_x_max").value
+        lead, place_lead = float(self.get_parameter("pick_lead_s").value), float(self.get_parameter("place_lead_s").value)
+        dwell = float(self.get_parameter("track_dwell_s").value)
+        fits = PRODUCT_FITS[self.tray.name]
+        park = [float(v) for v in self.get_parameter("park").value]
+        done, attempts = 0, 0
+        cycle_times, t_start = [], None
+        blacklist = {}
+        self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
+        parked = True
+        self.belts(belt_speed)
+        last_report = 0.0
+        while rclpy.ok() and done < int(self.get_parameter("cycles").value):
+            now = time.monotonic()
+            trays = []
+            for t in self.trays():
+                if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
+                    continue
+                pocket = self.free_pocket_moving(t, place_lead)
+                if pocket is not None:
+                    trays.append((t, pocket))
+            cands = []
+            for c in self.candidates(fits):
+                x_arrive = c.x + c.vx * lead
+                if c.tid is not None and xmin < x_arrive < xmax and -0.6 < c.y < -0.1 and reachable(x_arrive, c.y) \
+                        and not c.occluded and c.tilt < math.radians(4) and blacklist.get(c.key, 0) < now:
+                    cands.append((c, x_arrive))
+            if not trays or not cands:
+                if now - last_report > 5.0:
+                    last_report = now
+                    self.get_logger().info(f"waiting: {len(cands)} pickable, {len(trays)} trays ready")
+                if not parked:
+                    parked = self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
+                time.sleep(0.05)
+                continue
+            c, x_arrive = max(cands, key=lambda ca: ca[1])
+            tray, pocket = trays[0]
+            h = PRODUCT_HEIGHT[c.cls]
+            if t_start is None:
+                t_start = time.monotonic()
+            tc = time.monotonic()
+            attempts += 1
+            parked = False
+            frame = f"prod_{c.tid}"
+            seal = {}
+
+            def on_fb(fb, frame=frame):
+                if fb.feedback.segment_index == 1 and "t" not in seal:  # hover reached: descending onto the moving product
+                    seal["t"] = threading.Thread(target=lambda: seal.__setitem__("r", self.vacuum(True, 0.6)), daemon=True)
+                    seal["t"].start()
+
+            pick = [seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, c.yaw, via_speed=0.5),
+                    seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, 0.0, tracked=frame),
+                    seg(MotionSegment.TRACK_CART, 0.0, 0.0, 0.001, 0.0, dwell=dwell, tracked=frame)]
+            ok = self.run_motion(pick, f"pick {c.key}", on_feedback=on_fb)
+            if "t" in seal:
+                seal["t"].join(timeout=1.0)
+            sealed = ok and seal.get("r") is not None and seal["r"].sealed
+            if not sealed:
+                self.get_logger().warn(f"no seal on {c.key}" if ok else f"pick {c.key} failed")
+                blacklist[c.key] = time.monotonic() + 15.0
+                self.vacuum(False, 0.0)
+                self.run_motion([seg(MotionSegment.PTP_CART, x_arrive + c.vx * 0.6, c.y, c.top + hover, c.yaw)], "retreat")
+                continue
+            tframe = f"tray_{tray.tid}"
+            ox, oy = self.tray.pocket_offset(pocket)
+            z_place = self.tray.base_thickness + h + 0.004  # relative to the tray origin (tray bottom)
+            x_now = x_arrive + c.vx * (time.monotonic() - tc)
+            place = [seg(MotionSegment.VIA_CART, x_now, c.y, c.top + hover, c.yaw, via_speed=0.5),
+                     seg(MotionSegment.TRACK_CART, ox, oy, z_place + hover, 0.0, tracked=tframe),
+                     seg(MotionSegment.TRACK_CART, ox, oy, z_place, 0.0, dwell=0.2, tracked=tframe)]
+            ok = self.run_motion(place, f"place {c.key} -> {tray.key}[{pocket}]")
+            self.vacuum(False, 0.05)
+            self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
+            self.run_motion([seg(MotionSegment.TRACK_CART, ox, oy, z_place + hover, 0.0, tracked=tframe)], "lift")
+            if ok:
+                done += 1
+                cycle_times.append(time.monotonic() - tc)
+                el = time.monotonic() - t_start
+                self.get_logger().info(
+                    f"cycle {done}: {cycle_times[-1]:.2f} s | {60.0 * done / el:.1f} cpm | mean motion "
+                    f"{sum(cycle_times) / len(cycle_times):.2f} s | success {done}/{attempts}"
+                )
+        self.get_logger().info(f"finished: {done} cycles, {attempts} attempts, mode={self.mode} continuous")
+
+    def free_pocket_moving(self, tray, lead):
+        """First free, unlatched pocket that will still be reachable `lead` seconds from now."""
+        now = time.monotonic()
+        for i in range(self.tray.n_pockets):
+            if tray.occupied[i] or self.latched.get((tray.key, i), 0) > now:
+                continue
+            px, py, _ = self.tray.pocket_world((tray.x + tray.vx * lead, tray.y, tray.z), tray.yaw, i)
+            if reachable(px, py) and px < 0.50:
+                return i
+        return None
+
     # ---------------- main loop ----------------
     def run(self):
         self.get_logger().info(f"perception={self.mode}; waiting for motion server / vacuum ...")
         self.motion.wait_for_server()
         self.vac.wait_for_service()
+        if self.continuous:
+            return self.run_continuous()
         belt_speed = float(self.get_parameter("belt_speed").value)
         hover = float(self.get_parameter("hover").value)
         xmin, xmax = self.get_parameter("pick_x_min").value, self.get_parameter("pick_x_max").value

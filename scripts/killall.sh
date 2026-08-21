@@ -13,7 +13,7 @@ kill_pat() {
     [ "$pid" = "$me" ] || [ "$pid" = "$parent" ] || ! ours "$pid" || kill "$pid" 2>/dev/null || true
   done
 }
-for pat in "ign gazebo" "ruby /usr/bin/ign" parameter_bridge image_bridge product_spawner motion_server vacuum_bridge run_datagen run_cycle segmentation_node pick_pose_node tray_vacancy_node eval_pick_poses \
+for pat in "ign gazebo" "ruby /usr/bin/ign" parameter_bridge image_bridge product_spawner motion_server vacuum_bridge run_datagen run_cycle segmentation_node pick_pose_node tray_vacancy_node eval_pick_poses conveyor_tracker \
            demo_pick_gt robot_state_publisher static_transform_publisher "ros2 launch" "controller_manager/spawner"; do
   kill_pat "$pat"
 done

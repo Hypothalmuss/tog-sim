@@ -12,8 +12,17 @@ cleanup() { "$here/scripts/killall.sh" >/dev/null; }
 trap cleanup EXIT
 cleanup
 echo "[m4] launching cell (headless, products on) -> $out"
-setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed >"$out/sim.log" 2>&1 </dev/null &
-wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || { echo "[m4] motion server missing"; exit 1; }
+launch_cell() {  # Fortress occasionally hangs at robot spawn (controller_manager never appears): relaunch once
+  for attempt in 1 2; do
+    cleanup
+    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed >"$out/sim$attempt.log" 2>&1 </dev/null &
+    wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || continue
+    wait_for 60 timeout 3 ros2 topic echo --once /joint_states --field header && return 0
+    echo "[m4] simulator hung at start-up (no joint states), relaunching"
+  done
+  return 1
+}
+launch_cell || { echo "[m4] cell did not come up"; exit 1; }
 if [ "$mode" = vision ]; then
   wait_for 60 timeout 3 ros2 topic echo --once /cam_pick/depth_image --field header || { echo "[m4] cameras missing"; exit 1; }
   setsid ros2 launch togsim_perception perception.launch.py >"$out/perception.log" 2>&1 </dev/null &

@@ -10,6 +10,9 @@
 // Why Ruckig streaming instead of a planner: the cell is structured and collision-free by design; what limits the
 // cycle rate is latency and stops between segments. Ruckig gives time-optimal jerk-limited motion, allows fly-by
 // via points (non-zero target velocity) and re-targeting every tick (moving trays) with no planning latency.
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <ruckig/ruckig.hpp>
@@ -59,6 +62,7 @@ class MotionServer : public rclcpp::Node {
     kin_.tool_length = declare_parameter("tool_length", 0.1992);
     kin_.elbow_right = declare_parameter("elbow_right", true);
     settleTol_ = declare_parameter("settle_tolerance", 0.002);
+    trackSettleTol_ = declare_parameter("track_settle_tolerance", 0.004);  // Cartesian, m
     for (size_t i = 0; i < DOF; ++i) {
       vmax_[i] = vmax[i]; amax_[i] = amax[i]; jmax_[i] = jmax[i]; pmin_[i] = pmin[i]; pmax_[i] = pmax[i]; home_[i] = home[i];
     }
@@ -147,6 +151,14 @@ class MotionServer : public rclcpp::Node {
     geometry_msgs::msg::PoseStamped p = s.pose;
     if (!frameOverride.empty()) p.header.frame_id = frameOverride;
     if (p.header.frame_id.empty()) p.header.frame_id = baseFrame_;
+    if (p.header.frame_id == "tcp") {  // relative to where the tool is right now (e.g. "lift 60 mm straight up")
+      TcpPose cur = forward(input_.current_position, kin_);
+      TcpPose t;
+      t.x = cur.x + p.pose.position.x; t.y = cur.y + p.pose.position.y; t.z = cur.z + p.pose.position.z;
+      t.yaw = cur.yaw + tf2::getYaw(p.pose.orientation);
+      t.tilt = s.tilt_deg * M_PI / 180.0;
+      return t;
+    }
     geometry_msgs::msg::PoseStamped pb = p;
     if (p.header.frame_id != baseFrame_) {
       try {
@@ -204,6 +216,9 @@ class MotionServer : public rclcpp::Node {
     segScale_ = (s.velocity_scale > 0.0f) ? std::clamp(static_cast<double>(s.velocity_scale), 0.05, 1.0) : 1.0;
     applyLimits();
     dwellUntil_.reset();
+    trackPrevValid_ = false;
+    trackVel_.fill(0.0);
+    trackErr_ = 1.0;
     if (s.type == Segment::PTP_JOINT) {
       if (s.joint_target.size() != DOF) return fail(ExecuteMotion::Result::LIMITS, "joint_target needs 5 values");
       std::array<double, DOF> q{};
@@ -214,7 +229,13 @@ class MotionServer : public rclcpp::Node {
     auto tcp = segmentToTcp(s);
     if (!tcp) return fail(ExecuteMotion::Result::TRACKING_LOST, "pose frame not available");
     auto ik = inverse(*tcp, input_.current_position, kin_, true);
-    if (ik.status != IkStatus::Ok) return fail(ExecuteMotion::Result::IK_UNREACHABLE, "IK failed for segment " + std::to_string(idx));
+    if (ik.status != IkStatus::Ok) {
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "IK failed for segment %zu: %s at (%.3f, %.3f, %.3f) yaw %.1f deg tilt %.1f deg", idx,
+                    ik.status == IkStatus::OutOfLimits ? "out of joint limits" : "unreachable", tcp->x, tcp->y, tcp->z,
+                    tcp->yaw * 180.0 / M_PI, tcp->tilt * 180.0 / M_PI);
+      return fail(ExecuteMotion::Result::IK_UNREACHABLE, buf);
+    }
     std::array<double, DOF> v{};
     if (s.type == Segment::VIA_CART && s.via_speed_mps > 0.0f) {
       // descending if the via point is above the next segment's target
@@ -282,7 +303,41 @@ class MotionServer : public rclcpp::Node {
           auto tcp = segmentToTcp(s, s.tracked_frame.empty() ? "" : s.tracked_frame);
           if (tcp) {
             auto ik = inverse(*tcp, input_.current_position, kin_, true);
-            if (ik.status == IkStatus::Ok) setJointTarget(ik.q, {});
+            if (ik.status == IkStatus::Ok) {
+              // Frame velocity: low-pass filtered Cartesian displacement between TF updates (constant on a belt), then
+              // the joint-space feed-forward from a second IK solve a little ahead along that velocity. A zero target
+              // velocity made the generator decelerate towards every new target and trail the product by centimetres.
+              const auto tnow = now();
+              const std::array<double, 3> pnow{tcp->x, tcp->y, tcp->z};
+              if (!trackPrevValid_) {
+                trackPrevP_ = pnow; trackPrevTime_ = tnow; trackPrevValid_ = true; trackVelCart_.fill(0.0);
+              } else {
+                bool moved = false;
+                for (size_t i = 0; i < 3; ++i) moved |= std::fabs(pnow[i] - trackPrevP_[i]) > 1e-5;
+                const double dt = (tnow - trackPrevTime_).seconds();
+                if (moved && dt > 1e-3) {
+                  for (size_t i = 0; i < 3; ++i) {
+                    const double sample = std::clamp((pnow[i] - trackPrevP_[i]) / dt, -1.0, 1.0);
+                    trackVelCart_[i] = 0.85 * trackVelCart_[i] + 0.15 * sample;
+                  }
+                  trackPrevP_ = pnow; trackPrevTime_ = tnow;
+                }
+              }
+              trackVel_.fill(0.0);
+              constexpr double kDelta = 0.02;  // s
+              TcpPose ahead = *tcp;
+              ahead.x += trackVelCart_[0] * kDelta; ahead.y += trackVelCart_[1] * kDelta; ahead.z += trackVelCart_[2] * kDelta;
+              auto ik2 = inverse(ahead, ik.q, kin_, true);
+              if (ik2.status == IkStatus::Ok)
+                for (size_t i = 0; i < DOF; ++i) trackVel_[i] = std::clamp((ik2.q[i] - ik.q[i]) / kDelta, -0.5 * vmax_[i], 0.5 * vmax_[i]);
+              setJointTarget(ik.q, trackVel_);
+              const TcpPose cur = forward(input_.current_position, kin_);
+              trackErr_ = std::sqrt(std::pow(cur.x - tcp->x, 2) + std::pow(cur.y - tcp->y, 2) + std::pow(cur.z - tcp->z, 2));
+              RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 500, "track seg %zu: err %.1f mm, v_cart [%.3f %.3f %.3f]", segIdx_,
+                                    trackErr_ * 1e3, trackVelCart_[0], trackVelCart_[1], trackVelCart_[2]);
+            } else {
+              RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 500, "track seg %zu: target unreachable (%.3f, %.3f)", segIdx_, tcp->x, tcp->y);
+            }
           }
         }
       }
@@ -326,11 +381,8 @@ class MotionServer : public rclcpp::Node {
     if (goal_ && segStarted_) {
       const auto& s = goal_->get_goal()->segments[segIdx_];
       bool reached = (res == ruckig::Result::Finished);
-      if (!reached && s.type == Segment::TRACK_CART) {
-        double err = 0.0;
-        for (size_t i = 0; i < DOF; ++i) err = std::max(err, std::fabs(input_.current_position[i] - input_.target_position[i]));
-        reached = err < settleTol_;
-      }
+      if (!reached && s.type == Segment::TRACK_CART)  // a tracked target is never "finished": settle within tolerance
+        reached = trackPrevValid_ && trackErr_ < trackSettleTol_;
       if (reached) {
         if (s.dwell_s > 0.0f && !dwellUntil_) dwellUntil_ = now() + rclcpp::Duration::from_seconds(s.dwell_s);
         if (!dwellUntil_ || now() >= *dwellUntil_) {
@@ -355,6 +407,12 @@ class MotionServer : public rclcpp::Node {
   std::array<double, DOF> vmax_{}, amax_{}, jmax_{}, pmin_{}, pmax_{}, home_{};
   KinematicParams kin_;
   double settleTol_{0.002};
+  double trackSettleTol_{0.006};
+  std::array<double, DOF> trackVel_{};
+  std::array<double, 3> trackPrevP_{}, trackVelCart_{};
+  rclcpp::Time trackPrevTime_;
+  bool trackPrevValid_{false};
+  double trackErr_{1.0};
   double override_{1.0}, segScale_{1.0};
 
   std::unique_ptr<ruckig::Ruckig<DOF>> otg_;

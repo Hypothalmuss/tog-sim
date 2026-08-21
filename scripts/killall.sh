@@ -5,6 +5,7 @@
 me=$$; parent=$PPID
 ours() {  # $1 = pid
   local cmd; cmd=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
+  case "$cmd" in *".claude/shell-snapshots"*|*"bash -c "*) return 1 ;; esac  # interactive / agent shells, never
   case "$cmd" in *togsim*|*"ign gazebo"*|*"ruby /usr/bin/ign"*) return 0 ;; esac
   return 1
 }

@@ -14,8 +14,8 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 |---|---|
 | M0 Skeleton — packages, robot description, analytical IK + tests, CI | ✅ |
 | M1 Sim cell — conveyors, products, trays, ros2_control in Gazebo Fortress | ✅ |
-| M2 First closed loop (ground-truth perception) | 🟡 plugins, motion server, demo written — end-to-end run pending |
-| M3 Vision — synthetic data, YOLO-seg, grasp pose, tray vacancy | ⬜ |
+| M2 First closed loop (ground-truth perception) | ✅ 12/12 GT cycles, ~32 cpm motion-only |
+| M3 Vision — synthetic data, YOLO-seg, grasp pose, tray vacancy | 🟡 600 synthetic scenes → YOLO11n-seg mask mAP50 0.98; vs ground truth: class acc 1.00, recall 0.92, precision 0.94, grasp height 0.4 mm, yaw 0.8°; **12/13 vision-driven cycles** (`scripts/m3_validate.sh`). Open: GIF, tray-vacancy metrics |
 | M4 Speed & moving-tray tracking, benchmark | ⬜ |
 | M5 HMI | ⬜ |
 | M6 Polish, teach-in, stereo stretch, Docker | ⬜ |

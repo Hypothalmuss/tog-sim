@@ -72,7 +72,9 @@ class SegmentationNode(Node):
             )
             self.last_t[cam] = 0.0
             if self.source == "gt":
-                self.create_subscription(Image, f"/{cam}/segmentation/labels_map", self._gt_cb(cam), qos_profile_sensor_data)
+                self.create_subscription(
+                    Image, f"/{cam}/segmentation/labels_map", self._gt_cb(cam), qos_profile_sensor_data
+                )
                 self.latest_rgb = {}
                 self.create_subscription(Image, f"/{cam}/image", self._rgb_cache_cb(cam), qos_profile_sensor_data)
             else:
@@ -106,8 +108,16 @@ class SegmentationNode(Node):
             arr.detections.append(d)
             col = COLORS.get(cls, (255, 255, 255))
             overlay[mask] = (overlay[mask] * 0.55 + np.array(col) * 0.45).astype(np.uint8)
-            cv2.putText(overlay, f"{CLASS_NAMES[cls]} {score:.2f}", (int(xs.min()), max(12, int(ys.min()) - 3)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+            cv2.putText(
+                overlay,
+                f"{CLASS_NAMES[cls]} {score:.2f}",
+                (int(xs.min()), max(12, int(ys.min()) - 3)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                col,
+                1,
+                cv2.LINE_AA,
+            )
         det_pub.publish(arr)
         m = self.br.cv2_to_imgmsg(inst_map, encoding="mono16")
         m.header = header
@@ -131,9 +141,20 @@ class SegmentationNode(Node):
                 return
             t0 = time.monotonic()
             rgb = self.br.imgmsg_to_cv2(msg, "rgb8")
+            # ultralytics treats numpy input as BGR (the training PNGs were read with cv2): feeding RGB swaps red and
+            # blue, and red cartons came out as "bar"
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             with self.lock:
-                res = self.model.predict(rgb, imgsz=self.imgsz, conf=self.conf, iou=self.iou, device=self.device, verbose=False, agnostic_nms=True,
-                                         retina_masks=True)[0]
+                res = self.model.predict(
+                    bgr,
+                    imgsz=self.imgsz,
+                    conf=self.conf,
+                    iou=self.iou,
+                    device=self.device,
+                    verbose=False,
+                    agnostic_nms=True,
+                    retina_masks=True,
+                )[0]
             instances = []
             if res.masks is not None:
                 masks = res.masks.data.cpu().numpy() > 0.5

@@ -28,10 +28,10 @@ jobs:
         run: |
           source /opt/ros/humble/setup.bash
           colcon build --event-handlers console_cohesion+ --cmake-args -DCMAKE_BUILD_TYPE=Release \
-            --packages-skip togsim_gazebo
+            --packages-ignore togsim_gazebo
       - name: Test
         shell: bash
         run: |
           source /opt/ros/humble/setup.bash && source install/setup.bash
-          colcon test --event-handlers console_cohesion+ --packages-skip togsim_gazebo
+          colcon test --event-handlers console_cohesion+ --packages-ignore togsim_gazebo
           colcon test-result --verbose

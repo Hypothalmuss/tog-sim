@@ -38,7 +38,7 @@ class SegmentationNode(Node):
         self.declare_parameter("source", "yolo")
         self.declare_parameter("weights", os.path.expanduser("~/togsim_data/weights/togsim_seg.pt"))
         self.declare_parameter("conf", 0.5)
-        self.declare_parameter("iou", 0.6)
+        self.declare_parameter("iou", 0.45)
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("max_rate", 15.0)
         self.declare_parameter("device", "auto")  # auto | cpu | 0
@@ -132,7 +132,7 @@ class SegmentationNode(Node):
             t0 = time.monotonic()
             rgb = self.br.imgmsg_to_cv2(msg, "rgb8")
             with self.lock:
-                res = self.model.predict(rgb, imgsz=self.imgsz, conf=self.conf, iou=self.iou, device=self.device, verbose=False,
+                res = self.model.predict(rgb, imgsz=self.imgsz, conf=self.conf, iou=self.iou, device=self.device, verbose=False, agnostic_nms=True,
                                          retina_masks=True)[0]
             instances = []
             if res.masks is not None:

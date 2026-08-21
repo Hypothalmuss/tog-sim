@@ -10,6 +10,7 @@ import math
 import threading
 import time
 
+import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
@@ -28,7 +29,8 @@ from togsim_perception.geometry import (
     intrinsics_from_info,
     median_depth,
     pixel_to_point,
-    plane_normal,
+    axis_tilt,
+    contact_depth,
     principal_axis,
     quat_to_rot,
     suction_point,
@@ -48,10 +50,13 @@ class PickPoseNode(Node):
         self.declare_parameter("tilt_threshold_deg", 8.0)
         self.declare_parameter("max_tilt_deg", 40.0)
         self.declare_parameter("belt_velocity_topic", "/togsim/conveyor/infeed/state")
+        # world-frame box of the infeed belt surface; the camera also sees the outfeed belt and the enclosure
+        self.declare_parameter("pick_region", [-0.20, 0.90, -0.52, -0.18])
         cam = self.get_parameter("cam").value
         self.world = self.get_parameter("world_frame").value
         self.hfov = float(self.get_parameter("hfov_rad").value)
         self.cup_r = float(self.get_parameter("cup_radius_m").value)
+        self.region = [float(v) for v in self.get_parameter("pick_region").value]
         self.tilt_thr = math.radians(float(self.get_parameter("tilt_threshold_deg").value))
         self.max_tilt = math.radians(float(self.get_parameter("max_tilt_deg").value))
         self.br = CvBridge()
@@ -150,24 +155,26 @@ class PickPoseNode(Node):
             # 3D suction point in world
             p_cam = pixel_to_point(su, sv, z, self.k)
             p_w = transform_points(p_cam[None, :], rot, trans)[0]
+            if not (self.region[0] <= p_w[0] <= self.region[1] and self.region[2] <= p_w[1] <= self.region[3]):
+                continue  # outfeed belt / enclosure / tray contents are not pick candidates
             # yaw of the product's long axis in world: image x -> world via rot
             dir_cam = np.array([math.cos(ang), math.sin(ang), 0.0])
             dir_w = rot @ dir_cam
             yaw = math.atan2(dir_w[1], dir_w[0])
-            # tilt from a plane fit
-            n_cam, rms = plane_normal(depth, mask, self.k)
-            tilt = 0.0
-            if n_cam is not None:
-                n_w = rot @ n_cam
-                tilt = math.acos(max(-1.0, min(1.0, abs(n_w[2]))))
-            # occlusion: a neighbouring instance closer to the camera touching this mask
+            # tilt of the long axis from the depth ridge profile (bars are rounded: no plane fit across their width)
+            tilt, _rms = axis_tilt(depth, mask, self.k, ang)
+            tilt = abs(tilt)
+            # grasp height: where the cup actually meets the product (ridge at the suction point), not the mask median
+            zc = contact_depth(depth, mask, su, sv)
+            if zc is not None:
+                z = zc
+                p_cam = pixel_to_point(su, sv, z, self.k)
+                p_w = transform_points(p_cam[None, :], rot, trans)[0]
+            # occlusion: a neighbouring instance at least a product height closer to the camera and touching this mask
             occluded = False
-            dil = np.zeros_like(mask)
-            ys, xs = np.where(mask)
-            y0, y1, x0, x1 = max(ys.min() - 3, 0), min(ys.max() + 4, mask.shape[0]), max(xs.min() - 3, 0), min(xs.max() + 4, mask.shape[1])
-            dil[y0:y1, x0:x1] = True
+            dil = cv2.dilate(mask.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
             for j in range(n):
-                if j != i and depths[j] is not None and depths[j] < z - 0.004 and (masks[j] & dil).any():
+                if j != i and depths[j] is not None and depths[j] < z - 0.012 and (masks[j] & dil).any():
                     occluded = True
                     break
             c = PickCandidate()

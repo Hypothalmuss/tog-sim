@@ -135,15 +135,25 @@ class DataGen(Node):
         self.spawned = []
 
     def randomize_lights(self):
-        d = [random.uniform(0.5, 1.0) for _ in range(3)]
-        dx, dy = random.uniform(-0.6, 0.6), random.uniform(-0.6, 0.6)
+        """Complete Light messages around the world defaults (sun 0.9, lamps 0.6 with attenuation): `light_config`
+        resets every field that is missing from the request, so partial messages switched the lamps off and made the
+        whole dataset darker than the live cell. 30% of the scenes keep the default lighting exactly."""
+        default = random.random() < 0.3
+        d = [0.9] * 3 if default else [random.uniform(0.55, 1.2) * random.uniform(0.92, 1.0) for _ in range(3)]
+        dx, dy = (-0.3, 0.2) if default else (random.uniform(-0.6, 0.6), random.uniform(-0.6, 0.6))
+        shadows = "true" if default or random.random() < 0.7 else "false"
         self.ign(f"/world/{WORLD}/light_config", "ignition.msgs.Light",
                  f'name: "sun", type: DIRECTIONAL, diffuse: {{r: {d[0]:.2f}, g: {d[1]:.2f}, b: {d[2]:.2f}, a: 1}}, '
-                 f"direction: {{x: {dx:.2f}, y: {dy:.2f}, z: -0.9}}, cast_shadows: {random.random() < 0.7}")
-        for lamp in ("lamp_pick", "lamp_place"):
-            i = random.uniform(0.2, 0.9)
+                 f"specular: {{r: 0.2, g: 0.2, b: 0.2, a: 1}}, direction: {{x: {dx:.2f}, y: {dy:.2f}, z: -0.9}}, "
+                 f"cast_shadows: {shadows}, intensity: 1.0")
+        for lamp, (x, y) in (("lamp_pick", (0.35, -0.35)), ("lamp_place", (0.35, 0.35))):
+            i = 0.6 if default else random.uniform(0.25, 1.0)
+            g, b = (1.0, 1.0) if default else (random.uniform(0.85, 1.0), random.uniform(0.8, 1.0))
             self.ign(f"/world/{WORLD}/light_config", "ignition.msgs.Light",
-                     f'name: "{lamp}", type: POINT, diffuse: {{r: {i:.2f}, g: {i * random.uniform(0.85, 1.0):.2f}, b: {i * random.uniform(0.8, 1.0):.2f}, a: 1}}')
+                     f'name: "{lamp}", type: POINT, pose: {{position: {{x: {x}, y: {y}, z: 2.2}}}}, '
+                     f"diffuse: {{r: {i:.2f}, g: {i * g:.2f}, b: {i * b:.2f}, a: 1}}, specular: {{r: 0.1, g: 0.1, b: 0.1, a: 1}}, "
+                     f"range: 6, attenuation_constant: 0.6, attenuation_linear: 0.1, attenuation_quadratic: 0.02, "
+                     f"cast_shadows: false, intensity: 1.0")
 
     # ---------------- scene ----------------
     def build_scene(self):

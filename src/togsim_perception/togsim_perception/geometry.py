@@ -82,22 +82,87 @@ def principal_axis(mask: np.ndarray):
     return cu, cv_, ang, w, h
 
 
-def plane_normal(depth: np.ndarray, mask: np.ndarray, k: np.ndarray, step: int = 3):
-    """Least-squares plane through the mask's 3D points: (unit normal pointing to the camera, rms residual m)."""
-    ys, xs = np.where(mask)
+def plane_normal(
+    depth: np.ndarray, mask: np.ndarray, k: np.ndarray, step: int = 3, erode_px: int = 2, outlier_m: float = 0.005
+):
+    """Least-squares plane through the mask's 3D points: (unit normal pointing to the camera, rms residual m).
+
+    The mask is eroded first and the fit is repeated without residual outliers, so the belt pixels that a detector
+    mask always includes along the edges of a narrow product do not tilt the plane (18 mm of depth step at the
+    edges of a 25 mm wide bar used to give ~30 deg of fake tilt)."""
+    m = mask.astype(np.uint8)
+    if erode_px > 0:
+        er = cv2.erode(m, np.ones((2 * erode_px + 1, 2 * erode_px + 1), np.uint8))
+        if er.sum() >= 30:
+            m = er
+    ys, xs = np.where(m.astype(bool))
     ys, xs = ys[::step], xs[::step]
     z = depth[ys, xs]
     ok = np.isfinite(z) & (z > 0.05)
     if ok.sum() < 30:
         return None, None
-    pts = np.stack([pixel_to_point(u, v, d, k) for u, v, d in zip(xs[ok], ys[ok], z[ok], strict=False)])
-    c = pts.mean(axis=0)
-    _, s, vt = np.linalg.svd(pts - c, full_matrices=False)
-    n = vt[2]
+    fx, fy, cx, cy = k[0, 0], k[1, 1], k[0, 2], k[1, 2]
+    pts = np.stack([(xs[ok] - cx) * z[ok] / fx, (ys[ok] - cy) * z[ok] / fy, z[ok]], axis=1)
+    n = None
+    for _ in range(3):
+        c = pts.mean(axis=0)
+        _, sv, vt = np.linalg.svd(pts - c, full_matrices=False)
+        n = vt[2]
+        res = (pts - c) @ n
+        keep = np.abs(res) < outlier_m
+        if keep.sum() < 30 or keep.all():
+            break
+        pts = pts[keep]
     if n[2] > 0:  # optical z points away from the camera; we want the normal facing the camera
         n = -n
-    rms = float(s[2] / math.sqrt(len(pts)))
+    c = pts.mean(axis=0)
+    rms = float(np.sqrt(np.mean(((pts - c) @ n) ** 2)))
     return n, rms
+
+
+def axis_tilt(depth: np.ndarray, mask: np.ndarray, k: np.ndarray, axis_rad: float, bins: int = 12, erode_px: int = 1):
+    """Tilt of a product about the axis perpendicular to its long axis, from the depth *ridge* profile along that axis.
+
+    Bars are rounded: across their ~25 mm width the depth varies by ~10 mm, which makes a plane fit through the whole
+    mask meaningless. Along the long axis the closest-to-camera line (the ridge, 10th depth percentile per bin) is
+    straight for a flat product and sloped for a leaning one. Returns (tilt_rad, rms_m), or (0.0, None) when the
+    mask holds too few valid pixels."""
+    m = mask.astype(np.uint8)
+    if erode_px > 0:
+        er = cv2.erode(m, np.ones((2 * erode_px + 1, 2 * erode_px + 1), np.uint8))
+        if er.sum() >= 60:
+            m = er
+    ys, xs = np.where(m.astype(bool))
+    z = depth[ys, xs]
+    ok = np.isfinite(z) & (z > 0.05)
+    if ok.sum() < 60:
+        return 0.0, None
+    xs, ys, z = xs[ok], ys[ok], z[ok]
+    s = xs * math.cos(axis_rad) + ys * math.sin(axis_rad)  # position along the long axis, px
+    edges = np.linspace(s.min(), s.max() + 1e-6, bins + 1)
+    idx = np.clip(np.digitize(s, edges) - 1, 0, bins - 1)
+    pos, ridge = [], []
+    for b in range(bins):
+        sel = idx == b
+        if sel.sum() >= 4:
+            pos.append(s[sel].mean())
+            ridge.append(np.percentile(z[sel], 10))
+    if len(pos) < 4:
+        return 0.0, None
+    pos, ridge = np.array(pos), np.array(ridge)
+    gsd = float(np.median(ridge)) / k[0, 0]  # metres per pixel at the product's depth
+    a, b = np.polyfit(pos * gsd, ridge, 1)  # depth = a * s + b  ->  slope a = tan(tilt)
+    rms = float(np.sqrt(np.mean((a * pos * gsd + b - ridge) ** 2)))
+    return float(math.atan(a)), rms
+
+
+def contact_depth(depth: np.ndarray, mask: np.ndarray, u: int, v: int, half: int = 3):
+    """Median depth of the mask pixels in a (2*half+1)^2 window around the suction point: the height the cup meets."""
+    y0, y1 = max(v - half, 0), min(v + half + 1, depth.shape[0])
+    x0, x1 = max(u - half, 0), min(u + half + 1, depth.shape[1])
+    win = depth[y0:y1, x0:x1][mask[y0:y1, x0:x1]]
+    win = win[np.isfinite(win) & (win > 0.05)]
+    return float(np.median(win)) if win.size else None
 
 
 def polygon_coverage(mask: np.ndarray, polygon_px: np.ndarray) -> float:

@@ -94,6 +94,9 @@ class RunCycle(Node):
         self.declare_parameter("place_lead_s", 1.2)  # time from the pick to the pocket
         self.declare_parameter("track_dwell_s", 0.25)  # hold on the moving product while the cup seals
         self.declare_parameter(
+            "contact_offset_m", -0.002
+        )  # cup target relative to the estimated top (<0 = slight press)
+        self.declare_parameter(
             "pick_direct", True
         )  # approach the moving product with TRACK segments only (no fly-through)
         self.mode = self.get_parameter("perception").value
@@ -275,6 +278,7 @@ class RunCycle(Node):
             float(self.get_parameter("place_lead_s").value),
         )
         dwell = float(self.get_parameter("track_dwell_s").value)
+        contact = float(self.get_parameter("contact_offset_m").value)
         fits = PRODUCT_FITS[self.tray.name]
         park = [float(v) for v in self.get_parameter("park").value]
         done, attempts = 0, 0
@@ -340,7 +344,7 @@ class RunCycle(Node):
             seal = {}
             pick = [
                 seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, 0.0, tracked=frame),
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, 0.001, 0.0, dwell=dwell, tracked=frame),
+                seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, 0.0, dwell=dwell, tracked=frame),
             ]
             if not bool(self.get_parameter("pick_direct").value):
                 pick.insert(0, seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, c.yaw, via_speed=0.5))
@@ -355,7 +359,9 @@ class RunCycle(Node):
 
             ok = self.run_motion(pick, f"pick {c.key}", on_feedback=on_fb)
             if "t" in seal:
-                seal["t"].join(timeout=4.0)  # the bridge waits in sim time: at RTF 0.5 a 0.6 s seal window is 1.2 s wall
+                seal["t"].join(
+                    timeout=4.0
+                )  # the bridge waits in sim time: at RTF 0.5 a 0.6 s seal window is 1.2 s wall
             sealed = ok and seal.get("r") is not None and seal["r"].sealed
             if not sealed:
                 self.get_logger().warn(

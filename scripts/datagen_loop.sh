@@ -2,7 +2,7 @@
 # Generate the synthetic segmentation dataset robustly: (re)launch the headless cell with panoptic cameras, run the
 # resumable run_datagen, and restart the simulator whenever it stalls (run_datagen exits 3) until all scenes exist.
 #   scripts/datagen_loop.sh [frames=400] [out_dir=~/togsim_data/seg_v1] [max_restarts=20]
-set -u
+set +u  # ROS setup.bash references unset variables
 frames=${1:-400}; out=${2:-$HOME/togsim_data/seg_v1}; max=${3:-20}
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$here/scripts/env.sh"

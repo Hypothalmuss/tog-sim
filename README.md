@@ -16,7 +16,7 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 | M1 Sim cell — conveyors, products, trays, ros2_control in Gazebo Fortress | ✅ |
 | M2 First closed loop (ground-truth perception) | ✅ 12/12 GT cycles, ~32 cpm motion-only |
 | M3 Vision — synthetic data, YOLO-seg, grasp pose, tray vacancy | 🟡 600 synthetic scenes → YOLO11n-seg mask mAP50 0.98; vs ground truth: class acc 1.00, recall 0.92, precision 0.94, grasp height 0.4 mm, yaw 0.8°; **12/13 vision-driven cycles** (`scripts/m3_validate.sh`). Open: GIF, tray-vacancy metrics |
-| M4 Speed & moving-tray tracking, benchmark | ⬜ |
+| M4 Speed & moving-tray tracking, benchmark | 🟡 `conveyor_tracker` (stable product/tray tracks → TF) + `TRACK_CART` picks/places on **moving belts, no belt stops**: GT 12/13, vision **20/24** cycles (`scripts/m4_validate.sh 20 vision`), motion 4.4 s/cycle. Open: cycle time (target ≤2.5 s), bars → `tray_bar_2x3`, seal misses (3/24), benchmark table |
 | M5 HMI | ⬜ |
 | M6 Polish, teach-in, stereo stretch, Docker | ⬜ |
 

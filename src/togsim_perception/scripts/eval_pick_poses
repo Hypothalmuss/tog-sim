@@ -104,9 +104,8 @@ class EvalPickPoses(Node):
         self.n_cand += len(cands)
         self.n_match += len(used_c)
         if self.n_frames % 10 == 0:
-            self.get_logger().info(
-                f"{self.n_frames}/{self.frames} frames, recall {self.recall():.2f}, xy {1e3 * np.mean(self.err_xy or [0]):.1f} mm"
-            )
+            xy = 1e3 * np.mean(self.err_xy or [0])
+            self.get_logger().info(f"{self.n_frames}/{self.frames} frames, recall {self.recall():.2f}, xy {xy:.1f} mm")
         if self.n_frames >= self.frames:
             self.done.set()
 

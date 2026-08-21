@@ -27,10 +27,30 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 git clone <this repo> ~/tog-sim && cd ~/tog-sim   # use a real directory (no symlinks, no spaces in the path)
 ./scripts/fetch_assets.sh          # third-party meshes + Fuel models
 colcon build   # packages live in src/; do not use --symlink-install: Gazebo's model:// lookup does not follow symlinked model dirs
-source install/setup.bash
+source scripts/env.sh   # in EVERY shell: own ROS_DOMAIN_ID (42), workspace overlay, GPU rendering, optional ~/togsim_data/venv
 ros2 launch togsim_description view_robot.launch.py      # robot in RViz with joint sliders
 ros2 launch togsim_gazebo sim.launch.py                   # full cell in Gazebo Fortress (gui:=false for headless)
+ros2 launch togsim_bringup sim_full.launch.py gui:=false  # cell + controllers + vacuum + motion server (headless)
+./scripts/killall.sh                                      # stop leftover tog-sim processes only (stale bridges publish /clock)
 ```
+
+tog-sim uses its own `ROS_DOMAIN_ID` (default 42, override with `TOGSIM_ROS_DOMAIN_ID`) so that other ROS 2 stacks on the
+same machine or LAN — in particular another Gazebo publishing `/clock` — can never mix with it.
+
+### Vision (M3)
+
+```bash
+ros2 launch togsim_bringup sim_full.launch.py gui:=false products:=false segmentation:=true   # cell with panoptic cameras
+ros2 run togsim_perception run_datagen --ros-args -p frames:=400      # resumable synthetic dataset -> ~/togsim_data/seg_v1
+ros2 run togsim_perception train_seg -- --epochs 40                   # YOLO11n-seg -> ~/togsim_data/weights/togsim_seg.pt
+ros2 launch togsim_perception perception.launch.py                    # segmentation + pick poses + tray vacancy
+ros2 run togsim_perception eval_pick_poses --ros-args -p use_sim_time:=true   # vision vs ground truth metrics
+ros2 run togsim_task run_cycle --ros-args -p perception:=vision -p use_sim_time:=true
+```
+
+GPU: install a `torch` build matching the NVIDIA driver into `~/togsim_data/venv` (`python3 -m venv --system-site-packages`,
+e.g. `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128` for driver 535); `scripts/env.sh`
+activates it when present and the nodes pick CUDA automatically (`device:=auto`).
 
 ## Packages
 

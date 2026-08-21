@@ -47,6 +47,9 @@ class DataGen(Node):
         self.declare_parameter("seed", 0)
         self.declare_parameter("settle_s", 0.7)
         self.declare_parameter("start", -1)  # -1: resume after the last existing scene index in out_dir
+        # Fortress answers `ign service` calls slower and slower as calls accumulate (thousands of one-shot CLI nodes);
+        # exit with code 3 after this many scenes so scripts/datagen_loop.sh cycles the simulator (0 = never).
+        self.declare_parameter("restart_every", 60)
         self.frames = int(self.get_parameter("frames").value)
         self.out = os.path.expanduser(self.get_parameter("out_dir").value)
         self.cams = list(self.get_parameter("cams").value)
@@ -230,6 +233,10 @@ class DataGen(Node):
             silent = silent + 1 if got == 0 else 0
             if silent >= 3:
                 self.get_logger().error("cameras silent for 3 scenes: the simulator is stalled, exiting (resume after a restart)")
+                raise SystemExit(3)
+            every = int(self.get_parameter("restart_every").value)
+            if every and j + 1 >= every and i + 1 < self.frames:
+                self.get_logger().info(f"{every} scenes done in this simulator instance, exiting for a restart")
                 raise SystemExit(3)
         self.get_logger().info(f"done: {saved} images this run, {self.frames} scenes in {self.out}")
 

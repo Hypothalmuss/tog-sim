@@ -124,7 +124,9 @@ class BeltTracker:
         return touched
 
     def predict(self, t: float) -> list[Track]:
-        """Snapshot of all live tracks extrapolated to time t (new Track objects, originals untouched)."""
+        """Snapshot of all live tracks extrapolated to time t (new Track objects, originals untouched).
+        Tracks that have not been observed for `lost_s` are dropped here too (the source may have died)."""
+        self._prune(t)
         out = []
         for tr in self.tracks.values():
             x, y = tr.predicted(t)

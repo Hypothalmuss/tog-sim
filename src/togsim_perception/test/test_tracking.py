@@ -69,3 +69,10 @@ def test_yaw_fused_modulo_symmetry():
 
 def _deg(a):
     return math.degrees(a)
+
+
+def test_predict_drops_tracks_when_the_source_stops():
+    tr = BeltTracker(lost_s=1.0)
+    tr.update(_frame(0.0, [(0.0, -0.35, 0.0, "product_bar")]))
+    assert len(tr.predict(0.5)) == 1
+    assert tr.predict(5.0) == []  # no update() calls any more: predict must not extrapolate a dead track for ever

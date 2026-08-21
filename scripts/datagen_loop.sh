@@ -23,7 +23,7 @@ for attempt in $(seq 1 "$max"); do
   rc=$?
   echo "=== run_datagen exit $rc ($(date +%T))" | tee -a "$log"
   "$here/scripts/killall.sh" >/dev/null
-  [ $rc = 0 ] && { echo "dataset complete: $out"; exit 0; }
+  if [ $rc = 0 ] || tail -n 20 "$log" | grep -q "done: .* scenes in"; then echo "dataset complete: $out" | tee -a "$log"; exit 0; fi
   sleep 3
 done
 echo "gave up after $max attempts" | tee -a "$log"; exit 1

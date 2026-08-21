@@ -261,8 +261,9 @@ def main():
     try:
         node.run()
     finally:
+        rclpy.try_shutdown()  # stops the spin thread first: destroying the node under it aborts the interpreter at exit
+        th.join(timeout=3.0)
         node.destroy_node()
-        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

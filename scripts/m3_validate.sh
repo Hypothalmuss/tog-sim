@@ -16,13 +16,14 @@ cleanup() { "$here/scripts/killall.sh" >/dev/null; }
 trap cleanup EXIT
 cleanup
 echo "[m3] launching cell (products on, headless, segmentation cameras on: Fortress renders product materials differently without them) -> $out"
-setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false segmentation:=true >"$out/sim.log" 2>&1 </dev/null &
+setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false segmentation:=${M3_SEGMENTATION:-true} >"$out/sim.log" 2>&1 </dev/null &
 wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || { echo "[m3] motion server missing"; exit 1; }
 wait_for 60 timeout 3 ros2 topic echo --once /cam_pick/depth_image --field header || { echo "[m3] cameras missing"; exit 1; }
 echo "[m3] launching perception (weights: $weights)"
 setsid ros2 launch togsim_perception perception.launch.py weights:="$weights" >"$out/perception.log" 2>&1 </dev/null &
 wait_for 90 timeout 3 ros2 topic echo --once /togsim/pick_candidates --field frame_seq || { echo "[m3] no pick candidates"; exit 1; }
-sleep 5
+echo "[m3] waiting for products to reach the pick camera"
+sleep ${M3_WARMUP:-45}  # products spawn at x=-1.05 and ride at 0.1 m/s: the first ones reach the camera after ~10-15 s
 echo "[m3] eval_pick_poses ($frames frames)"
 timeout 600 ros2 run togsim_perception eval_pick_poses --ros-args -p frames:="$frames" -p use_sim_time:=true -p out:="$out/eval_pick_poses.json" >"$out/eval.log" 2>&1
 python3 - "$out/eval_pick_poses.json" <<'PY'

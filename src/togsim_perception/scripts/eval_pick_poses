@@ -46,6 +46,7 @@ class EvalPickPoses(Node):
         )  # x_min x_max y_min y_max (pick camera FOV on the belt)
         self.declare_parameter("match_radius_m", 0.05)
         self.declare_parameter("out", os.path.expanduser("~/togsim_data/eval_pick_poses.json"))
+        self.declare_parameter("debug_frames", 0)  # log every candidate / nearest GT for the first N frames
         self.frames = int(self.get_parameter("frames").value)
         self.region = [float(v) for v in self.get_parameter("region").value]
         self.radius = float(self.get_parameter("match_radius_m").value)
@@ -135,6 +136,18 @@ class EvalPickPoses(Node):
             ),
             key=lambda t: t[0],
         )
+        if self.n_frames < int(self.get_parameter("debug_frames").value):
+            now_ns = self.get_clock().now().nanoseconds
+            self.get_logger().info(
+                f"frame {self.n_frames}: stamp age {(now_ns - obs_ns) * 1e-9:.3f} s, {len(gt_all)} GT, {len(gts)} in region"
+            )
+            for i, (cx, cy, cz, cyaw, ccls) in enumerate(cands):
+                near = min(((math.hypot(cx - g[0], cy - g[1]), n) for n, g in gt_all.items()), default=(None, None))
+                g = gt_all.get(near[1])
+                self.get_logger().info(
+                    f"  cand {i} {ccls} ({cx:.3f},{cy:.3f},{cz:.4f}) -> {near[1]} d={None if near[0] is None else round(1e3 * near[0], 1)} mm"
+                    + ("" if g is None else f" gt=({g[0]:.3f},{g[1]:.3f},{g[2]:.3f})")
+                )
         used_c, used_g = set(), set()
         for d, i, n in pairs:
             if d > self.radius or i in used_c or n in used_g:

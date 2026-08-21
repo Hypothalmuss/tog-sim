@@ -52,11 +52,17 @@ class PickPoseNode(Node):
         self.declare_parameter("belt_velocity_topic", "/togsim/conveyor/infeed/state")
         # world-frame box of the infeed belt surface; the camera also sees the outfeed belt and the enclosure
         self.declare_parameter("pick_region", [-0.20, 0.90, -0.52, -0.18])
+        self.declare_parameter("border_px", 4)  # masks touching the image border are cut products: no pose from them
+        self.declare_parameter("belt_z", 0.52)
+        self.declare_parameter("min_height_m", 0.008)  # detections flatter than this above the belt are ghosts
         cam = self.get_parameter("cam").value
         self.world = self.get_parameter("world_frame").value
         self.hfov = float(self.get_parameter("hfov_rad").value)
         self.cup_r = float(self.get_parameter("cup_radius_m").value)
         self.region = [float(v) for v in self.get_parameter("pick_region").value]
+        self.border = int(self.get_parameter("border_px").value)
+        self.belt_z = float(self.get_parameter("belt_z").value)
+        self.min_h = float(self.get_parameter("min_height_m").value)
         self.tilt_thr = math.radians(float(self.get_parameter("tilt_threshold_deg").value))
         self.max_tilt = math.radians(float(self.get_parameter("max_tilt_deg").value))
         self.br = CvBridge()
@@ -73,12 +79,16 @@ class PickPoseNode(Node):
         self.tf_buf = Buffer()
         self.tf_listener = TransformListener(self.tf_buf, self, spin_thread=False)
         self.create_subscription(CameraInfo, f"/{cam}/camera_info", self.on_info, 5, callback_group=self.cb)
-        self.create_subscription(Image, f"/{cam}/depth_image", self.on_depth, qos_profile_sensor_data, callback_group=self.cb)
+        self.create_subscription(
+            Image, f"/{cam}/depth_image", self.on_depth, qos_profile_sensor_data, callback_group=self.cb
+        )
         self.create_subscription(Image, f"/togsim/masks/{cam}", self.on_masks, 5, callback_group=self.cb)
         self.create_subscription(Detection2DArray, f"/togsim/detections/{cam}", self.on_det, 5, callback_group=self.cb)
         from std_msgs.msg import Float64
 
-        self.create_subscription(Float64, self.get_parameter("belt_velocity_topic").value, lambda m: setattr(self, "belt_v", m.data), 5)
+        self.create_subscription(
+            Float64, self.get_parameter("belt_velocity_topic").value, lambda m: setattr(self, "belt_v", m.data), 5
+        )
         self.pub = self.create_publisher(PickCandidateArray, "/togsim/pick_candidates", 5)
         self.create_service(GetPickCandidates, "/togsim/get_pick_candidates", self.on_get, callback_group=self.cb)
         self.seq = 0
@@ -148,6 +158,10 @@ class PickPoseNode(Node):
             cls = d.results[0].hypothesis.class_id
             if cls not in CLASS_TO_PRODUCT:
                 continue
+            ys_, xs_ = np.where(mask)
+            b = self.border
+            if ys_.min() < b or xs_.min() < b or ys_.max() >= mask.shape[0] - b or xs_.max() >= mask.shape[1] - b:
+                continue  # partially outside the image: centroid, axis and suction point would be wrong
             su, sv, r_px = suction_point(mask)
             cu, cv_, ang, long_px, short_px = principal_axis(mask)
             gsd = gsd_cache.setdefault(round(z, 2), z / self.k[0, 0])  # m per px at this depth
@@ -157,6 +171,8 @@ class PickPoseNode(Node):
             p_w = transform_points(p_cam[None, :], rot, trans)[0]
             if not (self.region[0] <= p_w[0] <= self.region[1] and self.region[2] <= p_w[1] <= self.region[3]):
                 continue  # outfeed belt / enclosure / tray contents are not pick candidates
+            if p_w[2] - self.belt_z < self.min_h:
+                continue  # a mask on bare belt (shadow, texture): nothing to pick
             # yaw of the product's long axis in world: image x -> world via rot
             dir_cam = np.array([math.cos(ang), math.sin(ang), 0.0])
             dir_w = rot @ dir_cam
@@ -219,7 +235,9 @@ class PickPoseNode(Node):
                     res.success = True
                     res.candidates = self.latest
                     if req.class_filter:
-                        res.candidates.candidates = [c for c in self.latest.candidates if c.class_name == req.class_filter]
+                        res.candidates.candidates = [
+                            c for c in self.latest.candidates if c.class_name == req.class_filter
+                        ]
                     return res
             time.sleep(0.01)
         res.success = False

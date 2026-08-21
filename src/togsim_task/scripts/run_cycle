@@ -61,7 +61,16 @@ class Candidate:
     __slots__ = ("key", "cls", "x", "y", "top", "yaw", "tilt", "occluded")
 
     def __init__(self, key, cls, x, y, top, yaw, tilt=0.0, occluded=False):
-        self.key, self.cls, self.x, self.y, self.top, self.yaw, self.tilt, self.occluded = key, cls, x, y, top, yaw, tilt, occluded
+        self.key, self.cls, self.x, self.y, self.top, self.yaw, self.tilt, self.occluded = (
+            key,
+            cls,
+            x,
+            y,
+            top,
+            yaw,
+            tilt,
+            occluded,
+        )
 
 
 class Tray:
@@ -81,6 +90,9 @@ class RunCycle(Node):
         self.declare_parameter("pick_x_max", 0.50)
         self.declare_parameter("hover", 0.06)
         self.declare_parameter("belt_speed", 0.10)
+        # waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for every |y| < 1.1, so anywhere else within
+        # reach the arm hides products (bar recall 0.5-0.64 with the arm parked over the belt)
+        self.declare_parameter("park", [-0.25, -0.25, 0.75])
         self.mode = self.get_parameter("perception").value
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
@@ -94,10 +106,14 @@ class RunCycle(Node):
         if self.mode == "gt":
             self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_gt, 10, callback_group=self.cb)
         else:
-            self.create_subscription(PickCandidateArray, "/togsim/pick_candidates", self.on_cands, 5, callback_group=self.cb)
+            self.create_subscription(
+                PickCandidateArray, "/togsim/pick_candidates", self.on_cands, 5, callback_group=self.cb
+            )
             self.create_subscription(TrayState, "/togsim/tray_state", self.on_tray, 10, callback_group=self.cb)
         for b in ("infeed", "outfeed"):
-            self.create_subscription(Float64, f"/togsim/conveyor/{b}/state", lambda m, b=b: self.belt_state.__setitem__(b, m.data), 10)
+            self.create_subscription(
+                Float64, f"/togsim/conveyor/{b}/state", lambda m, b=b: self.belt_state.__setitem__(b, m.data), 10
+            )
         self.motion = ActionClient(self, ExecuteMotion, "/togsim/execute_motion", callback_group=self.cb)
         self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
         self.infeed = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
@@ -137,8 +153,18 @@ class RunCycle(Node):
                 for c in self.vis_cands[0].candidates:
                     if c.class_name in fits:
                         p = c.grasp_pose.pose.position
-                        out.append(Candidate(f"v{c.id}", c.class_name, p.x, p.y, p.z, math.radians(c.yaw_deg),
-                                             math.radians(c.tilt_deg), c.occluded))
+                        out.append(
+                            Candidate(
+                                f"v{c.id}",
+                                c.class_name,
+                                p.x,
+                                p.y,
+                                p.z,
+                                math.radians(c.yaw_deg),
+                                math.radians(c.tilt_deg),
+                                c.occluded,
+                            )
+                        )
         return out
 
     def trays(self):
@@ -235,28 +261,53 @@ class RunCycle(Node):
         done, attempts = 0, 0
         cycle_times, t_start = [], None
         blacklist = {}
-        self.run_motion([seg(MotionSegment.PTP_CART, 0.35, 0.0, 0.75, 0.0)], "home")
+        park = [float(v) for v in self.get_parameter("park").value]
+        self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
+        parked = True
         self.belts(belt_speed)
         last_report = 0.0
         while rclpy.ok() and done < int(self.get_parameter("cycles").value):
             now = time.monotonic()
-            trays = [t for t in self.trays() if 0.05 < t.x < 0.40 and t.tilt < math.radians(3) and abs(t.z - BELT_Z) < 0.012
-                     and self.free_pocket(t) is not None]
-            cands = [c for c in self.candidates(fits) if xmin < c.x < xmax and -0.6 < c.y < -0.1 and reachable(c.x, c.y)
-                     and not c.occluded and c.tilt < math.radians(4) and blacklist.get(c.key, 0) < now]
+            trays = [
+                t
+                for t in self.trays()
+                if 0.05 < t.x < 0.40
+                and t.tilt < math.radians(3)
+                and abs(t.z - BELT_Z) < 0.012
+                and self.free_pocket(t) is not None
+            ]
+            cands = [
+                c
+                for c in self.candidates(fits)
+                if xmin < c.x < xmax
+                and -0.6 < c.y < -0.1
+                and reachable(c.x, c.y)
+                and not c.occluded
+                and c.tilt < math.radians(4)
+                and blacklist.get(c.key, 0) < now
+            ]
             if not trays or not cands:
                 if now - last_report > 5.0:
                     last_report = now
                     self.get_logger().info(f"waiting: {len(cands)} pickable, {len(trays)} trays ready")
                 self.belts(belt_speed)
+                if not parked:  # get out of the cameras' view while nothing is pickable
+                    parked = self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
                 time.sleep(0.1)
                 continue
             self.belts(0.0)
             self.wait_belts_stopped()
             time.sleep(0.25 if self.mode == "vision" else 0.15)  # let perception see the stopped scene
             trays = [t for t in self.trays() if 0.05 < t.x < 0.40 and self.free_pocket(t) is not None]
-            cands = [c for c in self.candidates(fits) if xmin < c.x < xmax and reachable(c.x, c.y) and not c.occluded
-                     and c.tilt < math.radians(4) and blacklist.get(c.key, 0) < now]
+            cands = [
+                c
+                for c in self.candidates(fits)
+                if xmin < c.x < xmax
+                and reachable(c.x, c.y)
+                and not c.occluded
+                and c.tilt < math.radians(4)
+                and blacklist.get(c.key, 0) < now
+            ]
             if not trays or not cands:
                 self.belts(belt_speed)
                 continue
@@ -268,8 +319,11 @@ class RunCycle(Node):
                 t_start = time.monotonic()
             tc = time.monotonic()
             attempts += 1
-            pick = [seg(MotionSegment.VIA_CART, c.x, c.y, c.top + hover, c.yaw, via_speed=0.5),
-                    seg(MotionSegment.PTP_CART, c.x, c.y, c.top + 0.001, c.yaw)]
+            parked = False
+            pick = [
+                seg(MotionSegment.VIA_CART, c.x, c.y, c.top + hover, c.yaw, via_speed=0.5),
+                seg(MotionSegment.PTP_CART, c.x, c.y, c.top + 0.001, c.yaw),
+            ]
             if not self.run_motion(pick, f"pick {c.key}"):
                 blacklist[c.key] = time.monotonic() + 15.0
                 self.vacuum(False, 0.0)
@@ -285,9 +339,11 @@ class RunCycle(Node):
                 continue
             px, py, zf = self.tray.pocket_world((tray.x, tray.y, tray.z), tray.yaw, pocket)
             place_z = zf + h + 0.004
-            place = [seg(MotionSegment.VIA_CART, c.x, c.y, c.top + hover, c.yaw, via_speed=0.5),
-                     seg(MotionSegment.VIA_CART, px, py, place_z + hover, tray.yaw, via_speed=0.5),
-                     seg(MotionSegment.PTP_CART, px, py, place_z, tray.yaw)]
+            place = [
+                seg(MotionSegment.VIA_CART, c.x, c.y, c.top + hover, c.yaw, via_speed=0.5),
+                seg(MotionSegment.VIA_CART, px, py, place_z + hover, tray.yaw, via_speed=0.5),
+                seg(MotionSegment.PTP_CART, px, py, place_z, tray.yaw),
+            ]
             ok = self.run_motion(place, f"place {c.key} -> {tray.key}[{pocket}]")
             self.vacuum(False, 0.1)
             self.latched[(tray.key, pocket)] = time.monotonic() + 2.0

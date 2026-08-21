@@ -97,7 +97,9 @@ class MotionServer : public rclcpp::Node {
         std::bind(&MotionServer::handleGoal, this, std::placeholders::_1, std::placeholders::_2),
         std::bind(&MotionServer::handleCancel, this, std::placeholders::_1),
         std::bind(&MotionServer::handleAccepted, this, std::placeholders::_1));
-    timer_ = create_wall_timer(std::chrono::duration<double>(1.0 / rate_), std::bind(&MotionServer::tick, this));
+    // Tick on the node clock (sim time): with a wall timer the trajectory outran the physics whenever the simulator
+    // ran below real time (RTF 0.6-0.9 with the vision stack), and the jam guard tripped on the resulting 3-5 cm lag.
+    timer_ = rclcpp::create_timer(this, get_clock(), rclcpp::Duration::from_seconds(1.0 / rate_), std::bind(&MotionServer::tick, this));
     RCLCPP_INFO(get_logger(), "motion_server ready (%.0f Hz, %s)", rate_, cmdTopic_.c_str());
   }
 

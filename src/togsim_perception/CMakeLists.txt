@@ -5,6 +5,7 @@ find_package(ament_cmake_python REQUIRED)
 ament_python_install_package(${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS scripts/run_datagen scripts/train_seg scripts/segmentation_node scripts/pick_pose_node scripts/tray_vacancy_node
+  scripts/eval_pick_poses
   DESTINATION lib/${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)

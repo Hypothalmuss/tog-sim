@@ -12,6 +12,7 @@ lamp colours, settle, then one synchronised RGB + panoptic label frame per camer
 import math
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -46,6 +47,7 @@ class DataGen(Node):
         self.declare_parameter("cams", ["cam_pick", "cam_place"])
         self.declare_parameter("seed", 0)
         self.declare_parameter("settle_s", 0.7)
+        self.declare_parameter("start", -1)  # -1: resume after the last existing scene index in out_dir
         self.frames = int(self.get_parameter("frames").value)
         self.out = os.path.expanduser(self.get_parameter("out_dir").value)
         self.cams = list(self.get_parameter("cams").value)
@@ -62,6 +64,19 @@ class DataGen(Node):
         self.belt_pubs = [self.create_publisher(Float64, f"/togsim/conveyor/{b}/cmd_vel", 10) for b in ("infeed", "outfeed")]
         self.spawned = []
         self.counter = 0
+        self.start = int(self.get_parameter("start").value)
+        if self.start < 0:
+            self.start = self._next_index()
+            if self.start:
+                self.get_logger().info(f"resuming at scene {self.start} ({self.start} scenes already in {self.out})")
+
+    def _next_index(self):
+        """Index after the last scene that has an image for every camera (incomplete scenes are redone)."""
+        done = None
+        for cam in self.cams:
+            idx = {int(m.group(1)) for f in os.listdir(os.path.join(self.out, "images")) if (m := re.fullmatch(rf"{cam}_(\d+)\.png", f))}
+            done = idx if done is None else done & idx
+        return (max(done) + 1) if done else 0
 
     def _cb(self, cam, kind):
         def f(m):
@@ -146,7 +161,16 @@ class DataGen(Node):
         time.sleep(1.0)
         saved = 0
         t_start = time.time()
-        for i in range(self.frames):
+        try:
+            self._loop(saved, t_start)
+        finally:
+            self.clear()
+            self.write_dataset_yaml()
+            self.get_logger().info(f"dataset files written in {self.out}")
+
+    def _loop(self, saved, t_start):
+        n = self.frames - self.start
+        for j, i in enumerate(range(self.start, self.frames)):
             self.clear()
             self.randomize_lights()
             self.build_scene()
@@ -167,16 +191,16 @@ class DataGen(Node):
                 if i % 25 == 0:
                     cv2.imwrite(os.path.join(self.out, "preview", stem + ".jpg"), cv2.cvtColor(overlay(rgb, labels), cv2.COLOR_RGB2BGR))
                 saved += 1
-            if i % 10 == 0:
+            if j % 10 == 0:
                 el = time.time() - t_start
-                self.get_logger().info(f"scene {i + 1}/{self.frames}, {saved} images, {el / (i + 1):.1f} s/scene")
-        self.clear()
-        self.write_dataset_yaml()
-        self.get_logger().info(f"done: {saved} images in {self.out}")
+                self.get_logger().info(f"scene {i + 1}/{self.frames} ({j + 1}/{n} this run), {saved} images, {el / (j + 1):.1f} s/scene")
+            if j % 25 == 24:
+                self.write_dataset_yaml()  # keep the split files usable if the run is interrupted
+        self.get_logger().info(f"done: {saved} images this run, {self.frames} scenes in {self.out}")
 
     def write_dataset_yaml(self):
-        imgs = sorted(os.listdir(os.path.join(self.out, "images")))
-        random.shuffle(imgs)
+        imgs = sorted(f for f in os.listdir(os.path.join(self.out, "images")) if f.endswith(".png"))
+        random.Random(1234).shuffle(imgs)  # fixed split regardless of the scene RNG / resume point
         n_val = max(1, len(imgs) // 10)
         for split, lst in (("val", imgs[:n_val]), ("train", imgs[n_val:])):
             with open(os.path.join(self.out, f"{split}.txt"), "w") as f:

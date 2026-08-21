@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Score vision pick candidates against Gazebo ground truth.
+
+  ros2 run togsim_perception eval_pick_poses --ros-args -p frames:=100 -p use_sim_time:=true
+
+For every /togsim/pick_candidates frame, each candidate is matched (greedy, nearest first) to a GT product whose
+origin lies inside the pick-camera region. Reports recall / precision / class accuracy and xy / height / yaw error
+statistics, and writes them as JSON (`out` parameter).
+"""
+
+import json
+import math
+import os
+import threading
+import time
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from tf2_msgs.msg import TFMessage
+
+from togsim_msgs.msg import PickCandidateArray
+
+PRODUCT_H = {"product_bar": 0.0186, "product_carton": 0.025}
+SYMMETRIC_YAW = {
+    "product_bar": math.pi,
+    "product_carton": math.pi,
+}  # both are rectangular: yaw is defined modulo 180 deg
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def ang_diff(a, b, period):
+    d = (a - b) % period
+    return min(d, period - d)
+
+
+class EvalPickPoses(Node):
+    def __init__(self):
+        super().__init__("eval_pick_poses")
+        self.declare_parameter("frames", 100)
+        self.declare_parameter(
+            "region", [-0.05, 0.72, -0.50, -0.20]
+        )  # x_min x_max y_min y_max (pick camera FOV on the belt)
+        self.declare_parameter("match_radius_m", 0.05)
+        self.declare_parameter("out", os.path.expanduser("~/togsim_data/eval_pick_poses.json"))
+        self.frames = int(self.get_parameter("frames").value)
+        self.region = [float(v) for v in self.get_parameter("region").value]
+        self.radius = float(self.get_parameter("match_radius_m").value)
+        self.lock = threading.Lock()
+        self.gt = {}  # name -> (x, y, z, yaw, t)
+        self.n_frames = 0
+        self.n_gt = self.n_cand = self.n_match = self.n_cls_ok = 0
+        self.err_xy, self.err_z, self.err_yaw = [], [], []
+        self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_gt, 10)
+        self.create_subscription(PickCandidateArray, "/togsim/pick_candidates", self.on_cands, 5)
+        self.done = threading.Event()
+
+    def on_gt(self, msg):
+        now = time.monotonic()
+        with self.lock:
+            for t in msg.transforms:
+                n = t.child_frame_id
+                if n.startswith("product_"):
+                    tr = t.transform.translation
+                    self.gt[n] = (tr.x, tr.y, tr.z, yaw_of(t.transform.rotation), now)
+            for n in [k for k, v in self.gt.items() if now - v[4] > 2.0]:
+                self.gt.pop(n)
+
+    def gt_class(self, name):
+        return "product_" + name.split("_")[1]
+
+    def on_cands(self, msg):
+        if self.done.is_set():
+            return
+        x0, x1, y0, y1 = self.region
+        with self.lock:
+            gts = {n: v for n, v in self.gt.items() if x0 <= v[0] <= x1 and y0 <= v[1] <= y1}
+        cands = []
+        for c in msg.candidates:
+            p = c.grasp_pose.pose.position
+            cands.append((p.x, p.y, p.z, math.radians(c.yaw_deg), c.class_name))
+        pairs = sorted(
+            ((math.hypot(cx - g[0], cy - g[1]), i, n) for i, (cx, cy, *_) in enumerate(cands) for n, g in gts.items()),
+            key=lambda t: t[0],
+        )
+        used_c, used_g = set(), set()
+        for d, i, n in pairs:
+            if d > self.radius or i in used_c or n in used_g:
+                continue
+            used_c.add(i)
+            used_g.add(n)
+            cx, cy, cz, cyaw, ccls = cands[i]
+            gx, gy, gz, gyaw, _ = gts[n]
+            gcls = self.gt_class(n)
+            self.err_xy.append(d)
+            self.err_z.append(cz - (gz + PRODUCT_H.get(gcls, 0.0)))
+            self.err_yaw.append(math.degrees(ang_diff(cyaw, gyaw, SYMMETRIC_YAW.get(gcls, 2 * math.pi))))
+            self.n_cls_ok += ccls == gcls
+        self.n_frames += 1
+        self.n_gt += len(gts)
+        self.n_cand += len(cands)
+        self.n_match += len(used_c)
+        if self.n_frames % 10 == 0:
+            self.get_logger().info(
+                f"{self.n_frames}/{self.frames} frames, recall {self.recall():.2f}, xy {1e3 * np.mean(self.err_xy or [0]):.1f} mm"
+            )
+        if self.n_frames >= self.frames:
+            self.done.set()
+
+    def recall(self):
+        return self.n_match / self.n_gt if self.n_gt else 0.0
+
+    def summary(self):
+        def stats(v):
+            v = np.abs(np.array(v or [0.0]))
+            return {"mean": float(v.mean()), "p95": float(np.percentile(v, 95)), "max": float(v.max())}
+
+        return {
+            "frames": self.n_frames,
+            "gt_products": self.n_gt,
+            "candidates": self.n_cand,
+            "matched": self.n_match,
+            "recall": self.recall(),
+            "precision": self.n_match / self.n_cand if self.n_cand else 0.0,
+            "class_accuracy": self.n_cls_ok / self.n_match if self.n_match else 0.0,
+            "xy_error_mm": stats([1e3 * e for e in self.err_xy]),
+            "height_error_mm": stats([1e3 * e for e in self.err_z]),
+            "yaw_error_deg": stats(self.err_yaw),
+        }
+
+
+def main():
+    rclpy.init()
+    node = EvalPickPoses()
+    th = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    th.start()
+    try:
+        node.done.wait()
+    except KeyboardInterrupt:
+        pass
+    s = node.summary()
+    out = os.path.expanduser(node.get_parameter("out").value)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(s, f, indent=2)
+    print(json.dumps(s, indent=2))
+    node.destroy_node()
+    rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

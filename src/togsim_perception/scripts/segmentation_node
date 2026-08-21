@@ -41,6 +41,7 @@ class SegmentationNode(Node):
         self.declare_parameter("iou", 0.6)
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("max_rate", 15.0)
+        self.declare_parameter("device", "auto")  # auto | cpu | 0
         self.cams = list(self.get_parameter("cams").value)
         self.source = self.get_parameter("source").value
         self.conf = float(self.get_parameter("conf").value)
@@ -53,6 +54,12 @@ class SegmentationNode(Node):
             from ultralytics import YOLO
 
             self.model = YOLO(os.path.expanduser(self.get_parameter("weights").value))
+            self.device = str(self.get_parameter("device").value)
+            if self.device == "auto":
+                import torch
+
+                self.device = "0" if torch.cuda.is_available() else "cpu"
+            self.get_logger().info(f"YOLO inference on device={self.device}")
             self.get_logger().info(f"YOLO-seg weights: {self.get_parameter('weights').value}")
         self.lock = threading.Lock()
         self.pubs = {}
@@ -125,7 +132,7 @@ class SegmentationNode(Node):
             t0 = time.monotonic()
             rgb = self.br.imgmsg_to_cv2(msg, "rgb8")
             with self.lock:
-                res = self.model.predict(rgb, imgsz=self.imgsz, conf=self.conf, iou=self.iou, device=0, verbose=False,
+                res = self.model.predict(rgb, imgsz=self.imgsz, conf=self.conf, iou=self.iou, device=self.device, verbose=False,
                                          retina_masks=True)[0]
             instances = []
             if res.masks is not None:

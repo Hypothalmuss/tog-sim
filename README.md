@@ -43,10 +43,14 @@ same machine or LAN — in particular another Gazebo publishing `/clock` — can
 ros2 launch togsim_bringup sim_full.launch.py gui:=false products:=false segmentation:=true   # cell with panoptic cameras
 ros2 run togsim_perception run_datagen --ros-args -p frames:=400      # resumable synthetic dataset -> ~/togsim_data/seg_v1
 ros2 run togsim_perception train_seg -- --epochs 40                   # YOLO11n-seg -> ~/togsim_data/weights/togsim_seg.pt
+ros2 launch togsim_bringup sim_full.launch.py gui:=false segmentation:=true  # vision runs need the same render path as training (see below)
 ros2 launch togsim_perception perception.launch.py                    # segmentation + pick poses + tray vacancy
 ros2 run togsim_perception eval_pick_poses --ros-args -p use_sim_time:=true   # vision vs ground truth metrics
 ros2 run togsim_task run_cycle --ros-args -p perception:=vision -p use_sim_time:=true
 ```
+
+Fortress renders product materials differently when segmentation cameras are in the world (the carton turns from salmon red to
+orange without them) - the dataset is rendered *with* them, so always run the live cell with `segmentation:=true` for vision.
 
 GPU: install a `torch` build matching the NVIDIA driver into `~/togsim_data/venv` (`python3 -m venv --system-site-packages`,
 e.g. `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128` for driver 535); `scripts/env.sh`

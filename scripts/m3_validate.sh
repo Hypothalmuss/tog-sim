@@ -15,8 +15,8 @@ wait_for() {  # wait_for <seconds> <command...>
 cleanup() { "$here/scripts/killall.sh" >/dev/null; }
 trap cleanup EXIT
 cleanup
-echo "[m3] launching cell (products on, headless) -> $out"
-setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false >"$out/sim.log" 2>&1 </dev/null &
+echo "[m3] launching cell (products on, headless, segmentation cameras on: Fortress renders product materials differently without them) -> $out"
+setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false segmentation:=true >"$out/sim.log" 2>&1 </dev/null &
 wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || { echo "[m3] motion server missing"; exit 1; }
 wait_for 60 timeout 3 ros2 topic echo --once /cam_pick/depth_image --field header || { echo "[m3] cameras missing"; exit 1; }
 echo "[m3] launching perception (weights: $weights)"

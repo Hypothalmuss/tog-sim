@@ -355,7 +355,7 @@ class RunCycle(Node):
 
             ok = self.run_motion(pick, f"pick {c.key}", on_feedback=on_fb)
             if "t" in seal:
-                seal["t"].join(timeout=1.0)
+                seal["t"].join(timeout=4.0)  # the bridge waits in sim time: at RTF 0.5 a 0.6 s seal window is 1.2 s wall
             sealed = ok and seal.get("r") is not None and seal["r"].sealed
             if not sealed:
                 self.get_logger().warn(

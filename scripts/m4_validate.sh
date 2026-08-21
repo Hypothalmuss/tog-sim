@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # M4 validation: continuous picking from moving belts with conveyor_tracker + TRACK_CART segments.
-#   scripts/m4_validate.sh [cycles=12] [perception=gt|vision] [belt_speed=0.10]
+#   scripts/m4_validate.sh [cycles=12] [perception=gt|vision] [belt_speed=0.10]   (env: M4_RATE products/min, M4_WARMUP, M4_TIMEOUT)
 # Results in $M4_OUT (default ~/togsim_data/m4_<timestamp>): sim.log tracker.log [perception.log] run_cycle.log
 set +u
 cycles=${1:-12}; mode=${2:-gt}; speed=${3:-0.10}
@@ -15,7 +15,7 @@ echo "[m4] launching cell (headless, products on) -> $out"
 launch_cell() {  # Fortress occasionally hangs at robot spawn (controller_manager never appears): relaunch once
   for attempt in 1 2; do
     cleanup
-    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed >"$out/sim$attempt.log" 2>&1 </dev/null &
+    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed product_rate:=${M4_RATE:-24} >"$out/sim$attempt.log" 2>&1 </dev/null &
     wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || continue
     wait_for 60 timeout 3 ros2 topic echo --once /joint_states --field header && return 0
     echo "[m4] simulator hung at start-up (no joint states), relaunching"

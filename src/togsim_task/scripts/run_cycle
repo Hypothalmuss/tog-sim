@@ -302,7 +302,8 @@ class RunCycle(Node):
                     and xmin < x_arrive < xmax
                     and -0.6 < c.y < -0.1
                     and reachable(x_done, c.y)
-                    and math.hypot(x_arrive, c.y) > 0.28  # not folded against the base
+                    and math.hypot(x_arrive, c.y) > 0.28  # not folded against the base ...
+                    and math.hypot(c.x, c.y) > 0.30  # ... neither now (the TRACK segment starts from the current pose)
                     and not c.occluded
                     and c.tilt < math.radians(4)
                     and blacklist.get(c.key, 0) < now

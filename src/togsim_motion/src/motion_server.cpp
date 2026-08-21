@@ -120,12 +120,19 @@ class MotionServer : public rclcpp::Node {
   void onJointState(const sensor_msgs::msg::JointState& m) {
     std::lock_guard<std::mutex> lk(mutex_);
     size_t found = 0;
-    std::array<double, DOF> q{};
+    std::array<double, DOF> q{}, v{};
+    bool haveVel = m.velocity.size() == m.position.size();
     for (size_t i = 0; i < DOF; ++i)
       for (size_t k = 0; k < m.name.size(); ++k)
-        if (m.name[k] == joints_[i] && k < m.position.size()) { q[i] = m.position[k]; ++found; }
+        if (m.name[k] == joints_[i] && k < m.position.size()) {
+          q[i] = m.position[k];
+          if (haveVel) v[i] = m.velocity[k];
+          ++found;
+        }
     if (found != DOF) return;
     actual_ = q;
+    if (haveVel) actualVel_ = v;
+    haveActualVel_ = haveVel;
     haveActual_ = true;
     if (synced_) return;
     input_.current_position = q;
@@ -345,16 +352,19 @@ class MotionServer : public rclcpp::Node {
 
     // Jam guard: the arm is position-tracked, so a persistent error between command and measurement means it is
     // physically blocked (e.g. pressing a product into a tray). Abort the goal and brake instead of thrashing.
+    // Signature of a real jam: the vertical command keeps moving while the measured joint does not (tracking lag alone
+    // - transport latency, low RTF, fast descents - shows a moving joint and must not trip the guard).
     if (goal_ && haveActual_) {
-      // joint_states lag the command by a few ms: scale the tolerance with the commanded vertical speed
       const double err = std::fabs(actual_[2] - input_.current_position[2]);
-      const double tol = jamTolerance_ + 0.015 * std::fabs(input_.current_velocity[2]);
+      const double tol = jamTolerance_ + 0.03 * std::fabs(input_.current_velocity[2]);
       // readings outside the joint limits are solver glitches (e.g. at weld creation), not jams: ignore them
       bool plausible = true;
       for (size_t i = 0; i < DOF; ++i)
         if (actual_[i] < pmin_[i] - 0.02 || actual_[i] > pmax_[i] + 0.02) plausible = false;
-      jamTicks_ = (plausible && err > tol) ? jamTicks_ + 1 : 0;
-      if (jamTicks_ > static_cast<int>(0.1 * rate_)) {
+      const bool commanded = std::fabs(input_.current_velocity[2]) > 0.03;
+      const bool stalled = !haveActualVel_ || std::fabs(actualVel_[2]) < 0.01;
+      jamTicks_ = (plausible && err > tol && commanded && stalled) ? jamTicks_ + 1 : 0;
+      if (jamTicks_ > static_cast<int>(0.15 * rate_)) {
         jamTicks_ = 0;
         // resync the generator to where the arm really is, then fail the goal
         input_.current_position = actual_;
@@ -408,7 +418,8 @@ class MotionServer : public rclcpp::Node {
   KinematicParams kin_;
   double settleTol_{0.002};
   double trackSettleTol_{0.006};
-  std::array<double, DOF> trackVel_{};
+  std::array<double, DOF> trackVel_{}, actualVel_{};
+  bool haveActualVel_{false};
   std::array<double, 3> trackPrevP_{}, trackVelCart_{};
   rclcpp::Time trackPrevTime_;
   bool trackPrevValid_{false};

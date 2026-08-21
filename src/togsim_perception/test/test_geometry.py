@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+
 from togsim_perception.geometry import pixel_to_point, point_to_pixel, polygon_coverage, principal_axis, suction_point
 
 K = np.array([[600.0, 0, 424.0], [0, 600.0, 240.0], [0, 0, 1.0]])

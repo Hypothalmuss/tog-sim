@@ -7,5 +7,8 @@ extend-exclude = ["build", "install", "log", "third_party", "togsim_hmi/static/v
 select = ["E", "F", "I", "B", "UP", "N"]
 ignore = ["N802", "N806", "N812", "N999", "E741"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["togsim_perception", "togsim_task", "togsim_description", "togsim_gazebo", "togsim_control", "togsim_motion"]
+
 [tool.pytest.ini_options]
 testpaths = ["src/togsim_description/test", "src/togsim_perception/test", "src/togsim_task/test"]

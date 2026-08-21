@@ -1,4 +1,5 @@
 import numpy as np
+
 from togsim_perception.datagen.labels import instances_from_labels_map, yolo_seg_lines
 
 

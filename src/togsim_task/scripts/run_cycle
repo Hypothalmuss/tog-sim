@@ -421,7 +421,9 @@ class RunCycle(Node):
             if tray.occupied[i] or self.latched.get((tray.key, i), 0) > now:
                 continue
             px, py, _ = self.tray.pocket_world((tray.x + tray.vx * lead, tray.y, tray.z), tray.yaw, i)
-            if reachable(px, py) and -0.20 < px < 0.45:  # comfortably inside the arc, not at the reach limit
+            # comfortably inside the arc: not at the reach limit, not folded against the base, now and when the cup arrives
+            px0, py0, _ = self.tray.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
+            if reachable(px, py) and -0.20 < px < 0.45 and math.hypot(px, py) > 0.30 and math.hypot(px0, py0) > 0.30:
                 return i
         return None
 

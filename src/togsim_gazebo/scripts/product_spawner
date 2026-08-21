@@ -105,18 +105,25 @@ class ProductSpawner(Node):
             "--reptype",
             "ignition.msgs.Boolean",
             "--timeout",
-            "2000",
+            "4000",
             "--req",
             req,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        ok = r.returncode == 0 and "data: true" in r.stdout
-        if not ok:
-            self.get_logger().warn(f"create {name} failed: {r.stdout.strip()} {r.stderr.strip()}")
-        else:
-            with self.lock:  # pose feedback lags the create call; count the new model right away
-                self.poses[name] = (x, y, z)
-        return ok
+        # Fortress answers one-shot `ign service` calls late when the server is busy: the reply gets lost although the
+        # request was executed. Verify through the pose feedback before retrying, and retry once.
+        for attempt in range(2):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            ok = r.returncode == 0 and "data: true" in r.stdout
+            if not ok:
+                time.sleep(0.3)
+                with self.lock:
+                    ok = name in self.poses
+            if ok:
+                with self.lock:  # pose feedback lags the create call; count the new model right away
+                    self.poses.setdefault(name, (x, y, z))
+                return True
+            self.get_logger().warn(f"create {name} failed (attempt {attempt + 1}): {r.stdout.strip()} {r.stderr.strip()}")
+        return False
 
     def ign_remove(self, name):
         cmd = [
@@ -129,11 +136,15 @@ class ProductSpawner(Node):
             "--reptype",
             "ignition.msgs.Boolean",
             "--timeout",
-            "2000",
+            "4000",
             "--req",
             f'name: "{name}", type: MODEL',
         ]
-        subprocess.run(cmd, capture_output=True, text=True)
+        for _attempt in range(2):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if "data: true" in r.stdout:
+                break
+            time.sleep(0.2)
         with self.lock:
             self.poses.pop(name, None)
 

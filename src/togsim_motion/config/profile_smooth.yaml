@@ -1,0 +1,5 @@
+# motion profile "smooth" (default): gentle accelerations for demos and videos (velocity limits unchanged)
+motion_server:
+  ros__parameters:
+    max_acceleration: [22.0, 26.0, 12.0, 120.0, 60.0]
+    max_jerk:         [180.0, 220.0, 120.0, 1200.0, 600.0]

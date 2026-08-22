@@ -10,6 +10,7 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
 
 PASS = [
+    "motion_profile",
     "product_rate",
     "product_classes",
     "max_products",
@@ -27,6 +28,7 @@ PASS = [
     "conveyor_visuals",
 ]
 DEFAULTS = {
+    "motion_profile": "smooth",
     "segmentation": "false",
     "product_rate": "24.0",
     "product_classes": "product_bar,product_carton",
@@ -61,6 +63,7 @@ def generate_launch_description():
     motion = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([FindPackageShare("togsim_motion"), "launch", "motion.launch.py"])
-        )
+        ),
+        launch_arguments={"profile": LaunchConfiguration("motion_profile")}.items(),
     )
     return LaunchDescription([*args, sim, control, motion])

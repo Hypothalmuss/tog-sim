@@ -15,7 +15,7 @@ echo "[m4] launching cell (headless, products on) -> $out"
 launch_cell() {  # Fortress occasionally hangs at robot spawn (controller_manager never appears): relaunch once
   for attempt in 1 2; do
     cleanup
-    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed product_rate:=${M4_RATE:-24.0} product_classes:=${M4_CLASSES:-product_bar,product_carton} >"$out/sim$attempt.log" 2>&1 </dev/null &
+    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed product_rate:=${M4_RATE:-24.0} product_classes:=${M4_CLASSES:-product_bar,product_carton} motion_profile:=${M4_PROFILE:-smooth} >"$out/sim$attempt.log" 2>&1 </dev/null &
     wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || continue
     wait_for 60 timeout 3 ros2 topic echo --once /joint_states --field header && return 0
     echo "[m4] simulator hung at start-up (no joint states), relaunching"

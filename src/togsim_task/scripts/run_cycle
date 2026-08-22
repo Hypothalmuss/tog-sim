@@ -75,7 +75,7 @@ class Candidate:
 
 
 class Tray:
-    __slots__ = ("key", "x", "y", "z", "yaw", "occupied", "tilt", "vx", "tid")
+    __slots__ = ("key", "x", "y", "z", "yaw", "occupied", "tilt", "vx", "tid", "stamp", "x_raw", "rx_age")
 
     def __init__(self, key, x, y, z, yaw, occupied, tilt=0.0):
         self.key, self.x, self.y, self.z, self.yaw, self.occupied, self.tilt = key, x, y, z, yaw, occupied, tilt
@@ -149,6 +149,9 @@ class RunCycle(Node):
         self.joints = {}
         self.cur_goal = ""
         self.rejected_log = {}
+        self.in_pocket = False
+        self.gt_hist = {}  # tray name -> [(sim t, x, y)] recent GT samples (diagnostics)
+        self.last_on_tray = time.monotonic()
         self.idle_why = dict.fromkeys(("seen", "occluded", "window", "reach", "blacklist", "no_tray", "polls"), 0)
         self.create_subscription(JointState, "/joint_states", self.on_joint_state, 10)
         self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
@@ -170,6 +173,10 @@ class RunCycle(Node):
                             f" during '{self.cur_goal}'"
                         )
                     self.gt[n] = ((tr.x, tr.y, tr.z), yaw_of(q), tilt_of(q), now)
+                    if n.startswith("tray_"):
+                        h = self.gt_hist.setdefault(n, [])
+                        h.append((self.sim_now(), tr.x, tr.y))
+                        del h[:-60]
             for n in [k for k, v in self.gt.items() if now - v[3] > 2.0]:
                 self.gt.pop(n, None)
 
@@ -178,8 +185,13 @@ class RunCycle(Node):
             self.vis_cands = (msg, time.monotonic())
 
     def on_tray(self, msg):
+        now = time.monotonic()
+        gap = now - self.last_on_tray
+        self.last_on_tray = now
+        if gap > 0.3 and self.vis_trays:  # diagnostic: subscription callbacks stalled (executor starved?)
+            self.get_logger().warn(f"tray callback gap {gap:.2f} s during '{self.cur_goal}'")
         with self.lock:
-            self.vis_trays[msg.tray_id] = (msg, time.monotonic())
+            self.vis_trays[msg.tray_id] = (msg, now)
 
     def candidates(self, fits):
         out = []
@@ -192,6 +204,8 @@ class RunCycle(Node):
                     if cls in fits and p[2] < 0.6:
                         out.append(Candidate(n, cls, p[0], p[1], p[2] + PRODUCT_HEIGHT[cls], yaw, tilt))
             elif self.vis_cands and time.monotonic() - self.vis_cands[1] < 1.0:
+                st = self.vis_cands[0].header.stamp
+                dt_c = min(1.0, max(0.0, self.sim_now() - (st.sec + st.nanosec * 1e-9)))
                 for c in self.vis_cands[0].candidates:
                     if c.class_name in fits:
                         p = c.grasp_pose.pose.position
@@ -199,7 +213,7 @@ class RunCycle(Node):
                             Candidate(
                                 f"v{c.id}",
                                 c.class_name,
-                                p.x,
+                                p.x + c.belt_velocity.x * dt_c,
                                 p.y,
                                 p.z,
                                 math.radians(c.yaw_deg),
@@ -228,12 +242,20 @@ class RunCycle(Node):
                     out.append(Tray(n, p[0], p[1], p[2], yaw, occ, tilt))
             else:
                 now = time.monotonic()
+                t_sim = self.sim_now()
                 for tid, (m, t) in list(self.vis_trays.items()):
                     if now - t > 1.0:
                         self.vis_trays.pop(tid, None)
                         continue
                     p = m.pose.pose.position
-                    tr = Tray(f"t{tid}", p.x, p.y, p.z, yaw_of(m.pose.pose.orientation), list(m.occupied))
+                    # predict from the message stamp: callbacks lag by up to a second while the main thread is busy
+                    # (a stale pose made the second place decision per tray 85 mm behind the tray)
+                    dt = min(1.0, max(0.0, t_sim - (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9)))
+                    tr = Tray(
+                        f"t{tid}", p.x + m.velocity.x * dt, p.y, p.z, yaw_of(m.pose.pose.orientation), list(m.occupied)
+                    )
+                    tr.stamp, tr.x_raw = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9, p.x
+                    tr.rx_age = now - t  # monotonic age of the stored message (diagnostic)
                     tr.vx, tr.tid = m.velocity.x, int(tid)
                     out.append(tr)
         return out
@@ -462,7 +484,8 @@ class RunCycle(Node):
             attempts += 1
             parked = False
             frame = f"prod_{c.tid}"
-            n_pick = 3
+            lift = [seg(MotionSegment.PTP_CART, 0.0, 0.0, 0.04, 0.0, frame="tcp")] if self.in_pocket else []
+            n_pick = 3 + len(lift)
             ev = {"contact": None, "vac_on": None, "contact_gt": None}
 
             def on_fb_pick(fb, n=n_pick):
@@ -470,12 +493,11 @@ class RunCycle(Node):
                 self.get_logger().debug(
                     f"fb pick seg {fb.feedback.segment_index} progress {p:.3f} t+{time.monotonic() - tc:.2f}"
                 )
-                if abs(p - 1.0 / n) < 1e-3 and ev["vac_on"] is None:  # lift done: nothing to do yet
-                    pass
-                if abs(p - 2.0 / n) < 1e-3 and ev["vac_on"] is None:  # hover reached: descending onto the product
+                # progress is (idx + 1) / n when a segment completes and (idx + 0.5) / n when the last one is reached
+                if abs(p - (n - 1.0) / n) < 1e-3 and ev["vac_on"] is None:  # hover reached: descending onto the product
                     self.vacuum_cmd(True)
                     ev["vac_on"] = time.monotonic()
-                if abs(p - 2.5 / n) < 1e-3 and ev["contact"] is None:  # contact reached, dwelling
+                if abs(p - (n - 0.5) / n) < 1e-3 and ev["contact"] is None:  # contact reached, dwelling
                     ev["contact"] = time.monotonic()
                     # diagnostic (GT): where is the product relative to the estimate the cup just landed on?
                     xe = c.x + c.vx * (ev["contact"] - tc)
@@ -495,11 +517,14 @@ class RunCycle(Node):
             cur = self.cup_yaw()
             yaw_pick = c.yaw if cur is None else nearest_branch(c.yaw, cur)
             c.bp = yaw_pick - c.yaw
-            pick = [
+            # straight up first when the cup is still in the pocket it just filled (at wall-top height): a diagonal
+            # departure clips the rim and drags the tray. A PTP: a via point at the current pose never completes.
+            pick = lift + [
                 seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, yaw_pick, via_speed=0.4),
                 seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, c.bp, tracked=frame),
                 seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, c.bp, dwell=seal_budget, tracked=frame),
             ]
+            self.in_pocket = False
             gh = self.send_goal(pick, f"pick {c.key}", on_feedback=on_fb_pick)
             if gh is None:
                 blacklist[c.key] = time.monotonic() + 15.0
@@ -568,6 +593,7 @@ class RunCycle(Node):
                     (c.yaw - g[1] + math.pi / 2) % math.pi - math.pi / 2
                 )  # mod 180: axis ambiguity is fine
                 psi = self.cup_yaw()
+                self.psi_seal = psi
                 cupd = (
                     ""
                     if psi is None
@@ -586,15 +612,42 @@ class RunCycle(Node):
                 if pk is not None:
                     px, py, _ = self.tray.pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
                     fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
+            if not fresh:  # nothing with margin: the pockets that are still reachable right now, no margin
+                for t in self.trays():
+                    if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
+                        continue
+                    pk = self.free_pocket_moving(t, place_lead, margin=0.0)
+                    if pk is not None:
+                        px, py, _ = self.tray.pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
+                        fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
+                if fresh:
+                    self.get_logger().info("place: no pocket with reach margin, taking one reachable now")
             if fresh:
                 _, tray, pocket = min(fresh, key=lambda f: f[0])  # shortest transfer
             else:
                 tray, pocket = trays[0]
+                self.get_logger().warn(
+                    f"place: no reachable pocket now, falling back to {tray.key}[{pocket}] seen before the pick"
+                )
             tframe = f"tray_{tray.tid}"
             ox, oy = self.tray.pocket_offset(pocket)
+            loc = self.in_tray_frame((tray.x, tray.y))  # diagnostic (GT): tracked tray frame vs the real tray now
+            ferr = "" if loc is None else f", frame err ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm vs {loc[0]}"
+            st = getattr(tray, "stamp", None)
+            if st is not None and loc is not None:
+                # the same message against GT at its own stamp: separates a stale delivery from a lagging track
+                with self.lock:
+                    hist = list(self.gt_hist.get(loc[0], []))
+                if hist:
+                    tg, xg, _ = min(hist, key=lambda e: abs(e[0] - st))
+                    ferr += (
+                        f"; stamp age {self.sim_now() - st:.2f} s, raw x - GT x at stamp {1e3 * (tray.x_raw - xg):+.0f} mm"
+                        f" (GT dt {tg - st:+.2f}), vx {tray.vx:.3f}, predicted +{1e3 * (tray.x - tray.x_raw):.0f} mm,"
+                        f" rx age {getattr(tray, 'rx_age', -1.0):.2f} s"
+                    )
             self.get_logger().info(
                 f"place decision {c.key} -> {tray.key}[{pocket}]: tray x {tray.x:.2f}, occupied"
-                f" {''.join('x' if v else '.' for v in tray.occupied)}"
+                f" {''.join('x' if v else '.' for v in tray.occupied)}{ferr}"
             )
             # the cup holds the product off-centre by `off` (world, at pick); after J4 turns the product to the tray's
             # yaw that offset, expressed in the product frame, is constant -> aim the cup at pocket - offset
@@ -637,13 +690,19 @@ class RunCycle(Node):
                             f"release yaw {held} -> {tray.key}[{pocket}]: cup-tray {wrap(psi - tray.yaw):+.0f} deg,"
                             f" product-tray {wrap180(g[1] - tray.yaw):+.0f} deg, product-cup {wrap180(g[1] - psi):+.0f} deg"
                             f"{where}; target pocket ({1e3 * ox:+.0f},{1e3 * oy:+.0f}) mm in {tray.key}"
+                            + (
+                                ""
+                                if getattr(self, "psi_seal", None) is None
+                                else f"; J4 turned {wrap(psi - self.psi_seal):+.0f} deg since seal"
+                                + self.frame_err_now(tray.tid)
+                            )
                         )
 
             px_w, py_w, zf = self.tray.pocket_world((tray.x + tray.vx * place_lead, tray.y, tray.z), tray.yaw, pocket)
             place = [
-                seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.1),
+                seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.25),
                 seg(MotionSegment.TRACK_CART, ox, oy, z_clear, bq, tracked=tframe),
-                seg(MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=0.12, tracked=tframe),
+                seg(MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=0.08, tracked=tframe),
             ]
             t_place0 = time.monotonic()
             ghp = self.send_goal(place, f"place {c.key} -> {tray.key}[{pocket}]", on_feedback=on_fb_place)
@@ -655,6 +714,7 @@ class RunCycle(Node):
             tl["transfer"] = (rel["t"] or time.monotonic()) - t_place0
             tl["release"] = time.monotonic() - (rel["t"] or time.monotonic())
             self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
+            self.in_pocket = rel["t"] is not None  # the cup is down in the pocket: the next goal must lift first
             threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket, held), daemon=True).start()
             self.t_cycle_end = time.monotonic()
             self.timelines.append(tl)
@@ -676,6 +736,18 @@ class RunCycle(Node):
             self.get_logger().info("timeline means " + " ".join(f"{k} {v:.2f}" for k, v in means.items()))
 
     # ---------------- placement accuracy (ground truth, metric only) ----------------
+    def frame_err_now(self, tid):
+        """Diagnostic: the tracked tray frame (latest message, predicted to now) vs the GT tray, as text."""
+        with self.lock:
+            ent = self.vis_trays.get(tid)
+        if ent is None:
+            return ""
+        m = ent[0]
+        st = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+        dt = min(1.0, max(0.0, self.sim_now() - st))
+        loc = self.in_tray_frame((m.pose.pose.position.x + m.velocity.x * dt, m.pose.pose.position.y))
+        return "" if loc is None else f"; frame err at release ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm vs {loc[0]}"
+
     def in_tray_frame(self, pp, gt=None):
         """(tray name, x, y) of world point pp in the frame of the nearest GT tray, or None."""
         if gt is None:
@@ -771,8 +843,8 @@ class RunCycle(Node):
                 return True
         return False
 
-    def free_pocket_moving(self, tray, lead):
-        """First free, unlatched pocket that will still be reachable `lead` seconds from now."""
+    def free_pocket_moving(self, tray, lead, margin=0.5):
+        """First free, unlatched pocket that will still be reachable `lead` (+ `margin`) seconds from now."""
         now = time.monotonic()
         # leading pockets first: they leave the reach first, and a tray that passes with empty trailing pockets is
         # cheaper than one that passes with empty leading ones (only the trailing ones are still reachable late)
@@ -786,8 +858,8 @@ class RunCycle(Node):
             px, py, _ = self.tray.pocket_world((tray.x + tray.vx * lead, tray.y, tray.z), tray.yaw, i)
             # comfortably inside the arc: not at the reach limit, not folded against the base, now and when the cup arrives
             px0, py0, _ = self.tray.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
-            # ... and a second later: settling the heading can make the place outlast the lead
-            px1, py1, _ = self.tray.pocket_world((tray.x + tray.vx * (lead + 1.0), tray.y, tray.z), tray.yaw, i)
+            # ... and a little later: settling the heading can make the place outlast the lead
+            px1, py1, _ = self.tray.pocket_world((tray.x + tray.vx * (lead + margin), tray.y, tray.z), tray.yaw, i)
             if (
                 reachable(px, py)
                 and reachable(px1, py1)

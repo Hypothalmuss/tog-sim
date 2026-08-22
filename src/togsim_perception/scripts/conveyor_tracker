@@ -134,9 +134,11 @@ class ConveyorTracker(Node):
             return  # partial / unreliable observation: never create or drag a track with it
         p = msg.pose.pose.position
         tool = self.tool_xy()
-        # the arm hides/biases a tray only when the tool is above its footprint (a circle of 0.30 m also starved the
-        # next tray of its early observations while the previous one was being filled)
-        if tool is not None and abs(p.x - tool[0]) < 0.23 and abs(p.y - tool[1]) < 0.12:
+        # the arm hides/biases a tray while the tool is above the tray or the forearm reaches over it (the forearm
+        # occludes the tray well before the tool does; a biased observation then shifts the frame by ~15 mm right
+        # before the observations stop). 0.40 x 0.20 m around the tool: the next tray, 0.5 m behind, keeps its
+        # observations.
+        if tool is not None and abs(p.x - tool[0]) < 0.40 and abs(p.y - tool[1]) < 0.20:
             self.get_logger().info(
                 f"tray obs tray{msg.tray_id} gated: tool ({p.x - tool[0]:+.2f},{p.y - tool[1]:+.2f}) m away",
                 throttle_duration_sec=1.0,
@@ -262,18 +264,21 @@ class ConveyorTracker(Node):
         self.pub_p.publish(arr)
         if t - getattr(self, "_dump_t", 0.0) > 1.0:
             self._dump_t = t
+            pubs = getattr(self, "_pub_counts", {})
             self.get_logger().info(
                 "tray tracks: "
                 + "; ".join(
                     f"{tr.id}/{tr.key} ({tr.x:.3f},{tr.y:.3f}) n={tr.n_obs} age={tr.age(t):.1f} v={tr.vx:.3f}"
+                    f" pub={pubs.get(tr.id, 0)}"
                     for tr in trays
                 )
                 + f" | belt_vx={self.trays.belt_vx}"
             )
+            self._pub_counts = {}
         for tr in trays:
             tfs.append(self._tf(now, f"tray_{tr.id}", tr.x, tr.y, tr.z, tr.yaw))
-            if tr.n_obs < 12 and self.source != "gt":
-                continue  # not placeable yet: still converging from the biased first observations at the view entry
+            if tr.n_obs < 6 and self.source != "gt":
+                continue  # not placeable yet: still converging from the biased first observation at the view entry
             m = TrayState()
             if isinstance(tr.payload, TrayState):
                 m.occupied, m.confidence, m.tracked = tr.payload.occupied, tr.payload.confidence, tr.payload.tracked
@@ -291,6 +296,10 @@ class ConveyorTracker(Node):
             m.rows, m.cols = self.tray.rows, self.tray.cols
             m.pitch_x, m.pitch_y = float(self.tray.pitch_x), float(self.tray.pitch_y)
             self.pub_t.publish(m)
+            pc = getattr(self, "_pub_counts", None)
+            if pc is None:
+                pc = self._pub_counts = {}
+            pc[tr.id] = pc.get(tr.id, 0) + 1
         if tfs:
             self.tf.sendTransform(tfs)
 

@@ -78,7 +78,7 @@ class BeltTracker:
         # or under the robot arm are biased by tens of mm
         self.mature_alpha = pos_alpha if mature_alpha is None else mature_alpha
         # keyed observations farther than key_gate_factor * gate from a settled track's prediction are outliers (a belt
-        # track predicts to a few mm); after three in a row the track snaps to the observations (same id, fresh state)
+        # track predicts to a few mm); after eight in a row the track snaps to the observations (same id, fresh state)
         self.key_gate_factor = key_gate_factor
         # a settled track ignores heading observations that disagree by more than this (a merged or partially hidden
         # mask has the wrong axis); the cup seals on whatever heading the frame has at contact
@@ -119,8 +119,8 @@ class BeltTracker:
             elif tr.n_obs >= 3 and self._dist(tr, o) > self.key_gate_factor * self.gate:
                 tr.outliers += 1
                 unmatched_tracks.discard(tr.id)
-                if tr.outliers < 3:
-                    continue  # keep predicting; do not drag the track
+                if tr.outliers < 8:
+                    continue  # keep predicting; do not drag the track (the arm just left: masks are still biased)
                 self._snap(tr, o)
             else:
                 self._fuse(tr, o)
@@ -174,7 +174,9 @@ class BeltTracker:
         """Restart a track's geometry from an observation, keeping its identity."""
         tr.x, tr.y, tr.z, tr.yaw, tr.t = o.x, o.y, o.z, o.yaw, o.t
         tr.vx, tr.vy = o.vx, o.vy
-        tr.n_obs, tr.outliers, tr.history, tr.area, tr.payload = 1, 0, [(o.t, o.x, o.y)], o.area, o.payload
+        # n_obs is kept: the object is the same, only its state restarts (a reset re-armed the "not placeable before
+        # 12 observations" gate and hid the tray from the task for a second)
+        tr.outliers, tr.history, tr.area, tr.payload = 0, [(o.t, o.x, o.y)], o.area, o.payload
 
     def _create(self, o: Observation) -> Track:
         tr = Track(self._next_id, o.cls, o.x, o.y, o.z, o.yaw, o.vx, o.vy, o.t, 1, o.key, o.payload, self.yaw_period)

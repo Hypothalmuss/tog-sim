@@ -100,16 +100,16 @@ def test_keyed_outlier_rejected_then_snapped():
         t += 0.1
     (track,) = tr.predict(t)
     x_pred = track.x
-    # an observation 55 mm behind the prediction (partial mask): ignored twice
-    for _ in range(2):
+    # an observation 55 mm behind the prediction (partial mask): ignored seven times
+    for _ in range(7):
         tr.update([Observation(x_pred - 0.055, 0.35, 0.0, 0.0, "tray", t, vx=0.08, key="tray1")])
         (track,) = tr.predict(t)
         assert abs(track.x - (0.1 + 0.08 * t)) < 0.01
         t += 0.1
-    # the third consecutive outlier snaps the track onto the observations: same id, state restarted
+    # the eighth consecutive outlier snaps the track onto the observations: same id, history restarted
     tr.update([Observation(x_pred - 0.055, 0.35, 0.0, 0.0, "tray", t, vx=0.08, key="tray1")])
     (snapped,) = tr.predict(t)
-    assert snapped.id == track.id and snapped.n_obs == 1 and abs(snapped.x - (x_pred - 0.055)) < 1e-9
+    assert snapped.id == track.id and snapped.n_obs >= 5 and abs(snapped.x - (x_pred - 0.055)) < 1e-9
 
 
 def test_settled_track_ignores_yaw_outliers():

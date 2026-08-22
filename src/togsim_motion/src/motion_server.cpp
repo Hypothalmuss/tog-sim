@@ -64,6 +64,7 @@ class MotionServer : public rclcpp::Node {
     settleTol_ = declare_parameter("settle_tolerance", 0.002);
     trackSettleTol_ = declare_parameter("track_settle_tolerance", 0.004);  // Cartesian, m
     trackYawTol_ = declare_parameter("track_yaw_tolerance", 0.02);  // rad: the cup must also have finished turning
+    trackFilterTau_ = declare_parameter("track_filter_tau", 0.06);  // s: smooths the jumps of a tracked frame
     for (size_t i = 0; i < DOF; ++i) {
       vmax_[i] = vmax[i]; amax_[i] = amax[i]; jmax_[i] = jmax[i]; pmin_[i] = pmin[i]; pmax_[i] = pmax[i]; home_[i] = home[i];
     }
@@ -243,6 +244,7 @@ class MotionServer : public rclcpp::Node {
     dwellUntil_.reset();
     segStartTime_ = now();
     trackPrevValid_ = false;
+    trackFiltValid_ = false;
     trackVel_.fill(0.0);
     trackErr_ = 1.0;
     trackYawErr_ = M_PI;
@@ -350,15 +352,37 @@ class MotionServer : public rclcpp::Node {
                   trackPrevP_ = pnow; trackPrevTime_ = tnow;
                 }
               }
+              // Innovation filter on the target: advance the filtered target at the frame velocity (no lag on the belt
+              // ramp) and pull it towards the raw target with a short time constant, so a frame that jumps by a few mm
+              // when an observation arrives moves the arm smoothly instead of replanning with a step.
+              if (!trackFiltValid_) {
+                trackFilt_ = pnow; trackFiltTime_ = tnow; trackFiltValid_ = true;
+              } else {
+                const double dtf = std::clamp((tnow - trackFiltTime_).seconds(), 0.0, 0.1);
+                const double k = trackFilterTau_ > 1e-3 ? std::min(1.0, dtf / trackFilterTau_) : 1.0;
+                for (size_t i = 0; i < 3; ++i) {
+                  trackFilt_[i] += trackVelCart_[i] * dtf;
+                  trackFilt_[i] += (pnow[i] - trackFilt_[i]) * k;
+                }
+                trackFiltTime_ = tnow;
+              }
+              TcpPose tgt = *tcp;
+              tgt.x = trackFilt_[0]; tgt.y = trackFilt_[1]; tgt.z = trackFilt_[2];
+              auto ikf = inverse(tgt, input_.current_position, kin_, true);
+              if (ikf.status == IkStatus::Ok) ik = ikf;
               trackVel_.fill(0.0);
               constexpr double kDelta = 0.02;  // s
-              TcpPose ahead = *tcp;
+              TcpPose ahead = tgt;
               ahead.x += trackVelCart_[0] * kDelta; ahead.y += trackVelCart_[1] * kDelta; ahead.z += trackVelCart_[2] * kDelta;
               auto ik2 = inverse(ahead, ik.q, kin_, true);
               if (ik2.status == IkStatus::Ok)
                 for (size_t i = 0; i < DOF; ++i) trackVel_[i] = std::clamp((ik2.q[i] - ik.q[i]) / kDelta, -0.5 * vmax_[i], 0.5 * vmax_[i]);
               setJointTarget(ik.q, trackVel_);
-              const TcpPose cur = forward(input_.current_position, kin_);
+              // settle on the MEASURED arm, not on the commanded trajectory: after a long fast swing the joints still
+              // lag the command by up to a centimetre when the command itself is within tolerance
+              const TcpPose cur = forward(haveActual_ ? actual_ : input_.current_position, kin_);
+              const TcpPose cmd = forward(input_.current_position, kin_);
+              trackLag_ = std::sqrt(std::pow(cur.x - cmd.x, 2) + std::pow(cur.y - cmd.y, 2) + std::pow(cur.z - cmd.z, 2));
               trackErr_ = std::sqrt(std::pow(cur.x - tcp->x, 2) + std::pow(cur.y - tcp->y, 2) + std::pow(cur.z - tcp->z, 2));
               trackYawErr_ = std::fabs(wrapToPi(cur.yaw - tcp->yaw));
               RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 500, "track seg %zu: err %.1f mm, v_cart [%.3f %.3f %.3f]", segIdx_,
@@ -426,6 +450,10 @@ class MotionServer : public rclcpp::Node {
         reached = trackPrevValid_ && trackErr_ < k * trackSettleTol_ && trackYawErr_ < k * trackYawTol_;
       }
       if (dwellUntil_) reached = true;  // once dwelling, the dwell expiry alone ends the segment (tracking continues)
+      if (reached && s.type == Segment::TRACK_CART && !dwellUntil_)
+        RCLCPP_INFO(get_logger(), "track seg %zu reached: err %.1f mm, yaw %.1f deg, cmd-measured lag %.1f mm%s", segIdx_,
+                    trackErr_ * 1e3, trackYawErr_ * 180.0 / M_PI, trackLag_ * 1e3,
+                    res == ruckig::Result::Finished ? " (generator finished)" : "");
       if (reached) {
         if (s.dwell_s > 0.0f && !dwellUntil_) {
           dwellUntil_ = now() + rclcpp::Duration::from_seconds(s.dwell_s);
@@ -465,6 +493,11 @@ class MotionServer : public rclcpp::Node {
   bool trackPrevValid_{false};
   double trackErr_{1.0};
   double trackYawErr_{M_PI}, trackYawTol_{0.02};
+  double trackFilterTau_{0.06};
+  double trackLag_{0.0};
+  std::array<double, 3> trackFilt_{};
+  rclcpp::Time trackFiltTime_;
+  bool trackFiltValid_{false};
   double override_{1.0}, segScale_{1.0};
 
   std::unique_ptr<ruckig::Ruckig<DOF>> otg_;

@@ -83,6 +83,9 @@ class BeltTracker:
         # a settled track ignores heading observations that disagree by more than this (a merged or partially hidden
         # mask has the wrong axis); the cup seals on whatever heading the frame has at contact
         self.yaw_gate = yaw_gate
+        # objects slip on the belt: the measured speed of all settled tracks (robust, shared) refines the encoder prior.
+        # A per-track estimate from a few biased observations is worse than the prior; a shared one is better than both.
+        self.belt_vx: float | None = None
         self.vel_alpha = vel_alpha  # weight of the measured velocity in the velocity update
         self.yaw_period = yaw_period
         self.estimate_velocity = estimate_velocity
@@ -205,17 +208,16 @@ class BeltTracker:
         tr.history.append((o.t, o.x, o.y))
         if len(tr.history) > 10:
             tr.history.pop(0)
-        # velocity: the belt encoder value is the prior; refined from the observed displacement once there is history
-        vx, vy = o.vx, o.vy
+        # velocity: the belt encoder value is the prior; the shared belt-speed estimate (objects slip a few percent)
+        # replaces it once settled tracks have measured it over >= 0.5 s. Belts only move along x.
         if self.estimate_velocity and len(tr.history) >= self.min_obs_velocity:
-            (t0, x0, y0), (t1, x1, y1) = tr.history[0], tr.history[-1]
+            (t0, x0, _y0), (t1, x1, _y1) = tr.history[0], tr.history[-1]
             span = t1 - t0
-            if span > 0.3:
-                mvx, mvy = (x1 - x0) / span, (y1 - y0) / span
-                # sane: within 2 cm/s of the encoder. Observation bias of a few mm over the history span already makes
-                # cm/s errors, and a track predicted through an occlusion drifts by that error times the occlusion time
-                if math.hypot(mvx - o.vx, mvy - o.vy) < 0.02:
-                    vx, vy = mvx, mvy
+            if span > 0.5:
+                mvx = (x1 - x0) / span
+                if abs(mvx - o.vx) < 0.04:  # sane: within 4 cm/s of the encoder (partial masks drift much faster)
+                    self.belt_vx = mvx if self.belt_vx is None else 0.8 * self.belt_vx + 0.2 * mvx
+        vx, vy = (o.vx if self.belt_vx is None else self.belt_vx), o.vy
         b = self.vel_alpha
         tr.vx = (1 - b) * tr.vx + b * vx
         tr.vy = (1 - b) * tr.vy + b * vy

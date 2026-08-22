@@ -55,10 +55,10 @@ class ConveyorTracker(Node):
         self.products = BeltTracker(gate_m=gate, lost_s=lost, yaw_period=math.pi)
         tray_lost = float(self.get_parameter("tray_lost_s").value)
         mature = float(self.get_parameter("mature_alpha").value)
-        # trays ride the belt along x at the encoder speed: never estimate their velocity from (biased) observations -
-        # a bogus lateral velocity drifts the predicted frame by 100+ mm while the arm hides the tray during a place
+        # trays ride the belt along x; their speed comes from the shared belt-speed estimate (never a per-track lateral
+        # velocity: one drifted a hidden tray's frame by 100+ mm during a place)
         self.trays = BeltTracker(
-            gate_m=gate, lost_s=tray_lost, yaw_period=math.pi, mature_alpha=mature, estimate_velocity=False
+            gate_m=gate, lost_s=tray_lost, yaw_period=math.pi, mature_alpha=mature
         )  # the pocket grid is 180 deg symmetric
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)

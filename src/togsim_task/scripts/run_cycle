@@ -420,11 +420,11 @@ class RunCycle(Node):
             parked = False
             frame = f"prod_{c.tid}"
             n_pick = 3
-            ev = {"contact": None, "vac_on": None}
+            ev = {"contact": None, "vac_on": None, "contact_gt": None}
 
             def on_fb_pick(fb, n=n_pick):
                 p = fb.feedback.progress
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"fb pick seg {fb.feedback.segment_index} progress {p:.3f} t+{time.monotonic() - tc:.2f}"
                 )
                 if abs(p - 1.0 / n) < 1e-3 and ev["vac_on"] is None:  # lift done: nothing to do yet
@@ -434,6 +434,18 @@ class RunCycle(Node):
                     ev["vac_on"] = time.monotonic()
                 if abs(p - 2.5 / n) < 1e-3 and ev["contact"] is None:  # contact reached, dwelling
                     ev["contact"] = time.monotonic()
+                    # diagnostic (GT): where is the product relative to the estimate the cup just landed on?
+                    xe = c.x + c.vx * (ev["contact"] - tc)
+                    with self.lock:
+                        near = min(
+                            (
+                                (math.hypot(g[0][0] - xe, g[0][1] - c.y), nm, g[0][0] - xe, g[0][1] - c.y)
+                                for nm, g in self.gt.items()
+                                if nm.startswith("product_")
+                            ),
+                            default=None,
+                        )
+                    ev["contact_gt"] = near
 
             # fly through the predicted hover point at speed (a plain PTP/VIA is faster than converging a tracked target
             # from far away), then track: hover -> contact
@@ -477,11 +489,14 @@ class RunCycle(Node):
                     default=None,
                 )
                 why = ""
+                if ev["contact_gt"] is not None:
+                    _d, nm, dx, dy = ev["contact_gt"]
+                    why = f"; at contact GT {nm} was ({1e3 * dx:+.0f},{1e3 * dy:+.0f}) mm from the estimate"
                 if near is not None:
                     d, n, g = near
                     hgt = PRODUCT_HEIGHT.get("product_" + n.split("_")[1], 0.0)
-                    why = (
-                        f"; nearest GT {n} {1e3 * d:.0f} mm from the estimate, top est {1e3 * c.top:.1f} vs GT"
+                    why += (
+                        f"; at failure nearest GT {n} {1e3 * d:.0f} mm from the estimate, top est {1e3 * c.top:.1f} vs GT"
                         f" {1e3 * (g[0][2] + hgt):.1f} mm, tilt {math.degrees(g[2]):.0f} deg"
                     )
                 self.get_logger().warn(

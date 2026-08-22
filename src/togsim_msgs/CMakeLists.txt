@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetSpeedOverride.srv"
   "srv/SetMode.srv"
   "srv/SpawnProducts.srv"
+  "srv/IgnService.srv"
   "srv/TeachProduct.srv"
   "srv/ReloadModel.srv"
   "action/ExecuteMotion.action"

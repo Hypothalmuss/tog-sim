@@ -120,6 +120,12 @@ def generate_launch_description():
         arguments=["arm_trajectory_controller", "--controller-manager", "/controller_manager", "--inactive"],
         output="screen",
     )
+    ign_bridge = Node(  # persistent Ignition service client (spawner, datagen, tests call it instead of `ign service`)
+        package="togsim_gazebo",
+        executable="ign_service_bridge",
+        output="screen",
+        parameters=[use_sim_time],
+    )
     spawner = Node(
         package="togsim_gazebo",
         executable="product_spawner",
@@ -133,6 +139,7 @@ def generate_launch_description():
                 "products.rate_per_min": LaunchConfiguration("product_rate"),
                 "products.max_alive": LaunchConfiguration("max_products"),
                 "products.classes_csv": LaunchConfiguration("product_classes"),
+                "seed": LaunchConfiguration("spawn_seed"),
             },
         ],
         output="screen",
@@ -205,6 +212,9 @@ def generate_launch_description():
             DeclareLaunchArgument("product_rate", default_value="24.0", description="products spawned per minute"),
             DeclareLaunchArgument("max_products", default_value="12", description="max products alive on the infeed"),
             DeclareLaunchArgument(
+                "spawn_seed", default_value="0", description="random seed of the product/tray spawner"
+            ),
+            DeclareLaunchArgument(
                 "product_classes",
                 default_value="product_bar,product_carton",
                 description="comma-separated product models spawned on the infeed (equal weights), e.g. product_carton",
@@ -231,6 +241,7 @@ def generate_launch_description():
             TimerAction(period=3.0, actions=[spawn_robot]),
             RegisterEventHandler(OnProcessExit(target_action=spawn_robot, on_exit=[jsb])),
             RegisterEventHandler(OnProcessExit(target_action=jsb, on_exit=[arm_pos, arm_traj])),
+            ign_bridge,
             TimerAction(period=8.0, actions=[spawner]),
         ]
     )

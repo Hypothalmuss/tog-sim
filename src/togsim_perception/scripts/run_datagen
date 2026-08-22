@@ -13,7 +13,6 @@ import math
 import os
 import random
 import re
-import subprocess
 import threading
 import time
 
@@ -24,6 +23,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float64
 
+from togsim_gazebo.ign_client import IgnClient
 from togsim_perception.datagen.labels import CLASS_NAMES, overlay, yolo_seg_lines
 
 WORLD = "cell"
@@ -64,6 +64,9 @@ class DataGen(Node):
             self.create_subscription(Image, f"/{cam}/image", self._cb(cam, "rgb"), 2)
             self.create_subscription(Image, f"/{cam}/segmentation/labels_map", self._cb(cam, "labels"), 2)
         self.belt_pubs = [self.create_publisher(Float64, f"/togsim/conveyor/{b}/cmd_vel", 10) for b in ("infeed", "outfeed")]
+        self.client = IgnClient(self, WORLD)
+        if not self.client.wait(60.0):
+            raise SystemExit("ign_service_bridge not available (launch the cell with sim.launch.py)")
         self.spawned = []
         self.counter = 0
         self.start = int(self.get_parameter("start").value)
@@ -90,16 +93,12 @@ class DataGen(Node):
 
     # ---------------- gazebo helpers ----------------
     def ign(self, service, reqtype, req, reptype="ignition.msgs.Boolean", timeout_ms=4000):
-        r = subprocess.run(["ign", "service", "-s", service, "--reqtype", reqtype, "--reptype", reptype, "--timeout", str(timeout_ms),
-                            "--req", req], capture_output=True, text=True)
-        return "data: true" in r.stdout
+        ok, _ = self.client.call(service, reqtype, reptype, req, timeout_s=timeout_ms / 1000.0)
+        return ok
 
     def world_models(self, prefix="dg_"):
         """Names of the models currently in the world (None if the query failed)."""
-        r = subprocess.run(["ign", "model", "--list"], capture_output=True, text=True, timeout=20)
-        if r.returncode != 0 or "Available models" not in r.stdout:
-            return None
-        return [ln.strip()[2:] for ln in r.stdout.splitlines() if ln.strip().startswith("- ") and ln.strip()[2:].startswith(prefix)]
+        return self.client.models(prefix)
 
     def spawn(self, model, name, x, y, z, roll=0.0, pitch=0.0, yaw=0.0):
         qx, qy, qz, qw = q_from_rpy(roll, pitch, yaw)

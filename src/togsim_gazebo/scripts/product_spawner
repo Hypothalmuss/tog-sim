@@ -8,15 +8,17 @@ the initial belt speeds.
 
 import math
 import random
-import subprocess
 import threading
 import time
 
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Float64
 from tf2_msgs.msg import TFMessage
 
+from togsim_gazebo.ign_client import IgnClient
 from togsim_msgs.srv import SpawnProducts
 
 
@@ -73,6 +75,10 @@ class ProductSpawner(Node):
         self.world = self.cfg["world"]
         self.poses = {}  # name -> (x, y, z)
         self.lock = threading.Lock()
+        self.cb = ReentrantCallbackGroup()
+        self.ign = IgnClient(self, self.cfg["world"], callback_group=self.cb)
+        if not self.ign.wait(60.0):
+            self.get_logger().error("ign_service_bridge not available: spawns will fail")
         self.counter = 0
         self.tray_counter = 0
         self.last_tray_x = None
@@ -94,31 +100,9 @@ class ProductSpawner(Node):
 
     # ---------------- Gazebo helpers ----------------
     def ign_create(self, model_uri, name, x, y, z, roll=0.0, pitch=0.0, yaw=0.0):
-        qx, qy, qz, qw = quat_from_rpy(roll, pitch, yaw)
-        req = (
-            f'sdf_filename: "{model_uri}", name: "{name}", allow_renaming: false, '
-            f"pose: {{position: {{x: {x:.4f}, y: {y:.4f}, z: {z:.4f}}}, "
-            f"orientation: {{x: {qx:.6f}, y: {qy:.6f}, z: {qz:.6f}, w: {qw:.6f}}}}}"
-        )
-        cmd = [
-            "ign",
-            "service",
-            "-s",
-            f"/world/{self.world}/create",
-            "--reqtype",
-            "ignition.msgs.EntityFactory",
-            "--reptype",
-            "ignition.msgs.Boolean",
-            "--timeout",
-            "4000",
-            "--req",
-            req,
-        ]
-        # Fortress answers one-shot `ign service` calls late when the server is busy: the reply gets lost although the
-        # request was executed. Verify through the pose feedback before retrying, and retry once.
+        """Spawn through the persistent bridge; verify through the pose feedback when the reply says no."""
         for attempt in range(2):
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            ok = r.returncode == 0 and "data: true" in r.stdout
+            ok = self.ign.create(model_uri, name, x, y, z, roll, pitch, yaw)
             if not ok:
                 time.sleep(0.3)
                 with self.lock:
@@ -127,27 +111,12 @@ class ProductSpawner(Node):
                 with self.lock:  # pose feedback lags the create call; count the new model right away
                     self.poses.setdefault(name, (x, y, z))
                 return True
-            self.get_logger().warn(f"create {name} failed (attempt {attempt + 1}): {r.stdout.strip()} {r.stderr.strip()}")
+            self.get_logger().warn(f"create {name} failed (attempt {attempt + 1})")
         return False
 
     def ign_remove(self, name):
-        cmd = [
-            "ign",
-            "service",
-            "-s",
-            f"/world/{self.world}/remove",
-            "--reqtype",
-            "ignition.msgs.Entity",
-            "--reptype",
-            "ignition.msgs.Boolean",
-            "--timeout",
-            "4000",
-            "--req",
-            f'name: "{name}", type: MODEL',
-        ]
         for _attempt in range(2):
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if "data: true" in r.stdout:
+            if self.ign.remove(name):
                 break
             time.sleep(0.2)
         with self.lock:
@@ -254,7 +223,9 @@ def main():
     rclpy.init()
     node = ProductSpawner()
     try:
-        rclpy.spin(node)
+        ex = MultiThreadedExecutor(num_threads=3)
+        ex.add_node(node)
+        ex.spin()
     except KeyboardInterrupt:
         pass
     finally:

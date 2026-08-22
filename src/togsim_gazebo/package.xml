@@ -10,6 +10,9 @@
   <buildtool_depend>ament_cmake_python</buildtool_depend>
   <depend>ignition-gazebo6</depend>
   <depend>ignition-plugin</depend>
+  <depend>ignition-transport11</depend>
+  <depend>ignition-msgs8</depend>
+  <depend>rclcpp</depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>

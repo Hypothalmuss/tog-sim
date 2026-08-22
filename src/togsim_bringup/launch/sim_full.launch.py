@@ -11,6 +11,7 @@ from launch_ros.substitutions import FindPackageShare
 
 PASS = [
     "motion_profile",
+    "spawn_seed",
     "product_rate",
     "product_classes",
     "max_products",
@@ -29,6 +30,7 @@ PASS = [
 ]
 DEFAULTS = {
     "motion_profile": "smooth",
+    "spawn_seed": "0",
     "segmentation": "false",
     "product_rate": "24.0",
     "product_classes": "product_bar,product_carton",

@@ -7,6 +7,10 @@ find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(ignition-gazebo6 REQUIRED)
 find_package(ignition-plugin1 REQUIRED COMPONENTS register)
+find_package(ignition-transport11 REQUIRED)
+find_package(ignition-msgs8 REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(togsim_msgs REQUIRED)
 set(IGN_GAZEBO_VER ${ignition-gazebo6_VERSION_MAJOR})
 set(IGN_PLUGIN_VER ${ignition-plugin1_VERSION_MAJOR})
 
@@ -22,6 +26,14 @@ target_link_libraries(togsim_vacuum_gripper_system
 
 install(TARGETS togsim_conveyor_system togsim_vacuum_gripper_system
   LIBRARY DESTINATION lib)
+
+# persistent Ignition Transport client behind a ROS service (replaces the one-shot `ign service` CLI)
+add_executable(ign_service_bridge src/ign_service_bridge.cc)
+target_link_libraries(ign_service_bridge
+  ignition-transport${ignition-transport11_VERSION_MAJOR}::core
+  ignition-msgs${ignition-msgs8_VERSION_MAJOR}::ignition-msgs${ignition-msgs8_VERSION_MAJOR})
+ament_target_dependencies(ign_service_bridge rclcpp togsim_msgs)
+install(TARGETS ign_service_bridge DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY worlds models config launch DESTINATION share/${PROJECT_NAME})
 ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS scripts/product_spawner scripts/gen_tray_model DESTINATION lib/${PROJECT_NAME})

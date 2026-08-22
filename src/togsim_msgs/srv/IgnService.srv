@@ -1,0 +1,10 @@
+# Generic Ignition Transport service call through a persistent node (see togsim_gazebo/ign_service_bridge).
+# The one-shot `ign service` CLI pays discovery on every call and loses replies when the server is busy.
+string service          # e.g. /world/cell/create
+string request_type     # e.g. ignition.msgs.EntityFactory
+string response_type    # e.g. ignition.msgs.Boolean
+string request          # protobuf text format, as for `ign service --req`
+float32 timeout_s       # 0 = default (5 s)
+---
+bool success            # transport result and (for Boolean replies) the reply's data field
+string response         # reply in protobuf text format

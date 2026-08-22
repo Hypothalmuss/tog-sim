@@ -110,11 +110,14 @@ class RunCycle(Node):
         self.vis_trays = {}  # id -> (TrayState, t)
         self.belt_state = {"infeed": 1.0, "outfeed": 1.0}
         self.latched = {}  # (tray_key, pocket) -> until
+        self.placements = []  # (offset_m, yaw_err_deg) per placed product, from ground truth
         if self.continuous:  # tracks: stable ids + poses predicted to now, for both perception sources
             self.create_subscription(
                 PickCandidateArray, "/togsim/tracks/products", self.on_cands, 5, callback_group=self.cb
             )
             self.create_subscription(TrayState, "/togsim/tracks/trays", self.on_tray, 10, callback_group=self.cb)
+            # ground truth is still read for the placement-accuracy metric (never used for control in vision mode)
+            self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_gt, 10, callback_group=self.cb)
         elif self.mode == "gt":
             self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_gt, 10, callback_group=self.cb)
         else:
@@ -396,6 +399,7 @@ class RunCycle(Node):
             ok = self.run_motion(place, f"place {c.key} -> {tray.key}[{pocket}]")
             self.vacuum(False, 0.05)
             self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
+            self.measure_placement(c.key, tray, pocket)
             self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "lift")
             if ok:
                 done += 1
@@ -406,6 +410,40 @@ class RunCycle(Node):
                     f"{sum(cycle_times) / len(cycle_times):.2f} s | success {done}/{attempts}"
                 )
         self.get_logger().info(f"finished: {done} cycles, {attempts} attempts, mode={self.mode} continuous")
+        self.report_placement()
+
+    # ---------------- placement accuracy (ground truth, metric only) ----------------
+    def measure_placement(self, key, tray, pocket):
+        """Offset of the just-released product from the pocket centre, from Gazebo ground truth (0.4 s after release)."""
+        time.sleep(0.4)
+        with self.lock:
+            gt = dict(self.gt)
+        best = None
+        for tn, (tp, tyaw, _, _) in gt.items():
+            if not tn.startswith("tray_") or abs(tp[0] - tray.x) > 0.25:
+                continue  # the tray we placed into: GT and track agree within the prediction error
+            px, py, _ = self.tray.pocket_world(tp, tyaw, pocket)
+            for pn, (pp, pyaw, _, _) in gt.items():
+                if pn.startswith("product_") and abs(pp[2] - tp[2]) < 0.06:
+                    d = math.hypot(pp[0] - px, pp[1] - py)
+                    if best is None or d < best[0]:
+                        best = (d, pn, math.degrees((pyaw - tyaw + math.pi / 2) % math.pi - math.pi / 2))
+        if best and best[0] < 0.05:
+            self.placements.append((best[0], abs(best[2])))
+            self.get_logger().info(
+                f"placed {key} -> {tray.key}[{pocket}] ({best[1]}): {1e3 * best[0]:.1f} mm off centre, yaw {best[2]:+.1f} deg"
+            )
+
+    def report_placement(self):
+        if not self.placements:
+            return
+        d = sorted(x[0] for x in self.placements)
+        y = sorted(x[1] for x in self.placements)
+        self.get_logger().info(
+            f"placement accuracy over {len(d)}: offset mean {1e3 * sum(d) / len(d):.1f} mm, "
+            f"p95 {1e3 * d[int(0.95 * (len(d) - 1))]:.1f} mm | yaw mean {sum(y) / len(y):.1f} deg, "
+            f"p95 {y[int(0.95 * (len(y) - 1))]:.1f} deg"
+        )
 
     def track_pose(self, tid):
         """Current (predicted-to-now) pose of a product track, or None if it is gone."""

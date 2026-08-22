@@ -64,7 +64,7 @@
         <direction>1 0 0</direction>
         <capture_height>0.10</capture_height>
         <initial_velocity>${speed}</initial_velocity>
-        <max_acceleration>1.0</max_acceleration>
+        <max_acceleration>0.4</max_acceleration>   <!-- gentle belt starts/stops: products do not slip or tip -->
         <drive_gain>40.0</drive_gain>
         <max_drive_accel>6.0</max_drive_accel>
         <cmd_topic>/togsim/conveyor/${name}/cmd_vel</cmd_topic>

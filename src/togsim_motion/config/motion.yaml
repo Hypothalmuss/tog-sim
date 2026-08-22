@@ -6,8 +6,8 @@ motion_server:
     base_frame: base_link
     # limits (Epson GX8-C653S datasheet for position/velocity; accel/jerk chosen for sim)
     max_velocity:     [10.053, 11.729, 2.387, 49.368, 17.45]
-    max_acceleration: [40.0, 50.0, 20.0, 200.0, 100.0]
-    max_jerk:         [400.0, 500.0, 300.0, 2000.0, 1000.0]
+    max_acceleration: [22.0, 26.0, 12.0, 120.0, 60.0]   # smoother than the 40/50 rad/s^2 used until 2026-08-22
+    max_jerk:         [180.0, 220.0, 120.0, 1200.0, 600.0]
     min_position:     [-1.0821, -2.57, -0.33, -6.2832, -0.7854]
     max_position:     [4.2237, 2.57, 0.0, 6.2832, 0.7854]
     home: [0.0, 1.2, -0.05, 0.0, 0.0]

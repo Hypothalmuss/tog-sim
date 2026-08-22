@@ -331,7 +331,7 @@ class RunCycle(Node):
                             f" | {t.key} x{t.x:.2f} z{t.z:.3f} tid{t.tid} occ{sum(t.occupied)}" for t in raw_t[:2]
                         )
                     )
-                if not parked:
+                if not parked and not self.product_due(fits, 3.0):  # stay near the belt when the next product is close
                     parked = self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
                 time.sleep(0.05)
                 continue
@@ -399,7 +399,7 @@ class RunCycle(Node):
             ok = self.run_motion(place, f"place {c.key} -> {tray.key}[{pocket}]")
             self.vacuum(False, 0.05)
             self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
-            self.measure_placement(c.key, tray, pocket)
+            threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket), daemon=True).start()  # off the cycle
             self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "lift")
             if ok:
                 done += 1
@@ -410,6 +410,7 @@ class RunCycle(Node):
                     f"{sum(cycle_times) / len(cycle_times):.2f} s | success {done}/{attempts}"
                 )
         self.get_logger().info(f"finished: {done} cycles, {attempts} attempts, mode={self.mode} continuous")
+        time.sleep(0.6)  # let the last placement measurement finish
         self.report_placement()
 
     # ---------------- placement accuracy (ground truth, metric only) ----------------
@@ -457,6 +458,17 @@ class RunCycle(Node):
                         f"v{c.id}", c.class_name, p.x, p.y, p.z, math.radians(c.yaw_deg), vx=c.belt_velocity.x, tid=tid
                     )
         return None
+
+    def product_due(self, fits, horizon_s):
+        """True if a fitting product track will enter the pick window within `horizon_s` (no point parking then)."""
+        xmin = float(self.get_parameter("pick_x_min").value)
+        for c in self.candidates(fits):
+            if c.tid is None or c.vx <= 0.01:
+                continue
+            eta = (xmin - c.x) / c.vx
+            if -1.0 < eta < horizon_s and -0.6 < c.y < -0.1:
+                return True
+        return False
 
     def free_pocket_moving(self, tray, lead):
         """First free, unlatched pocket that will still be reachable `lead` seconds from now."""

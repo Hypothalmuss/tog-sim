@@ -24,12 +24,15 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Demos
 
-| Continuous vision-driven pick & place from the *moving* belts |
+| Max pick rate test — cartons only, 60 products/min, fast motion profile, vision perception |
 |---|
-| ![demo](docs/media/demo_after.gif) |
+| ![demo](docs/media/demo_speed.gif) |
 
-YOLO11n-seg → pick poses → conveyor tracker → `TRACK_CART` motions, recorded live from Gazebo. Placement accuracy
-(product vs pocket centre, ground truth): GT perception 8.6 mm / 0.2°, vision 14.6 mm / 3.7° (10/10 cycles).
+Continuous vision-driven pick & place from the *moving* belts (YOLO11n-seg → pick poses → conveyor tracker →
+`TRACK_CART` motions), recorded live from Gazebo with `scripts/demo.sh` (`DEMO_CLASSES=product_carton DEMO_RATE=60.0
+DEMO_PROFILE=fast`). Benchmark (`scripts/m4_validate.sh 20 vision`, same settings): **20/22 cycles, 11.3 picks/min**
+incl. waits, 4.6 s motion per cycle (pick 1.1 s, place 1.3 s; the rest is vacuum/seal waiting). Placement accuracy
+(product vs pocket centre, ground truth): GT perception 8.6 mm / 0.2°, vision 14.6 mm / 3.7° with mixed products.
 
 ## Quick start (native)
 

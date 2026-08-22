@@ -11,6 +11,7 @@ from launch_ros.substitutions import FindPackageShare
 
 PASS = [
     "product_rate",
+    "product_classes",
     "max_products",
     "segmentation",
     "gui",
@@ -28,6 +29,7 @@ PASS = [
 DEFAULTS = {
     "segmentation": "false",
     "product_rate": "24.0",
+    "product_classes": "product_bar,product_carton",
     "max_products": "12",
     "gui": "true",
     "products": "true",

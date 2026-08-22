@@ -43,6 +43,7 @@ class ProductSpawner(Node):
                 ("products.enabled", True),
                 ("products.classes", ["product_bar", "product_carton"]),
                 ("products.class_weights", [0.7, 0.3]),
+                ("products.classes_csv", ""),  # launch-arg friendly override of classes (equal weights), e.g. "product_carton"
                 ("products.rate_per_min", 30.0),
                 ("products.max_alive", 12),
                 ("products.spawn_x", -1.05),
@@ -64,6 +65,10 @@ class ProductSpawner(Node):
             ],
         )
         self.cfg = {d.name: d.value for d in p}
+        csv = str(self.cfg.get("products.classes_csv", "")).strip()
+        if csv:
+            self.cfg["products.classes"] = [c.strip() for c in csv.split(",") if c.strip()]
+            self.cfg["products.class_weights"] = [1.0] * len(self.cfg["products.classes"])
         random.seed(int(self.cfg["seed"]))
         self.world = self.cfg["world"]
         self.poses = {}  # name -> (x, y, z)

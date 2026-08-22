@@ -11,7 +11,7 @@ log=${DEMO_LOG:-/tmp/togsim_demo}; mkdir -p "$log"
 wait_for() { local t=$1; shift; for _ in $(seq 1 "$t"); do "$@" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
 "$here/scripts/killall.sh" >/dev/null
 echo "[demo] Gazebo GUI cell (products ${DEMO_RATE:-30.0}/min, belts $speed m/s) -> logs in $log"
-setsid ros2 launch togsim_bringup sim_full.launch.py gui:=true infeed_speed:=$speed outfeed_speed:=$speed product_rate:=${DEMO_RATE:-30.0} >"$log/sim.log" 2>&1 </dev/null &
+setsid ros2 launch togsim_bringup sim_full.launch.py gui:=true infeed_speed:=$speed outfeed_speed:=$speed product_rate:=${DEMO_RATE:-30.0} product_classes:=${DEMO_CLASSES:-product_bar,product_carton} >"$log/sim.log" 2>&1 </dev/null &
 wait_for 180 bash -c "ros2 action list | grep -q /togsim/execute_motion" || { echo "[demo] motion server missing"; exit 1; }
 wait_for 90 timeout 3 ros2 topic echo --once /joint_states --field header || { echo "[demo] simulator hung at start-up: run scripts/killall.sh and try again"; exit 1; }
 if [ "$mode" = vision ]; then

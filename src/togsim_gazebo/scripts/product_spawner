@@ -45,7 +45,10 @@ class ProductSpawner(Node):
                 ("products.enabled", True),
                 ("products.classes", ["product_bar", "product_carton"]),
                 ("products.class_weights", [0.7, 0.3]),
-                ("products.classes_csv", ""),  # launch-arg friendly override of classes (equal weights), e.g. "product_carton"
+                (
+                    "products.classes_csv",
+                    "",
+                ),  # launch-arg friendly override of classes (equal weights), e.g. "product_carton"
                 ("products.rate_per_min", 30.0),
                 ("products.max_alive", 12),
                 ("products.spawn_x", -1.05),
@@ -56,6 +59,7 @@ class ProductSpawner(Node):
                 ("products.despawn_x", 1.15),
                 ("trays.enabled", True),
                 ("trays.model", "tray_2x4"),
+                ("trays.models_csv", ""),  # cycle through several tray models, e.g. "tray_2x4,tray_bar_2x3" (S4)
                 ("trays.spawn_x", -1.05),
                 ("trays.y_center", 0.35),
                 ("trays.pitch", 0.55),
@@ -177,8 +181,10 @@ class ProductSpawner(Node):
     def spawn_tray(self):
         self.tray_counter += 1
         name = f"tray_{self.tray_counter}"
+        models = [m.strip() for m in str(self.cfg.get("trays.models_csv", "")).split(",") if m.strip()]
+        model = models[(self.tray_counter - 1) % len(models)] if models else self.cfg["trays.model"]
         return self.ign_create(
-            f"model://{self.cfg['trays.model']}",
+            f"model://{model}",
             name,
             float(self.cfg["trays.spawn_x"]),
             float(self.cfg["trays.y_center"]),

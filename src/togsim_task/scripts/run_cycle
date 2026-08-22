@@ -535,7 +535,7 @@ class RunCycle(Node):
             # straight up first when the cup is still in the pocket it just filled (at wall-top height): a diagonal
             # departure clips the rim and drags the tray. A PTP: a via point at the current pose never completes.
             pick = lift + [
-                seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, yaw_pick, via_speed=0.4),
+                seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, yaw_pick, via_speed=0.5),
                 seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, c.bp, tracked=frame),
                 # the pick contact may settle loosely: the grasp offset is measured at the seal and compensated at the
                 # place, where the tight tolerance matters
@@ -743,9 +743,11 @@ class RunCycle(Node):
 
             px_w, py_w, zf = self.tray.pocket_world((tray.x + tray.vx * place_lead, tray.y, tray.z), tray.yaw, pocket)
             place = [
-                seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.25),
+                seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.35),
                 seg(MotionSegment.TRACK_CART, ox, oy, z_clear, bq, tracked=tframe),
-                seg(MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=0.08, tracked=tframe),
+                # 3.5 mm on the measured arm: the steady command-measured lag while tracking is ~2 mm, a 2.5 mm
+                # tolerance hovered at the threshold for a second
+                seg(MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=0.08, tracked=tframe, settle=0.0035),
             ]
             t_place0 = time.monotonic()
             ghp = self.send_goal(place, f"place {c.key} -> {tray.key}[{pocket}]", on_feedback=on_fb_place)

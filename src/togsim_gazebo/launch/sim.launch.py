@@ -139,6 +139,7 @@ def generate_launch_description():
                 "products.rate_per_min": LaunchConfiguration("product_rate"),
                 "products.max_alive": LaunchConfiguration("max_products"),
                 "products.classes_csv": LaunchConfiguration("product_classes"),
+                "trays.models_csv": LaunchConfiguration("tray_models"),
                 "seed": LaunchConfiguration("spawn_seed"),
             },
         ],
@@ -211,6 +212,11 @@ def generate_launch_description():
             DeclareLaunchArgument("segmentation", default_value="false"),
             DeclareLaunchArgument("product_rate", default_value="24.0", description="products spawned per minute"),
             DeclareLaunchArgument("max_products", default_value="12", description="max products alive on the infeed"),
+            DeclareLaunchArgument(
+                "tray_models",
+                default_value="",
+                description="csv of tray models spawned in turn, e.g. tray_2x4,tray_bar_2x3",
+            ),
             DeclareLaunchArgument(
                 "spawn_seed", default_value="0", description="random seed of the product/tray spawner"
             ),

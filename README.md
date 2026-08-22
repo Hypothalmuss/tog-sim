@@ -17,9 +17,9 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 | M0 Skeleton — packages, robot description, analytical IK + tests, CI | ✅ |
 | M1 Sim cell — conveyors, products, trays, ros2_control in Gazebo Fortress | ✅ |
 | M2 First closed loop (ground-truth perception) | ✅ 12/12 GT cycles, ~32 cpm motion-only |
-| M3 Vision — synthetic data, YOLO-seg, grasp pose, tray vacancy | 🟡 600 synthetic scenes → YOLO11n-seg mask mAP50 0.98; vs ground truth: class acc 1.00, recall 0.92, precision 0.94, grasp height 0.4 mm, yaw 0.8°; **12/13 vision-driven cycles** (`scripts/m3_validate.sh`). Open: GIF, tray-vacancy metrics |
-| M4 Speed & moving-tray tracking, benchmark | 🟡 `conveyor_tracker` (stable product/tray tracks → TF) + `TRACK_CART` picks/places on **moving belts, no belt stops**: GT 12/13, vision **20/24** cycles (`scripts/m4_validate.sh 20 vision`), motion 4.4 s/cycle. Open: cycle time (target ≤2.5 s), bars → `tray_bar_2x3`, seal misses (3/24), benchmark table |
-| M5 HMI | ⬜ |
+| M3 Vision — synthetic data, YOLO-seg, grasp pose, tray vacancy | ✅ 600 synthetic scenes → YOLO11n-seg (mask mAP50 0.98); vs ground truth: class acc 1.00, grasp height 0.4 mm, yaw 0.8°; tray pose 4 mm / 0.05°, pocket occupancy validated (`eval_pick_poses`, `eval_tray_state`) |
+| M4 Speed & moving-tray tracking, benchmark | ✅ `conveyor_tracker` (stable product/tray tracks → TF) + `TRACK_CART` picks/places on **moving belts, no belt stops**; vision benches 95–100 % success, placement mean 4–6 mm (see Benchmarks) |
+| M5 HMI | 🟡 `togsim_hmi`: FastAPI + vanilla JS operator panel (status, belts, start/stop, tray occupancy) |
 | M6 Polish, teach-in, stereo stretch, Docker | ⬜ |
 
 ## Demos
@@ -30,9 +30,7 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Continuous vision-driven pick & place from the *moving* belts (YOLO11n-seg → pick poses → conveyor tracker →
 `TRACK_CART` motions), recorded live from Gazebo with `scripts/demo.sh` (`DEMO_CLASSES=product_carton DEMO_RATE=60.0
-DEMO_PROFILE=fast`). Benchmark (`scripts/m4_validate.sh 20 vision`, same settings): **20/22 cycles, 11.3 picks/min**
-incl. waits, 4.6 s motion per cycle (pick 1.1 s, place 1.3 s; the rest is vacuum/seal waiting). Placement accuracy
-(product vs pocket centre, ground truth): GT perception 8.6 mm / 0.2°, vision 14.6 mm / 3.7° with mixed products.
+DEMO_PROFILE=fast`). Current numbers are in [Benchmarks](#benchmarks).
 
 ## Quick start (native)
 
@@ -68,6 +66,46 @@ Note: ultralytics treats numpy images as BGR - the nodes convert the ROS `rgb8` 
 GPU: install a `torch` build matching the NVIDIA driver into `~/togsim_data/venv` (`python3 -m venv --system-site-packages`,
 e.g. `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128` for driver 535); `scripts/env.sh`
 activates it when present and the nodes pick CUDA automatically (`device:=auto`).
+
+## Benchmarks
+
+`scripts/bench.sh <name> [repeats] [cycles] [vision|gt]` runs seeded repeats of `scripts/m4_validate.sh` and writes one JSON
+per run (cycles, attempts, cpm, motion time, placement mean/p95 from ground truth, per-phase timeline, failures).
+Placement = released product vs the centre of the pocket it sits in (ground truth); the pocket clearance is 5 mm per side.
+
+| scenario (vision) | success | cpm | placement mean | p95 | yaw |
+|---|---|---|---|---|---|
+| cartons only, 60/min, `fast` profile, belts 0.10 m/s | 20/20, 20/21 | 10–14 | 4–6 mm | 5–12 mm | ~2° |
+| bars + cartons, 24/min, `smooth` profile | 20/21, 20/24 | 5–6 (carton arrivals 12/min) | 5–6 mm | 6–20 mm | 2–3° |
+
+Motion profiles (`motion_profile:=fast|smooth`, `scripts/joint_metrics.py` samples `/joint_states`, cartons 60/min):
+
+| profile | cpm | motion / cycle | acc p95 J1/J2/J4 (rad/s²) | jerk p95 J1/J2/J4 (rad/s³) |
+|---|---|---|---|---|
+| fast | 7–10 | 3.2–4.2 s | 40 / 45 / 51 | 457 / 491 / 1391 |
+| smooth | 6–7 | 4.4–4.5 s | 22 / 26 / 33 | 213 / 223 / 833 |
+
+What made the difference (details in the commit log): tracked segments settle on the *measured* arm including the
+heading, the place approach clears the pocket walls, the grasp offset is measured at the seal and compensated at the
+place, tray tracks are dead-reckoned on a shared belt-speed estimate (objects slip ~10 % on the belts) and observations
+taken while the arm is over a tray are ignored. Throughput is now bounded by the tray window: a tray is placeable for
+~3 s of its passage at 0.10 m/s, so cycles of ~3 s allow one or two placements per tray.
+
+Several tray models can share the outfeed (`tray_models:=tray_2x4,tray_bar_2x3` on `sim_full.launch.py` and
+`perception.launch.py`): the vacancy node picks the spec per mask from the pocket size and `run_cycle` places each
+product class only into a fitting tray. The 620 mm bar tray is longer than the place camera's view, so it is only
+placeable while fully visible (partial-tray lattice pose: open item).
+
+## Operator HMI (M5)
+
+```bash
+ros2 launch togsim_hmi hmi.launch.py port:=8080        # with the cell running; scripts/demo.sh starts it too
+# http://localhost:8080 : state / cycles / rate / success / placement, belt speed sliders, start-stop of the
+# continuous pick & place (vision or ground truth), tray occupancy grid, pickable products, events, run_cycle log
+```
+
+The panel talks to a small rclpy bridge (`/togsim/hmi/status` from `run_cycle`, tracked trays/products, vacuum, joints,
+belt `cmd_vel`) through `GET /api/state`, `POST /api/belts`, `POST /api/run`, `POST /api/stop`.
 
 ## Packages
 

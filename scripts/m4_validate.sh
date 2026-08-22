@@ -15,7 +15,7 @@ echo "[m4] launching cell (headless, products on) -> $out"
 launch_cell() {  # Fortress occasionally hangs at robot spawn (controller_manager never appears): relaunch once
   for attempt in 1 2; do
     cleanup
-    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed product_rate:=${M4_RATE:-24.0} product_classes:=${M4_CLASSES:-product_bar,product_carton} motion_profile:=${M4_PROFILE:-smooth} spawn_seed:=${M4_SEED:-0} >"$out/sim$attempt.log" 2>&1 </dev/null &
+    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed product_rate:=${M4_RATE:-24.0} tray_models:=${M4_TRAYS:-} product_classes:=${M4_CLASSES:-product_bar,product_carton} motion_profile:=${M4_PROFILE:-smooth} spawn_seed:=${M4_SEED:-0} >"$out/sim$attempt.log" 2>&1 </dev/null &
     wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || continue
     wait_for 60 timeout 3 ros2 topic echo --once /joint_states --field header && return 0
     echo "[m4] simulator hung at start-up (no joint states), relaunching"
@@ -25,7 +25,7 @@ launch_cell() {  # Fortress occasionally hangs at robot spawn (controller_manage
 launch_cell || { echo "[m4] cell did not come up"; exit 1; }
 if [ "$mode" = vision ]; then
   wait_for 60 timeout 3 ros2 topic echo --once /cam_pick/depth_image --field header || { echo "[m4] cameras missing"; exit 1; }
-  setsid ros2 launch togsim_perception perception.launch.py >"$out/perception.log" 2>&1 </dev/null &
+  setsid ros2 launch togsim_perception perception.launch.py tray_models:=${M4_TRAYS:-} >"$out/perception.log" 2>&1 </dev/null &
   wait_for 90 timeout 3 ros2 topic echo --once /togsim/pick_candidates --field frame_seq || { echo "[m4] no pick candidates"; exit 1; }
 fi
 echo "[m4] conveyor_tracker source=$mode"

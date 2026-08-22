@@ -12,6 +12,11 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("source", default_value="yolo", description="yolo | gt"),
             DeclareLaunchArgument("weights", default_value="~/togsim_data/weights/togsim_seg.pt"),
+            DeclareLaunchArgument(
+                "tray_models",
+                default_value="",
+                description="csv of tray models in the cell, e.g. tray_2x4,tray_bar_2x3",
+            ),
             Node(
                 package="togsim_perception",
                 executable="segmentation_node",
@@ -19,6 +24,11 @@ def generate_launch_description():
                 parameters=[sim, {"source": source, "weights": weights}],
             ),
             Node(package="togsim_perception", executable="pick_pose_node", output="screen", parameters=[sim]),
-            Node(package="togsim_perception", executable="tray_vacancy_node", output="screen", parameters=[sim]),
+            Node(
+                package="togsim_perception",
+                executable="tray_vacancy_node",
+                output="screen",
+                parameters=[sim, {"tray_models_csv": LaunchConfiguration("tray_models")}],
+            ),
         ]
     )

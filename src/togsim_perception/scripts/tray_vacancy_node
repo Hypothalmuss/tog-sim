@@ -208,11 +208,29 @@ class TrayVacancyNode(Node):
             # half hidden by the arm, gave poses up to 180 mm off with the axis flipped by 90 deg
             gsd = z_floor / self.k[0, 0]
             cu, cv_, ang, long_px, short_px = principal_axis(m)
-            # several tray models in the cell: the mask's metric extents pick the spec (360x140 vs the bar tray)
-            sp = min(
-                self.specs.values(),
-                key=lambda s_: abs(long_px * gsd - s_["total"][0]) + abs(short_px * gsd - s_["total"][1]),
-            )
+            # pocket floors: blobs at the floor depth separated by the (closer) walls. Computed before the spec choice
+            # because the pocket size tells the tray model apart even on a partial mask (a 620 mm bar tray is never
+            # fully in view and its visible part has the extents of the carton tray)
+            floor_band = floor_px & np.isfinite(depth) & (np.abs(depth - z_floor) < 0.004)
+            n_cc, _labels, stats, cents = cv2.connectedComponentsWithStats(floor_band.astype(np.uint8), connectivity=4)
+            blobs, blob_len = [], []
+            for k in range(1, n_cc):
+                if stats[k, cv2.CC_STAT_AREA] >= 120:
+                    pw = transform_points(
+                        pixel_to_point(cents[k][0], cents[k][1], z_floor, self.k)[None, :], rot, trans
+                    )[0]
+                    blobs.append((pw[0], pw[1]))
+                    blob_len.append(max(stats[k, cv2.CC_STAT_WIDTH], stats[k, cv2.CC_STAT_HEIGHT]) * gsd)
+            if len(self.specs) == 1:
+                sp = next(iter(self.specs.values()))
+            elif blob_len:
+                med = sorted(blob_len)[len(blob_len) // 2]
+                sp = min(self.specs.values(), key=lambda s_: abs(0.92 * s_["pocket"][0] - med))
+            else:
+                sp = min(
+                    self.specs.values(),
+                    key=lambda s_: abs(long_px * gsd - s_["total"][0]) + abs(short_px * gsd - s_["total"][1]),
+                )
             expected_px = (sp["total"][0] * sp["total"][1]) / (gsd * gsd)
             # 95 %: at 80 % visible the centroid of the visible part is already ~35 mm off the tray centre
             full = (not partial) and (m | product_mask).sum() >= 0.95 * expected_px
@@ -232,15 +250,6 @@ class TrayVacancyNode(Node):
                 yaw += math.pi
             # refine: the pocket floors are blobs at the floor depth separated by the (closer) walls; fitting the known
             # pocket grid to their centres gives the tray pose from the pockets themselves, not from the mask outline
-            floor_band = floor_px & np.isfinite(depth) & (np.abs(depth - z_floor) < 0.004)
-            n_cc, _labels, stats, cents = cv2.connectedComponentsWithStats(floor_band.astype(np.uint8), connectivity=4)
-            blobs = []
-            for k in range(1, n_cc):
-                if stats[k, cv2.CC_STAT_AREA] >= 120:
-                    pw = transform_points(
-                        pixel_to_point(cents[k][0], cents[k][1], z_floor, self.k)[None, :], rot, trans
-                    )[0]
-                    blobs.append((pw[0], pw[1]))
             fx, fy, fyaw, n_fit, rms_fit = fit_pocket_lattice(blobs, sp["pocket_offsets"], (p_w[0], p_w[1]), yaw)
             # the lattice is periodic: a fit shifted by a pitch looks just as good, so the mask pose anchors it - accept
             # only a small correction of a fully visible tray with most pockets matched

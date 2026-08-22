@@ -437,6 +437,18 @@ class RunCycle(Node):
                 continue
             tl["approach"] = (ev["contact"] or t_sealed) - tc
             tl["seal_wait"] = t_sealed - (ev["contact"] or t_sealed)
+            # diagnostic (ground truth, metric only): where did the cup really seal relative to the product centre,
+            # compared with the vision estimate the place compensates for
+            with self.lock:
+                att = self.vac_attached
+                g = self.gt.get(att)
+            held = att
+            tp = self.track_pose(c.tid)
+            if g is not None and tp is not None:
+                ax, ay = g[0][0] - tp.x, g[0][1] - tp.y
+                self.get_logger().info(
+                    f"grasp offset {att}: actual ({1e3 * ax:+.0f},{1e3 * ay:+.0f}) mm, estimated ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm"
+                )
             # place: the tray is chosen now (the one selected before the pick has moved on)
             fresh = []
             for t in self.trays():
@@ -482,7 +494,7 @@ class RunCycle(Node):
             tl["transfer"] = (rel["t"] or time.monotonic()) - t_place0
             tl["release"] = time.monotonic() - (rel["t"] or time.monotonic())
             self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
-            threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket), daemon=True).start()
+            threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket, held), daemon=True).start()
             self.t_cycle_end = time.monotonic()
             self.timelines.append(tl)
             self.get_logger().info("timeline " + " ".join(f"{k} {v:.2f}" for k, v in tl.items()))
@@ -503,30 +515,37 @@ class RunCycle(Node):
             self.get_logger().info("timeline means " + " ".join(f"{k} {v:.2f}" for k, v in means.items()))
 
     # ---------------- placement accuracy (ground truth, metric only) ----------------
-    def measure_placement(self, key, tray, pocket):
-        """Offset of the just-released product from the pocket centre, from Gazebo ground truth (0.4 s after release)."""
+    def measure_placement(self, key, tray, pocket, held=""):
+        """Offset of the product the gripper just released (`held`, GT name) from the nearest pocket centre of the tray
+        it sits on, 0.4 s after release. Index-free: the vision tray yaw may be 180 deg from the GT convention."""
         time.sleep(0.4)
         with self.lock:
             gt = dict(self.gt)
+        trays = {n: v for n, v in gt.items() if n.startswith("tray_")}
         best = None
-        for tn, (tp, tyaw, _, _) in gt.items():
-            if not tn.startswith("tray_"):
-                continue  # every GT tray: the product is within 50 mm of the intended pocket of exactly one of them
-            px, py, _ = self.tray.pocket_world(tp, tyaw, pocket)
+        for tn, (tp, tyaw, _, _) in trays.items():
+            centres = [self.tray.pocket_world(tp, tyaw, k) for k in range(self.tray.n_pockets)]
             for pn, (pp, pyaw, _, _) in gt.items():
-                if pn.startswith("product_") and abs(pp[2] - tp[2]) < 0.06:
+                if not pn.startswith("product_") or abs(pp[2] - tp[2]) > 0.06 or (held and pn != held):
+                    continue
+                if math.hypot(pp[0] - tp[0], pp[1] - tp[1]) > 0.25:
+                    continue  # not on this tray
+                for k, (px, py, _) in enumerate(centres):
                     d = math.hypot(pp[0] - px, pp[1] - py)
                     if best is None or d < best[0]:
-                        best = (d, pn, math.degrees((pyaw - tyaw + math.pi / 2) % math.pi - math.pi / 2))
-        if best and best[0] >= 0.05:
+                        best = (d, pn, math.degrees((pyaw - tyaw + math.pi / 2) % math.pi - math.pi / 2), tn, k)
+        if best is None:
+            return
+        if best[0] >= 0.05:
             self.get_logger().warn(
-                f"placed {key} -> {tray.key}[{pocket}]: nearest product {1e3 * best[0]:.0f} mm from the pocket centre (not counted)"
+                f"placed {key} -> {tray.key}[{pocket}]: nearest product {1e3 * best[0]:.0f} mm from any pocket centre (not counted)"
             )
-        if best and best[0] < 0.05:
-            self.placements.append((best[0], abs(best[2])))
-            self.get_logger().info(
-                f"placed {key} -> {tray.key}[{pocket}] ({best[1]}): {1e3 * best[0]:.1f} mm off centre, yaw {best[2]:+.1f} deg"
-            )
+            return
+        self.placements.append((best[0], abs(best[2])))
+        self.get_logger().info(
+            f"placed {key} -> {tray.key}[{pocket}] ({best[1]} in {best[3]}[{best[4]}]): {1e3 * best[0]:.1f} mm off centre, "
+            f"yaw {best[2]:+.1f} deg"
+        )
 
     def report_placement(self):
         if not self.placements:

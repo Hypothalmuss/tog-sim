@@ -38,6 +38,9 @@ from togsim_perception.geometry import (
 )
 
 CLASS_TO_PRODUCT = {"bar": "product_bar", "carton": "product_carton"}
+# long/short side ratio of a clean mask per class (bar ~150x25 mm, carton 70x50 mm); a mask far from it is occluded,
+# merged with a neighbour or cut - its axis (and centre) cannot be trusted for a pick
+CLASS_ASPECT = {"bar": (3.0, 9.0), "carton": (1.15, 1.75)}
 
 
 class PickPoseNode(Node):
@@ -213,7 +216,9 @@ class PickPoseNode(Node):
             c.centre_offset.x, c.centre_offset.y = float(pc_w[0] - p_w[0]), float(pc_w[1] - p_w[1])
             c.height_m = float(p_w[2])
             c.mask_area_px = float(mask.sum())
-            c.occluded = bool(occluded) or tilt > self.max_tilt
+            lo, hi = CLASS_ASPECT.get(cls, (0.0, 99.0))
+            aspect = long_px / max(short_px, 1.0)
+            c.occluded = bool(occluded) or tilt > self.max_tilt or not (lo <= aspect <= hi)
             c.belt_velocity.x = float(self.belt_v)
             c.observed = header.stamp
             cands.append(c)

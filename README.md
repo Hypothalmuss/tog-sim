@@ -8,6 +8,8 @@
 Intel RealSense D435 · Open-RMF workcell / conveyors / trays · Google Scanned Objects & YCB products.
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+![tog-sim cell: Epson GX8 SCARA with tilt module and VGC10 suction cup between an infeed belt (products) and an outfeed belt (trays), two overhead D435 cameras, Open-RMF enclosure — Gazebo Fortress](docs/media/setup.png)
+
 ## Status
 
 | Milestone | State |
@@ -19,6 +21,12 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 | M4 Speed & moving-tray tracking, benchmark | 🟡 `conveyor_tracker` (stable product/tray tracks → TF) + `TRACK_CART` picks/places on **moving belts, no belt stops**: GT 12/13, vision **20/24** cycles (`scripts/m4_validate.sh 20 vision`), motion 4.4 s/cycle. Open: cycle time (target ≤2.5 s), bars → `tray_bar_2x3`, seal misses (3/24), benchmark table |
 | M5 HMI | ⬜ |
 | M6 Polish, teach-in, stereo stretch, Docker | ⬜ |
+
+## Demos
+
+| Continuous vision-driven pick & place from the moving belts (before the 2026-08-22 polish pass) |
+|---|
+| ![demo before](docs/media/demo_before.gif) |
 
 ## Quick start (native)
 

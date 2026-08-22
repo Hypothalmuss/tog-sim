@@ -24,13 +24,14 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Demos
 
-| Max pick rate test — cartons only, 60 products/min, fast motion profile, vision perception |
+| Cartons only, 60 products/min, `fast` motion profile, vision perception — live from Gazebo |
 |---|
 | ![demo](docs/media/demo_speed.gif) |
 
 Continuous vision-driven pick & place from the *moving* belts (YOLO11n-seg → pick poses → conveyor tracker →
-`TRACK_CART` motions), recorded live from Gazebo with `scripts/demo.sh` (`DEMO_CLASSES=product_carton DEMO_RATE=60.0
-DEMO_PROFILE=fast`). Current numbers are in [Benchmarks](#benchmarks).
+`TRACK_CART` motions), recorded with `scripts/demo.sh vision 30` (`DEMO_CLASSES=product_carton DEMO_RATE=60.0
+DEMO_PROFILE=fast`): 10/10 cycles during the recording at ~10 picks/min including waits; products land within a few mm
+of the pocket centre (numbers in [Benchmarks](#benchmarks)). The operator HMI (`http://localhost:8080`) runs alongside.
 
 ## Quick start (native)
 

@@ -975,7 +975,10 @@ class RunCycle(Node):
             self.status["placement_mean_mm"] = round(sum(offs) / len(offs), 1)
             self.status["placement_p95_mm"] = round(srt[int(0.95 * (len(srt) - 1))], 1)
         self.status["t"] = round(time.time(), 2)
-        self.status_pub.publish(String(data=json.dumps(self.status)))
+        try:
+            self.status_pub.publish(String(data=json.dumps(self.status)))
+        except Exception as e:  # noqa: BLE001 - best effort: the run must not fail because the HMI feed did
+            self.get_logger().warn(f"status publish failed: {e}")
 
     def report_placement(self):
         if not self.placements:

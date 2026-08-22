@@ -40,7 +40,9 @@ from togsim_perception.geometry import (
 CLASS_TO_PRODUCT = {"bar": "product_bar", "carton": "product_carton"}
 # long/short side ratio of a clean mask per class (bar ~150x25 mm, carton 70x50 mm); a mask far from it is occluded,
 # merged with a neighbour or cut - its axis (and centre) cannot be trusted for a pick
-CLASS_ASPECT = {"bar": (3.0, 9.0), "carton": (1.15, 1.75)}
+# true aspects: bar 4.0, carton 1.4. A mask that swallowed part of a touching neighbour skews the axis by tens of
+# degrees while still looking like "a carton" - keep the gates tight
+CLASS_ASPECT = {"bar": (3.2, 5.0), "carton": (1.25, 1.55)}
 # top-face area (m^2): two cartons side by side merge into one near-square mask that passes the aspect gate, with the
 # axis 90 deg off and the suction point on the seam
 CLASS_AREA = {"bar": 0.168 * 0.042, "carton": 0.07 * 0.05}
@@ -192,13 +194,13 @@ class PickPoseNode(Node):
                 z = zc
                 p_cam = pixel_to_point(su, sv, z, self.k)
                 p_w = transform_points(p_cam[None, :], rot, trans)[0]
-            # occlusion: a neighbouring instance at least a product height closer to the camera and touching this mask;
-            # a neighbour merely touching at the same height also disqualifies it: merged/abutting masks give a wrong
-            # axis (a near-square pair of cartons) and an off-centre suction point
+            # occlusion: a neighbouring instance at least a product height closer to the camera and touching this mask
+            # (a neighbour merely touching at the same height is fine: the cup lands on this product's own centre;
+            # masks merged into one instance are caught by the area/aspect gates below)
             occluded = False
-            dil = cv2.dilate(mask.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+            dil = cv2.dilate(mask.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
             for j in range(n):
-                if j != i and depths[j] is not None and (masks[j] & dil).any():
+                if j != i and depths[j] is not None and depths[j] < z - 0.012 and (masks[j] & dil).any():
                     occluded = True
                     break
             c = PickCandidate()
@@ -225,7 +227,7 @@ class PickPoseNode(Node):
             aspect = long_px / max(short_px, 1.0)
             area_ratio = float(mask.sum()) * gsd * gsd / CLASS_AREA.get(cls, 1e9)
             c.occluded = (
-                bool(occluded) or tilt > self.max_tilt or not (lo <= aspect <= hi) or not (0.5 <= area_ratio <= 1.4)
+                bool(occluded) or tilt > self.max_tilt or not (lo <= aspect <= hi) or not (0.75 <= area_ratio <= 1.25)
             )
             c.belt_velocity.x = float(self.belt_v)
             c.observed = header.stamp

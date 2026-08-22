@@ -74,8 +74,8 @@ class BeltTracker:
         self.gate = gate_m
         self.lost_s = lost_s
         self.pos_alpha = pos_alpha  # weight of the new observation in the position update
-        # a settled track (>= 5 observations) trusts single observations less: partial masks at the edge of the view or
-        # under the robot arm are biased by tens of mm
+        # a settled track (>= 10 observations) trusts single observations less: partial masks at the edge of the view
+        # or under the robot arm are biased by tens of mm
         self.mature_alpha = pos_alpha if mature_alpha is None else mature_alpha
         # keyed observations farther than key_gate_factor * gate from a settled track's prediction are outliers (a belt
         # track predicts to a few mm); after three in a row the track snaps to the observations (same id, fresh state)
@@ -86,6 +86,7 @@ class BeltTracker:
         # objects slip on the belt: the measured speed of all settled tracks (robust, shared) refines the encoder prior.
         # A per-track estimate from a few biased observations is worse than the prior; a shared one is better than both.
         self.belt_vx: float | None = None
+        self._v_samples: list[float] = []  # measured speeds of settled tracks; the median resists biased tails
         self.vel_alpha = vel_alpha  # weight of the measured velocity in the velocity update
         self.yaw_period = yaw_period
         self.estimate_velocity = estimate_velocity
@@ -193,7 +194,9 @@ class BeltTracker:
         if o.area > 0:
             tr.area = o.area if tr.area <= 0 else 0.8 * tr.area + 0.2 * o.area
         px, py = tr.predicted(o.t)
-        a = self.pos_alpha if tr.n_obs < 5 else self.mature_alpha
+        # converge fast from the (biased) first observations of an object entering the view, then trust single
+        # observations less
+        a = self.pos_alpha if tr.n_obs < 10 else self.mature_alpha
         tr.outliers = 0
         tr.x = (1 - a) * px + a * o.x
         tr.y = (1 - a) * py + a * o.y
@@ -213,10 +216,13 @@ class BeltTracker:
         if self.estimate_velocity and len(tr.history) >= self.min_obs_velocity:
             (t0, x0, _y0), (t1, x1, _y1) = tr.history[0], tr.history[-1]
             span = t1 - t0
-            if span > 0.5:
+            if span > 0.5 and tr.n_obs >= 8:
                 mvx = (x1 - x0) / span
                 if abs(mvx - o.vx) < 0.04:  # sane: within 4 cm/s of the encoder (partial masks drift much faster)
-                    self.belt_vx = mvx if self.belt_vx is None else 0.8 * self.belt_vx + 0.2 * mvx
+                    self._v_samples.append(mvx)
+                    del self._v_samples[:-60]
+                    if len(self._v_samples) >= 5:
+                        self.belt_vx = sorted(self._v_samples)[len(self._v_samples) // 2]
         vx, vy = (o.vx if self.belt_vx is None else self.belt_vx), o.vy
         b = self.vel_alpha
         tr.vx = (1 - b) * tr.vx + b * vx

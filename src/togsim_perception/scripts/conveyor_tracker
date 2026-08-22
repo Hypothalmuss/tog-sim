@@ -21,7 +21,8 @@ from geometry_msgs.msg import PoseStamped, TransformStamped
 from rclpy.node import Node
 from std_msgs.msg import Float64
 from tf2_msgs.msg import TFMessage
-from tf2_ros import TransformBroadcaster
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
 from togsim_msgs.msg import PickCandidate, PickCandidateArray, TrayState
 from togsim_perception.tracking import BeltTracker, Observation
@@ -47,6 +48,10 @@ class ConveyorTracker(Node):
         self.declare_parameter("lost_s", 2.5)  # a product is hidden under the arm for most of its pick
         self.declare_parameter("tray_lost_s", 4.0)  # trays are occluded by the arm during a place: predict through it
         self.declare_parameter("mature_alpha", 0.25)
+        self.declare_parameter("tool_frame", "tcp")  # observations near the tool are hidden/biased by the arm: ignored
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tool_warned = False
         self.declare_parameter("tray_model", "tray_2x4")
         self.declare_parameter("world_frame", "world")
         self.source = self.get_parameter("source").value
@@ -86,8 +91,14 @@ class ConveyorTracker(Node):
 
     def on_cands(self, msg):
         obs = []
+        tool = self.tool_xy()
         for c in msg.candidates:
             p = c.grasp_pose.pose.position
+            if not (0.4 < p.z < 0.7):
+                continue  # a grasp pose off the belt plane (missing depth) would drag the track's height
+            if tool is not None and math.hypot(p.x - tool[0], p.y - tool[1]) < 0.12:
+                continue  # under the arm: hidden or biased
+
             obs.append(
                 Observation(
                     p.x,
@@ -105,10 +116,24 @@ class ConveyorTracker(Node):
         with self.lock:
             self.products.update(obs, t_now=self._t(msg.header.stamp))
 
+    def tool_xy(self):
+        """World xy of the tool (None if the robot TF is not available)."""
+        try:
+            tf = self.tf_buffer.lookup_transform(self.world, self.get_parameter("tool_frame").value, Time())
+            return tf.transform.translation.x, tf.transform.translation.y
+        except Exception as e:  # noqa: BLE001
+            if not self.tool_warned:
+                self.tool_warned = True
+                self.get_logger().warn(f"no tool TF, observations under the arm are not filtered: {e}")
+            return None
+
     def on_tray(self, msg):
         if not msg.tracked:
             return  # partial / unreliable observation: never create or drag a track with it
         p = msg.pose.pose.position
+        tool = self.tool_xy()
+        if tool is not None and math.hypot(p.x - tool[0], p.y - tool[1]) < 0.30:
+            return  # the arm is over the tray: the mask/lattice are biased, keep predicting
         o = Observation(
             p.x,
             p.y,
@@ -204,6 +229,10 @@ class ConveyorTracker(Node):
                     tr.payload.mask_area_px,
                 )
                 c.centre_offset = tr.payload.centre_offset
+                # not pickable while only predicted (the product may be gone: a picked product's track lives on for
+                # lost_s) or before the heading/position have settled on a few observations
+                if tr.age(t) > 0.4 or tr.n_obs < 4:
+                    c.occluded = True
             elif isinstance(tr.payload, tuple):  # gt: (tilt,)
                 c.tilt_deg = float(math.degrees(tr.payload[0]))
                 c.score = 1.0
@@ -225,6 +254,8 @@ class ConveyorTracker(Node):
         self.pub_p.publish(arr)
         for tr in trays:
             tfs.append(self._tf(now, f"tray_{tr.id}", tr.x, tr.y, tr.z, tr.yaw))
+            if tr.n_obs < 12 and self.source != "gt":
+                continue  # not placeable yet: still converging from the biased first observations at the view entry
             m = TrayState()
             if isinstance(tr.payload, TrayState):
                 m.occupied, m.confidence, m.tracked = tr.payload.occupied, tr.payload.confidence, tr.payload.tracked

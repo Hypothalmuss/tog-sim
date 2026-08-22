@@ -148,7 +148,14 @@ class MotionServer : public rclcpp::Node {
 
   void setJointTarget(const std::array<double, DOF>& q, const std::array<double, DOF>& v) {
     for (size_t i = 0; i < DOF; ++i) {
-      input_.target_position[i] = std::clamp(q[i], pmin_[i], pmax_[i]);
+      double qi = q[i];
+      // J4 winds up over many cycles (each pick/place turns it by up to 90 deg either way); the same TCP heading one
+      // full turn away is equally valid for a symmetric cup, whereas clamping would silently rotate the cup
+      if (i == 3 && (qi < pmin_[i] || qi > pmax_[i])) {
+        const double alt = qi + (qi < pmin_[i] ? 2.0 * M_PI : -2.0 * M_PI);
+        if (alt >= pmin_[i] && alt <= pmax_[i]) qi = alt;
+      }
+      input_.target_position[i] = std::clamp(qi, pmin_[i], pmax_[i]);
       input_.target_velocity[i] = v[i];
       input_.target_acceleration[i] = 0.0;
     }

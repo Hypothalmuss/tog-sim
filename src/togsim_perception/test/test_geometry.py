@@ -5,6 +5,7 @@ import numpy as np
 from togsim_perception.geometry import (
     axis_tilt,
     contact_depth,
+    fit_pocket_lattice,
     pixel_to_point,
     plane_normal,
     point_to_pixel,
@@ -112,3 +113,38 @@ def test_contact_depth_is_ridge_not_mask_median():
     su, sv, _ = suction_point(mask)
     assert abs(contact_depth(depth, mask, su, sv) - 1.0814) < 0.002
     assert float(np.median(depth[mask])) > 1.0814 + 0.002  # the mask median sits lower on the rounded flanks
+
+
+def test_fit_pocket_lattice_recovers_pose_from_partial_noisy_pockets():
+    rows, cols, px, py = 2, 4, 0.09, 0.07
+    offs = [
+        (-cols * px / 2 + (c + 0.5) * px, -rows * py / 2 + (r + 0.5) * py) for r in range(rows) for c in range(cols)
+    ]
+    tx, ty, tyaw = 0.31, 0.352, math.radians(6.0)
+    cy, sy = math.cos(tyaw), math.sin(tyaw)
+    rng = np.random.default_rng(1)
+    pts = [
+        (tx + cy * ox - sy * oy + rng.normal(0, 0.002), ty + sy * ox + cy * oy + rng.normal(0, 0.002))
+        for ox, oy in offs
+    ]
+    pts = [p for i, p in enumerate(pts) if i not in (2, 5)]  # two pockets occupied / not visible
+    pts.append((tx + 0.2, ty + 0.2))  # an outlier blob
+    x, y, yaw, n, rms = fit_pocket_lattice(pts, offs, (tx + 0.015, ty - 0.012), tyaw + math.radians(4))
+    assert n == 6
+    assert abs(x - tx) < 0.003 and abs(y - ty) < 0.003
+    assert abs(math.degrees(yaw - tyaw)) < 1.0
+    assert rms < 0.004
+
+
+def test_fit_pocket_lattice_keeps_the_initial_yaw_branch():
+    rows, cols, px, py = 2, 4, 0.09, 0.07
+    offs = [
+        (-cols * px / 2 + (c + 0.5) * px, -rows * py / 2 + (r + 0.5) * py) for r in range(rows) for c in range(cols)
+    ]
+    tx, ty, tyaw = 0.2, 0.35, math.radians(3.0)
+    cy, sy = math.cos(tyaw), math.sin(tyaw)
+    pts = [(tx + cy * ox - sy * oy, ty + sy * ox + cy * oy) for ox, oy in offs]
+    # start from the 180-degree-rotated guess: the symmetric grid fits either way, the result must follow the guess
+    x, y, yaw, n, _ = fit_pocket_lattice(pts, offs, (tx, ty), tyaw + math.pi)
+    assert n == 8 and abs(x - tx) < 1e-6 and abs(y - ty) < 1e-6
+    assert abs(((yaw - (tyaw + math.pi) + math.pi) % (2 * math.pi)) - math.pi) < math.radians(1)

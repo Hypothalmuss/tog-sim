@@ -59,11 +59,11 @@ def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0,
 
 
 class Candidate:
-    __slots__ = ("key", "cls", "x", "y", "top", "yaw", "tilt", "occluded", "vx", "tid")
+    __slots__ = ("key", "cls", "x", "y", "top", "yaw", "tilt", "occluded", "vx", "tid", "off")
 
-    def __init__(self, key, cls, x, y, top, yaw, tilt=0.0, occluded=False, vx=0.0, tid=None):
+    def __init__(self, key, cls, x, y, top, yaw, tilt=0.0, occluded=False, vx=0.0, tid=None, off=(0.0, 0.0)):
         self.key, self.cls, self.x, self.y, self.top, self.yaw = key, cls, x, y, top, yaw
-        self.tilt, self.occluded, self.vx, self.tid = tilt, occluded, vx, tid
+        self.tilt, self.occluded, self.vx, self.tid, self.off = tilt, occluded, vx, tid, off
 
 
 class Tray:
@@ -187,6 +187,7 @@ class RunCycle(Node):
                                 c.occluded,
                                 c.belt_velocity.x,
                                 int(c.id),
+                                (c.centre_offset.x, c.centre_offset.y),
                             )
                         )
         return out
@@ -328,7 +329,9 @@ class RunCycle(Node):
             float(self.get_parameter("pick_lead_s").value),
             float(self.get_parameter("place_lead_s").value),
         )
-        seal_budget = max(0.8, float(self.get_parameter("track_dwell_s").value) * 3.0)  # the place goal preempts on seal
+        seal_budget = max(
+            0.8, float(self.get_parameter("track_dwell_s").value) * 3.0
+        )  # the place goal preempts on seal
         contact = float(self.get_parameter("contact_offset_m").value)
         fits = PRODUCT_FITS[self.tray.name]
         park = [float(v) for v in self.get_parameter("park").value]
@@ -387,7 +390,9 @@ class RunCycle(Node):
 
             def on_fb_pick(fb, n=n_pick):
                 p = fb.feedback.progress
-                self.get_logger().info(f"fb pick seg {fb.feedback.segment_index} progress {p:.3f} t+{time.monotonic() - tc:.2f}")
+                self.get_logger().info(
+                    f"fb pick seg {fb.feedback.segment_index} progress {p:.3f} t+{time.monotonic() - tc:.2f}"
+                )
                 if abs(p - 1.0 / n) < 1e-3 and ev["vac_on"] is None:  # lift done: nothing to do yet
                     pass
                 if abs(p - 2.0 / n) < 1e-3 and ev["vac_on"] is None:  # hover reached: descending onto the product
@@ -447,6 +452,12 @@ class RunCycle(Node):
                 tray, pocket = trays[0]
             tframe = f"tray_{tray.tid}"
             ox, oy = self.tray.pocket_offset(pocket)
+            # the cup holds the product off-centre by `off` (world, at pick); after J4 turns the product to the tray's
+            # yaw that offset, expressed in the product frame, is constant -> aim the cup at pocket - offset
+            cp, sp = math.cos(-c.yaw), math.sin(-c.yaw)
+            offx, offy = cp * c.off[0] - sp * c.off[1], sp * c.off[0] + cp * c.off[1]
+            if math.hypot(offx, offy) < 0.03:  # sanity: a bigger "offset" is a bad mask, not a real grasp offset
+                ox, oy = ox - offx, oy - offy
             z_place = self.tray.base_thickness + h + 0.004
             rel = {"t": None}
 
@@ -499,14 +510,18 @@ class RunCycle(Node):
             gt = dict(self.gt)
         best = None
         for tn, (tp, tyaw, _, _) in gt.items():
-            if not tn.startswith("tray_") or abs(tp[0] - tray.x) > 0.25:
-                continue  # the tray we placed into: GT and track agree within the prediction error
+            if not tn.startswith("tray_"):
+                continue  # every GT tray: the product is within 50 mm of the intended pocket of exactly one of them
             px, py, _ = self.tray.pocket_world(tp, tyaw, pocket)
             for pn, (pp, pyaw, _, _) in gt.items():
                 if pn.startswith("product_") and abs(pp[2] - tp[2]) < 0.06:
                     d = math.hypot(pp[0] - px, pp[1] - py)
                     if best is None or d < best[0]:
                         best = (d, pn, math.degrees((pyaw - tyaw + math.pi / 2) % math.pi - math.pi / 2))
+        if best and best[0] >= 0.05:
+            self.get_logger().warn(
+                f"placed {key} -> {tray.key}[{pocket}]: nearest product {1e3 * best[0]:.0f} mm from the pocket centre (not counted)"
+            )
         if best and best[0] < 0.05:
             self.placements.append((best[0], abs(best[2])))
             self.get_logger().info(

@@ -207,6 +207,10 @@ class PickPoseNode(Node):
             c.tilt_deg = float(math.degrees(tilt)) if self.tilt_thr <= tilt <= self.max_tilt else 0.0
             c.yaw_deg = float(math.degrees(yaw))
             c.suction_margin_mm = float(margin_mm)
+            # product centre (min-area-rectangle centre) relative to the grasp point: the place compensates it so the
+            # *product* ends up centred in the pocket, not the cup
+            pc_w = transform_points(pixel_to_point(cu, cv_, z, self.k)[None, :], rot, trans)[0]
+            c.centre_offset.x, c.centre_offset.y = float(pc_w[0] - p_w[0]), float(pc_w[1] - p_w[1])
             c.height_m = float(p_w[2])
             c.mask_area_px = float(mask.sum())
             c.occluded = bool(occluded) or tilt > self.max_tilt

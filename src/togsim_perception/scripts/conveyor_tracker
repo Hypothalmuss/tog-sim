@@ -51,7 +51,7 @@ class ConveyorTracker(Node):
         self.world = self.get_parameter("world_frame").value
         gate, lost = float(self.get_parameter("gate_m").value), float(self.get_parameter("lost_s").value)
         self.products = BeltTracker(gate_m=gate, lost_s=lost, yaw_period=math.pi)
-        self.trays = BeltTracker(gate_m=gate, lost_s=lost, yaw_period=2 * math.pi)
+        self.trays = BeltTracker(gate_m=gate, lost_s=lost, yaw_period=math.pi)  # the pocket grid is 180 deg symmetric
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
         self.lock = threading.Lock()
@@ -84,6 +84,8 @@ class ConveyorTracker(Node):
             self.products.update(obs, t_now=self._t(msg.header.stamp))
 
     def on_tray(self, msg):
+        if not msg.tracked:
+            return  # partial / unreliable observation: never create or drag a track with it
         p = msg.pose.pose.position
         o = Observation(p.x, p.y, p.z, yaw_of(msg.pose.pose.orientation), "tray", self._t(msg.header.stamp),
                         vx=msg.velocity.x, vy=msg.velocity.y, key=f"tray{msg.tray_id}", payload=msg, area=1.0 if msg.tracked else 0.1)
@@ -143,6 +145,7 @@ class ConveyorTracker(Node):
                 c = PickCandidate()
                 c.tilt_deg, c.suction_margin_mm, c.occluded, c.score, c.mask_area_px = (tr.payload.tilt_deg, tr.payload.suction_margin_mm,
                                                                                    tr.payload.occluded, tr.payload.score, tr.payload.mask_area_px)
+                c.centre_offset = tr.payload.centre_offset
             elif isinstance(tr.payload, tuple):  # gt: (tilt,)
                 c.tilt_deg = float(math.degrees(tr.payload[0]))
                 c.score = 1.0

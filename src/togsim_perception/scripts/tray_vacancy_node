@@ -32,6 +32,7 @@ from togsim_perception.geometry import (
     pixel_to_point,
     point_to_pixel,
     polygon_coverage,
+    fit_pocket_lattice,
     principal_axis,
     quat_to_rot,
     transform_points,
@@ -58,7 +59,18 @@ class TrayVacancyNode(Node):
         self.pocket = (t["pocket_x"], t["pocket_y"])
         self.base_t = t.get("base_thickness", 0.004)
         self.depth_total = self.base_t + t["pocket_depth"]
-        self.total = (self.cols * self.pitch[0] + 2 * t.get("margin", 0.01), self.rows * self.pitch[1] + 2 * t.get("margin", 0.01))
+        self.total = (
+            self.cols * self.pitch[0] + 2 * t.get("margin", 0.01),
+            self.rows * self.pitch[1] + 2 * t.get("margin", 0.01),
+        )
+        self.pocket_offsets = [
+            (
+                -self.cols * self.pitch[0] / 2 + (c + 0.5) * self.pitch[0],
+                -self.rows * self.pitch[1] / 2 + (r + 0.5) * self.pitch[1],
+            )
+            for r in range(self.rows)
+            for c in range(self.cols)
+        ]
         self.cov_thr = float(self.get_parameter("coverage_threshold").value)
         self.rise = float(self.get_parameter("depth_rise_m").value)
         self.belt_z = float(self.get_parameter("belt_z").value)
@@ -70,19 +82,26 @@ class TrayVacancyNode(Node):
         self.masks = {}
         self.det = {}
         self.belt_v = 0.0
-        self.tracks = []  # [id, x, y, stamp]
+        self.tracks = []
+        self.corr = {}  # track id -> EMA of the lattice correction (dx, dy, dyaw)  # [id, x, y, stamp]
         self.next_id = 1
         self.tf_buf = Buffer()
         self.tf_listener = TransformListener(self.tf_buf, self, spin_thread=False)
         self.create_subscription(CameraInfo, f"/{cam}/camera_info", self.on_info, 5, callback_group=self.cb)
-        self.create_subscription(Image, f"/{cam}/depth_image", self.on_depth, qos_profile_sensor_data, callback_group=self.cb)
+        self.create_subscription(
+            Image, f"/{cam}/depth_image", self.on_depth, qos_profile_sensor_data, callback_group=self.cb
+        )
         self.create_subscription(Image, f"/togsim/masks/{cam}", self.on_masks, 5, callback_group=self.cb)
         self.create_subscription(Detection2DArray, f"/togsim/detections/{cam}", self.on_det, 5, callback_group=self.cb)
-        self.create_subscription(Float64, "/togsim/conveyor/outfeed/state", lambda m: setattr(self, "belt_v", m.data), 5)
+        self.create_subscription(
+            Float64, "/togsim/conveyor/outfeed/state", lambda m: setattr(self, "belt_v", m.data), 5
+        )
         self.pub = self.create_publisher(TrayState, "/togsim/tray_state", 10)
         self.dbg_pub = self.create_publisher(Image, "/togsim/debug/tray_overlay", 2)
         self.latest_rgb = None
-        self.create_subscription(Image, f"/{cam}/image", lambda m: setattr(self, "latest_rgb", m), qos_profile_sensor_data)
+        self.create_subscription(
+            Image, f"/{cam}/image", lambda m: setattr(self, "latest_rgb", m), qos_profile_sensor_data
+        )
         self.get_logger().info("tray_vacancy_node ready")
 
     def on_info(self, msg):
@@ -115,13 +134,16 @@ class TrayVacancyNode(Node):
         if det is not None:
             self.process(msg.header, img, det)
 
-    def track_id(self, x, y, stamp_s):
+    def track_id(self, x, y, stamp_s, assign=True):
         for tr in self.tracks:
             dt = max(0.0, stamp_s - tr[3])
             px = tr[1] + self.belt_v * dt
-            if math.hypot(px - x, tr[2] - y) < 0.08:
-                tr[1], tr[2], tr[3] = x, y, stamp_s
+            if math.hypot(px - x, tr[2] - y) < 0.12:
+                if assign:
+                    tr[1], tr[2], tr[3] = x, y, stamp_s
                 return tr[0]
+        if not assign:
+            return None
         self.tracks = [tr for tr in self.tracks if stamp_s - tr[3] < 3.0]
         self.tracks.append([self.next_id, x, y, stamp_s])
         self.next_id += 1
@@ -169,6 +191,13 @@ class TrayVacancyNode(Node):
             z_floor = median_depth(depth, floor_px, erode_px=1)
             if z_floor is None:
                 continue
+            # only a fully visible tray has a meaningful centroid / axis: a tray entering or leaving the view, or one
+            # half hidden by the arm, gave poses up to 180 mm off with the axis flipped by 90 deg
+            gsd = z_floor / self.k[0, 0]
+            expected_px = (self.total[0] * self.total[1]) / (gsd * gsd)
+            full = (not partial) and (m | product_mask).sum() >= 0.8 * expected_px
+            if not full:
+                continue
             cu, cv_, ang, long_px, short_px = principal_axis(m)
             p_cam = pixel_to_point(cu, cv_, z_floor, self.k)
             p_w = transform_points(p_cam[None, :], rot, trans)[0]
@@ -182,6 +211,33 @@ class TrayVacancyNode(Node):
                 yaw -= math.pi
             if yaw < -math.pi / 2:
                 yaw += math.pi
+            # refine: the pocket floors are blobs at the floor depth separated by the (closer) walls; fitting the known
+            # pocket grid to their centres gives the tray pose from the pockets themselves, not from the mask outline
+            floor_band = floor_px & np.isfinite(depth) & (np.abs(depth - z_floor) < 0.004)
+            n_cc, _labels, stats, cents = cv2.connectedComponentsWithStats(floor_band.astype(np.uint8), connectivity=4)
+            blobs = []
+            for k in range(1, n_cc):
+                if stats[k, cv2.CC_STAT_AREA] >= 120:
+                    pw = transform_points(
+                        pixel_to_point(cents[k][0], cents[k][1], z_floor, self.k)[None, :], rot, trans
+                    )[0]
+                    blobs.append((pw[0], pw[1]))
+            fx, fy, fyaw, n_fit, rms_fit = fit_pocket_lattice(blobs, self.pocket_offsets, (p_w[0], p_w[1]), yaw)
+            # the lattice is periodic: a fit shifted by a pitch looks just as good, so the mask pose anchors it - accept
+            # only a small correction of a fully visible tray with most pockets matched
+            if not partial and n_fit >= 5 and rms_fit < 0.006 and math.hypot(fx - p_w[0], fy - p_w[1]) < 0.035:
+                # apply the correction through a per-track EMA so the pose does not jump between frames where the fit is
+                # accepted and frames where it is not (jumps spawn new track ids and break the tray_<id> frame mid-place)
+                key = self.track_id(p_w[0], p_w[1], stamp_s, assign=False)
+                dx, dy, dyaw = fx - p_w[0], fy - p_w[1], (fyaw - yaw + math.pi) % (2 * math.pi) - math.pi
+                prev = self.corr.get(key)
+                if prev is None:
+                    corr = (dx, dy, dyaw)
+                else:
+                    corr = tuple(0.7 * a + 0.3 * b for a, b in zip(prev, (dx, dy, dyaw)))
+                self.corr[key] = corr
+                p_w = np.array([p_w[0] + corr[0], p_w[1] + corr[1], p_w[2]])
+                yaw += corr[2]
             tid = self.track_id(p_w[0], p_w[1], stamp_s)
             occupied, conf = [], []
             c, s = math.cos(yaw), math.sin(yaw)
@@ -207,16 +263,36 @@ class TrayVacancyNode(Node):
                     occ = cov > self.cov_thr or rise > self.rise
                     occupied.append(bool(occ))
                     if dbg is not None:
-                        cv2.polylines(dbg, [np.round(poly).astype(np.int32).reshape(-1, 1, 2)], True, (0, 0, 255) if occ else (0, 255, 0), 2)
-                        cv2.putText(dbg, f"{cov:.2f}/{rise * 1000:.0f}", (int(poly[0][0]), int(poly[0][1])), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                    conf.append(float(min(1.0, 0.5 * cov / max(self.cov_thr, 1e-6) + 0.5 * rise / max(self.rise, 1e-6))))
+                        cv2.polylines(
+                            dbg,
+                            [np.round(poly).astype(np.int32).reshape(-1, 1, 2)],
+                            True,
+                            (0, 0, 255) if occ else (0, 255, 0),
+                            2,
+                        )
+                        cv2.putText(
+                            dbg,
+                            f"{cov:.2f}/{rise * 1000:.0f}",
+                            (int(poly[0][0]), int(poly[0][1])),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4,
+                            (255, 255, 255),
+                            1,
+                        )
+                    conf.append(
+                        float(min(1.0, 0.5 * cov / max(self.cov_thr, 1e-6) + 0.5 * rise / max(self.rise, 1e-6)))
+                    )
             msg = TrayState()
             msg.header = header
             msg.header.frame_id = self.world
             msg.tray_id = tid
             msg.pose = PoseStamped()
             msg.pose.header = msg.header
-            msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z = float(p_w[0]), float(p_w[1]), float(z_bottom)
+            msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z = (
+                float(p_w[0]),
+                float(p_w[1]),
+                float(z_bottom),
+            )
             msg.pose.pose.orientation.z = math.sin(yaw / 2)
             msg.pose.pose.orientation.w = math.cos(yaw / 2)
             msg.velocity.x = float(self.belt_v)
@@ -228,7 +304,15 @@ class TrayVacancyNode(Node):
             self.pub.publish(msg)
             if dbg is not None:
                 cv2.circle(dbg, (int(cu), int(cv_)), 6, (255, 0, 255), 2)
-                cv2.putText(dbg, f"tray {tid} yaw {math.degrees(yaw):.0f} z {z_bottom:.3f}", (int(cu) + 8, int(cv_)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+                cv2.putText(
+                    dbg,
+                    f"tray {tid} yaw {math.degrees(yaw):.0f} z {z_bottom:.3f}",
+                    (int(cu) + 8, int(cv_)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 0, 255),
+                    1,
+                )
         if dbg is not None:
             o = self.br.cv2_to_imgmsg(dbg, encoding="bgr8")
             o.header = header

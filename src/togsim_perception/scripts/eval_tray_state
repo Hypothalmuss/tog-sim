@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Score vision tray states against Gazebo ground truth.
+
+  ros2 run togsim_perception eval_tray_state --ros-args -p frames:=300 -p use_sim_time:=true [-p topic:=...]
+
+Each TrayState (raw from tray_vacancy_node, or the tracker's /togsim/tracks/trays) is matched to the nearest GT tray
+(within 0.2 m, GT interpolated to the message stamp); reports xy / yaw / z error, pocket-occupancy confusion (GT
+occupancy = products resting in the pockets) and id churn (distinct ids per GT tray). JSON to `out`.
+"""
+
+import json
+import math
+import os
+import threading
+from collections import deque
+
+import numpy as np
+import rclpy
+import yaml
+from ament_index_python.packages import get_package_share_directory
+from rclpy.node import Node
+from tf2_msgs.msg import TFMessage
+
+from togsim_msgs.msg import TrayState
+from togsim_task.trays import TraySpec
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+class EvalTrayState(Node):
+    def __init__(self):
+        super().__init__("eval_tray_state")
+        self.declare_parameter("frames", 300)
+        self.declare_parameter("topic", "/togsim/tray_state")
+        self.declare_parameter("tray_model", "tray_2x4")
+        self.declare_parameter("out", os.path.expanduser("~/togsim_data/eval_tray_state.json"))
+        self.frames = int(self.get_parameter("frames").value)
+        cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
+        self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
+        self.lock = threading.Lock()
+        self.hist = deque()  # (t_ns, {name: (x, y, z, yaw)} for trays, {name: (x, y, z)} for products)
+        self.n = 0
+        self.err_xy, self.err_yaw, self.err_z = [], [], []
+        self.tp = self.fp = self.fn = self.tn = 0
+        self.ids = {}  # gt tray -> set of vision ids
+        self.unmatched = 0
+        self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_gt, 10)
+        self.create_subscription(TrayState, self.get_parameter("topic").value, self.on_tray, 10)
+        self.done = threading.Event()
+
+    def on_gt(self, msg):
+        t = self.get_clock().now().nanoseconds
+        trays, prods = {}, {}
+        for tr in msg.transforms:
+            n, p = tr.child_frame_id, tr.transform.translation
+            if n.startswith("tray_"):
+                trays[n] = (p.x, p.y, p.z, yaw_of(tr.transform.rotation))
+            elif n.startswith("product_"):
+                prods[n] = (p.x, p.y, p.z)
+        with self.lock:
+            self.hist.append((t, trays, prods))
+            while len(self.hist) > 1 and t - self.hist[0][0] > 3_000_000_000:
+                self.hist.popleft()
+
+    def gt_at(self, t_ns):
+        with self.lock:
+            hist = list(self.hist)
+        if not hist:
+            return None
+        return min(hist, key=lambda h: abs(h[0] - t_ns))
+
+    def on_tray(self, msg):
+        if self.done.is_set():
+            return
+        t_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        snap = self.gt_at(t_ns)
+        if snap is None or abs(snap[0] - t_ns) > 300_000_000:
+            return
+        _, trays, prods = snap
+        p = msg.pose.pose.position
+        vyaw = yaw_of(msg.pose.pose.orientation)
+        best = min(((math.hypot(p.x - g[0], p.y - g[1]), n, g) for n, g in trays.items()), default=None)
+        self.n += 1
+        if best is None or best[0] > 0.2:
+            self.unmatched += 1
+            return
+        d, name, g = best
+        self.err_xy.append(d)
+        self.err_yaw.append(abs(math.degrees((vyaw - g[3] + math.pi / 2) % math.pi - math.pi / 2)))
+        self.err_z.append(abs(p.z - g[2]))
+        self.ids.setdefault(name, set()).add(int(msg.tray_id))
+        # GT occupancy: a product whose origin lies in pocket k and rests at tray height
+        occ_gt = [False] * self.tray.n_pockets
+        for q in prods.values():
+            if abs(q[2] - g[2]) < 0.06:
+                k = self.tray.pocket_of_point((g[0], g[1], g[2]), g[3], q[0], q[1])
+                if k is not None:
+                    occ_gt[k] = True
+        for k in range(min(len(msg.occupied), self.tray.n_pockets)):
+            v, t = bool(msg.occupied[k]), occ_gt[k]
+            if v and t:
+                self.tp += 1
+            elif v and not t:
+                self.fp += 1
+            elif not v and t:
+                self.fn += 1
+            else:
+                self.tn += 1
+        if self.n % 50 == 0:
+            self.get_logger().info(f"{self.n}/{self.frames} frames, xy {1e3 * np.mean(self.err_xy):.1f} mm")
+        if self.n >= self.frames:
+            self.done.set()
+
+    def summary(self):
+        def st(v):
+            a = np.array(v or [0.0])
+            return {"mean": float(a.mean()), "p95": float(np.percentile(a, 95)), "max": float(a.max())}
+
+        tot = self.tp + self.fp + self.fn + self.tn
+        return {
+            "frames": self.n,
+            "unmatched": self.unmatched,
+            "xy_error_mm": st([1e3 * e for e in self.err_xy]),
+            "yaw_error_deg": st(self.err_yaw),
+            "z_error_mm": st([1e3 * e for e in self.err_z]),
+            "occupancy_accuracy": (self.tp + self.tn) / tot if tot else 0.0,
+            "occupancy_confusion": {"tp": self.tp, "fp": self.fp, "fn": self.fn, "tn": self.tn},
+            "ids_per_gt_tray": {k: len(v) for k, v in self.ids.items()},
+        }
+
+
+def main():
+    rclpy.init()
+    node = EvalTrayState()
+    th = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    th.start()
+    try:
+        node.done.wait()
+    except KeyboardInterrupt:
+        pass
+    s = node.summary()
+    out = os.path.expanduser(node.get_parameter("out").value)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(s, f, indent=2)
+    print(json.dumps(s, indent=2))
+    rclpy.try_shutdown()
+    th.join(timeout=2.0)
+    node.destroy_node()
+
+
+if __name__ == "__main__":
+    main()

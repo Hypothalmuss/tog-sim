@@ -165,6 +165,54 @@ def contact_depth(depth: np.ndarray, mask: np.ndarray, u: int, v: int, half: int
     return float(np.median(win)) if win.size else None
 
 
+def fit_pocket_lattice(points, offsets, init_xy, init_yaw, iters: int = 4, gate_m: float = 0.03):
+    """Fit the known pocket grid to observed pocket-floor centres (2-D Procrustes with nearest-neighbour assignment).
+
+    points: (N, 2) observed pocket centres in the world, offsets: (M, 2) pocket centres in the tray frame.
+    Returns (x, y, yaw, n_matched, rms_m); with fewer than 3 matches the initial pose is returned with n_matched < 3."""
+    pts = np.asarray(points, dtype=float).reshape(-1, 2)
+    offs = np.asarray(offsets, dtype=float).reshape(-1, 2)
+    x, y, yaw = float(init_xy[0]), float(init_xy[1]), float(init_yaw)
+    matched, rms = 0, 0.0
+    for _ in range(iters):
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        pred = np.stack([x + c * offs[:, 0] - s_ * offs[:, 1], y + s_ * offs[:, 0] + c * offs[:, 1]], axis=1)
+        pairs = []  # greedy unique assignment, nearest first
+        d = np.linalg.norm(pts[:, None, :] - pred[None, :, :], axis=2)
+        used_p, used_o = set(), set()
+        for k in np.argsort(d, axis=None):
+            i, j = divmod(int(k), len(offs))
+            if d[i, j] > gate_m:
+                break
+            if i in used_p or j in used_o:
+                continue
+            used_p.add(i)
+            used_o.add(j)
+            pairs.append((i, j))
+        matched = len(pairs)
+        if matched < 3:
+            return x, y, yaw, matched, rms
+        P = pts[[i for i, _ in pairs]]
+        O = offs[[j for _, j in pairs]]
+        pm, om = P.mean(axis=0), O.mean(axis=0)
+        H = (O - om).T @ (P - pm)
+        u, _, vt = np.linalg.svd(H)
+        R = vt.T @ u.T
+        if np.linalg.det(R) < 0:  # reflection guard
+            vt[1, :] *= -1
+            R = vt.T @ u.T
+        yaw = math.atan2(R[1, 0], R[0, 0])
+        t = pm - R @ om
+        x, y = float(t[0]), float(t[1])
+        res = P - (t + (R @ O.T).T)
+        rms = float(np.sqrt(np.mean(np.sum(res**2, axis=1))))
+    # a rectangular grid is symmetric under 180 deg: keep the yaw branch closest to the initial (mask-based) yaw so the
+    # pocket indices stay consistent with it
+    if abs((yaw - float(init_yaw) + math.pi) % (2 * math.pi) - math.pi) > math.pi / 2:
+        yaw = (yaw + math.pi + math.pi) % (2 * math.pi) - math.pi
+    return x, y, yaw, matched, rms
+
+
 def polygon_coverage(mask: np.ndarray, polygon_px: np.ndarray) -> float:
     """Fraction of a pixel polygon covered by True pixels of mask."""
     poly = np.zeros(mask.shape, np.uint8)

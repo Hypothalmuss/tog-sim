@@ -189,11 +189,13 @@ class PickPoseNode(Node):
                 z = zc
                 p_cam = pixel_to_point(su, sv, z, self.k)
                 p_w = transform_points(p_cam[None, :], rot, trans)[0]
-            # occlusion: a neighbouring instance at least a product height closer to the camera and touching this mask
+            # occlusion: a neighbouring instance at least a product height closer to the camera and touching this mask;
+            # a neighbour merely touching at the same height also disqualifies it: merged/abutting masks give a wrong
+            # axis (a near-square pair of cartons) and an off-centre suction point
             occluded = False
-            dil = cv2.dilate(mask.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
+            dil = cv2.dilate(mask.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
             for j in range(n):
-                if j != i and depths[j] is not None and depths[j] < z - 0.012 and (masks[j] & dil).any():
+                if j != i and depths[j] is not None and (masks[j] & dil).any():
                     occluded = True
                     break
             c = PickCandidate()

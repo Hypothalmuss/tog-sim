@@ -41,6 +41,7 @@ class Track:
     yaw_period: float = math.pi
     history: list = field(default_factory=list)  # (t, x, y) of the last observations, for velocity estimation
     area: float = 0.0  # running estimate of the observation area (0 = unknown)
+    outliers: int = 0  # consecutive keyed observations rejected as too far from the prediction
 
     def predicted(self, t: float):
         """(x, y) extrapolated to time t."""
@@ -62,6 +63,8 @@ class BeltTracker:
         lost_s: float = 1.0,
         pos_alpha: float = 0.6,
         vel_alpha: float = 0.3,
+        mature_alpha: float | None = None,
+        key_gate_factor: float = 0.5,
         yaw_period: float = math.pi,
         estimate_velocity: bool = True,
         min_obs_velocity: int = 3,
@@ -70,6 +73,12 @@ class BeltTracker:
         self.gate = gate_m
         self.lost_s = lost_s
         self.pos_alpha = pos_alpha  # weight of the new observation in the position update
+        # a settled track (>= 5 observations) trusts single observations less: partial masks at the edge of the view or
+        # under the robot arm are biased by tens of mm
+        self.mature_alpha = pos_alpha if mature_alpha is None else mature_alpha
+        # keyed observations farther than key_gate_factor * gate from a settled track's prediction are outliers (a belt
+        # track predicts to a few mm); after three in a row the track snaps to the observations (same id, fresh state)
+        self.key_gate_factor = key_gate_factor
         self.vel_alpha = vel_alpha  # weight of the measured velocity in the velocity update
         self.yaw_period = yaw_period
         self.estimate_velocity = estimate_velocity
@@ -99,6 +108,12 @@ class BeltTracker:
             tr = next((tr for tr in self.tracks.values() if tr.key == o.key), None)
             if tr is None:
                 tr = self._create(o)
+            elif tr.n_obs >= 3 and self._dist(tr, o) > self.key_gate_factor * self.gate:
+                tr.outliers += 1
+                unmatched_tracks.discard(tr.id)
+                if tr.outliers < 3:
+                    continue  # keep predicting; do not drag the track
+                self._snap(tr, o)
             else:
                 self._fuse(tr, o)
                 unmatched_tracks.discard(tr.id)
@@ -142,6 +157,17 @@ class BeltTracker:
         return out
 
     # ---------------- internals ----------------
+    @staticmethod
+    def _dist(tr: Track, o: Observation) -> float:
+        px, py = tr.predicted(o.t)
+        return math.hypot(o.x - px, o.y - py)
+
+    def _snap(self, tr: Track, o: Observation):
+        """Restart a track's geometry from an observation, keeping its identity."""
+        tr.x, tr.y, tr.z, tr.yaw, tr.t = o.x, o.y, o.z, o.yaw, o.t
+        tr.vx, tr.vy = o.vx, o.vy
+        tr.n_obs, tr.outliers, tr.history, tr.area, tr.payload = 1, 0, [(o.t, o.x, o.y)], o.area, o.payload
+
     def _create(self, o: Observation) -> Track:
         tr = Track(self._next_id, o.cls, o.x, o.y, o.z, o.yaw, o.vx, o.vy, o.t, 1, o.key, o.payload, self.yaw_period)
         tr.area = o.area
@@ -160,7 +186,8 @@ class BeltTracker:
         if o.area > 0:
             tr.area = o.area if tr.area <= 0 else 0.8 * tr.area + 0.2 * o.area
         px, py = tr.predicted(o.t)
-        a = self.pos_alpha
+        a = self.pos_alpha if tr.n_obs < 5 else self.mature_alpha
+        tr.outliers = 0
         tr.x = (1 - a) * px + a * o.x
         tr.y = (1 - a) * py + a * o.y
         tr.z = (1 - a) * tr.z + a * o.z
@@ -176,9 +203,11 @@ class BeltTracker:
         if self.estimate_velocity and len(tr.history) >= self.min_obs_velocity:
             (t0, x0, y0), (t1, x1, y1) = tr.history[0], tr.history[-1]
             span = t1 - t0
-            if span > 0.15:
+            if span > 0.3:
                 mvx, mvy = (x1 - x0) / span, (y1 - y0) / span
-                if math.hypot(mvx - o.vx, mvy - o.vy) < 0.05:  # sane: within 5 cm/s of the encoder
+                # sane: within 2 cm/s of the encoder. Observation bias of a few mm over the history span already makes
+                # cm/s errors, and a track predicted through an occlusion drifts by that error times the occlusion time
+                if math.hypot(mvx - o.vx, mvy - o.vy) < 0.02:
                     vx, vy = mvx, mvy
         b = self.vel_alpha
         tr.vx = (1 - b) * tr.vx + b * vx

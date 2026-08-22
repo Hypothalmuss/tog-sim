@@ -63,6 +63,7 @@ class MotionServer : public rclcpp::Node {
     kin_.elbow_right = declare_parameter("elbow_right", true);
     settleTol_ = declare_parameter("settle_tolerance", 0.002);
     trackSettleTol_ = declare_parameter("track_settle_tolerance", 0.004);  // Cartesian, m
+    trackYawTol_ = declare_parameter("track_yaw_tolerance", 0.02);  // rad: the cup must also have finished turning
     for (size_t i = 0; i < DOF; ++i) {
       vmax_[i] = vmax[i]; amax_[i] = amax[i]; jmax_[i] = jmax[i]; pmin_[i] = pmin[i]; pmax_[i] = pmax[i]; home_[i] = home[i];
     }
@@ -174,6 +175,12 @@ class MotionServer : public rclcpp::Node {
     if (p.header.frame_id != baseFrame_) {
       try {
         auto tf = tfBuffer_.lookupTransform(baseFrame_, p.header.frame_id, tf2::TimePointZero);
+        // a tracked frame that stopped being published (track lost) must not be followed at its last pose
+        const double age = (now() - rclcpp::Time(tf.header.stamp, get_clock()->get_clock_type())).seconds();
+        if (s.type == Segment::TRACK_CART && age > 0.5) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "tracked frame %s is stale (%.2f s)", p.header.frame_id.c_str(), age);
+          return std::nullopt;
+        }
         tf2::doTransform(p, pb, tf);
       } catch (const tf2::TransformException& e) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "TF %s->%s: %s", baseFrame_.c_str(), p.header.frame_id.c_str(), e.what());
@@ -231,6 +238,7 @@ class MotionServer : public rclcpp::Node {
     trackPrevValid_ = false;
     trackVel_.fill(0.0);
     trackErr_ = 1.0;
+    trackYawErr_ = M_PI;
     if (s.type == Segment::PTP_JOINT) {
       if (s.joint_target.size() != DOF) return fail(ExecuteMotion::Result::LIMITS, "joint_target needs 5 values");
       std::array<double, DOF> q{};
@@ -345,6 +353,7 @@ class MotionServer : public rclcpp::Node {
               setJointTarget(ik.q, trackVel_);
               const TcpPose cur = forward(input_.current_position, kin_);
               trackErr_ = std::sqrt(std::pow(cur.x - tcp->x, 2) + std::pow(cur.y - tcp->y, 2) + std::pow(cur.z - tcp->z, 2));
+              trackYawErr_ = std::fabs(wrapToPi(cur.yaw - tcp->yaw));
               RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 500, "track seg %zu: err %.1f mm, v_cart [%.3f %.3f %.3f]", segIdx_,
                                     trackErr_ * 1e3, trackVelCart_[0], trackVelCart_[1], trackVelCart_[2]);
             } else {
@@ -405,7 +414,9 @@ class MotionServer : public rclcpp::Node {
         const auto& segs = goal_->get_goal()->segments;
         const bool intermediate = segIdx_ + 1 < segs.size() && segs[segIdx_ + 1].type == Segment::TRACK_CART &&
                                   segs[segIdx_ + 1].tracked_frame == s.tracked_frame;
-        reached = trackPrevValid_ && trackErr_ < (intermediate ? 3.0 * trackSettleTol_ : trackSettleTol_);
+        // position and heading: releasing or sealing while J4 is still turning puts the product down rotated
+        const double k = intermediate ? 3.0 : 1.0;
+        reached = trackPrevValid_ && trackErr_ < k * trackSettleTol_ && trackYawErr_ < k * trackYawTol_;
       }
       if (dwellUntil_) reached = true;  // once dwelling, the dwell expiry alone ends the segment (tracking continues)
       if (reached) {
@@ -446,6 +457,7 @@ class MotionServer : public rclcpp::Node {
   rclcpp::Time trackPrevTime_;
   bool trackPrevValid_{false};
   double trackErr_{1.0};
+  double trackYawErr_{M_PI}, trackYawTol_{0.02};
   double override_{1.0}, segScale_{1.0};
 
   std::unique_ptr<ruckig::Ruckig<DOF>> otg_;

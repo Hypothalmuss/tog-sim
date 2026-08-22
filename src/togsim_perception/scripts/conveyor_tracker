@@ -44,20 +44,30 @@ class ConveyorTracker(Node):
         self.declare_parameter("source", "vision")
         self.declare_parameter("rate", 100.0)
         self.declare_parameter("gate_m", 0.06)
-        self.declare_parameter("lost_s", 1.0)
+        self.declare_parameter("lost_s", 2.5)  # a product is hidden under the arm for most of its pick
+        self.declare_parameter("tray_lost_s", 4.0)  # trays are occluded by the arm during a place: predict through it
+        self.declare_parameter("mature_alpha", 0.25)
         self.declare_parameter("tray_model", "tray_2x4")
         self.declare_parameter("world_frame", "world")
         self.source = self.get_parameter("source").value
         self.world = self.get_parameter("world_frame").value
         gate, lost = float(self.get_parameter("gate_m").value), float(self.get_parameter("lost_s").value)
         self.products = BeltTracker(gate_m=gate, lost_s=lost, yaw_period=math.pi)
-        self.trays = BeltTracker(gate_m=gate, lost_s=lost, yaw_period=math.pi)  # the pocket grid is 180 deg symmetric
+        tray_lost = float(self.get_parameter("tray_lost_s").value)
+        mature = float(self.get_parameter("mature_alpha").value)
+        # trays ride the belt along x at the encoder speed: never estimate their velocity from (biased) observations -
+        # a bogus lateral velocity drifts the predicted frame by 100+ mm while the arm hides the tray during a place
+        self.trays = BeltTracker(
+            gate_m=gate, lost_s=tray_lost, yaw_period=math.pi, mature_alpha=mature, estimate_velocity=False
+        )  # the pocket grid is 180 deg symmetric
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
         self.lock = threading.Lock()
         self.belt_v = {"infeed": 0.0, "outfeed": 0.0}
         for b in ("infeed", "outfeed"):
-            self.create_subscription(Float64, f"/togsim/conveyor/{b}/state", lambda m, b=b: self.belt_v.__setitem__(b, m.data), 10)
+            self.create_subscription(
+                Float64, f"/togsim/conveyor/{b}/state", lambda m, b=b: self.belt_v.__setitem__(b, m.data), 10
+            )
         if self.source == "gt":
             self.create_subscription(TFMessage, "/world/cell/pose/info", self.on_gt, 10)
         else:
@@ -78,8 +88,20 @@ class ConveyorTracker(Node):
         obs = []
         for c in msg.candidates:
             p = c.grasp_pose.pose.position
-            obs.append(Observation(p.x, p.y, p.z, math.radians(c.yaw_deg), c.class_name, self._t(c.observed),
-                                   vx=c.belt_velocity.x, vy=c.belt_velocity.y, payload=c, area=float(c.mask_area_px)))
+            obs.append(
+                Observation(
+                    p.x,
+                    p.y,
+                    p.z,
+                    math.radians(c.yaw_deg),
+                    c.class_name,
+                    self._t(c.observed),
+                    vx=c.belt_velocity.x,
+                    vy=c.belt_velocity.y,
+                    payload=c,
+                    area=float(c.mask_area_px),
+                )
+            )
         with self.lock:
             self.products.update(obs, t_now=self._t(msg.header.stamp))
 
@@ -87,10 +109,36 @@ class ConveyorTracker(Node):
         if not msg.tracked:
             return  # partial / unreliable observation: never create or drag a track with it
         p = msg.pose.pose.position
-        o = Observation(p.x, p.y, p.z, yaw_of(msg.pose.pose.orientation), "tray", self._t(msg.header.stamp),
-                        vx=msg.velocity.x, vy=msg.velocity.y, key=f"tray{msg.tray_id}", payload=msg, area=1.0 if msg.tracked else 0.1)
+        o = Observation(
+            p.x,
+            p.y,
+            p.z,
+            yaw_of(msg.pose.pose.orientation),
+            "tray",
+            self._t(msg.header.stamp),
+            vx=msg.velocity.x,
+            vy=msg.velocity.y,
+            key=f"tray{msg.tray_id}",
+            payload=msg,
+            area=1.0 if msg.tracked else 0.1,
+        )
         with self.lock:
-            self.trays.update([o])
+            before = {tr.id: (tr.x, tr.y) for tr in self.trays.predict(o.t)}
+            for tid, (x, y) in before.items():
+                if self.trays.tracks[tid].key == o.key and math.hypot(o.x - x, o.y - y) > 0.03:
+                    self.get_logger().warn(
+                        f"tray obs {o.key} jumps {1e3 * math.hypot(o.x - x, o.y - y):.0f} mm from track {tid}:"
+                        f" obs ({o.x:.3f},{o.y:.3f}) track ({x:.3f},{y:.3f}) t {o.t:.2f}"
+                    )
+            touched = self.trays.update([o])
+            for tr in touched:
+                if tr.n_obs == 1:
+                    self.get_logger().info(
+                        f"tray track {tr.id} created at ({tr.x:.3f},{tr.y:.3f}) key {tr.key} t {o.t:.2f}"
+                    )
+            for tid in before:
+                if tid not in self.trays.tracks:
+                    self.get_logger().info(f"tray track {tid} pruned at t {o.t:.2f}")
 
     def on_gt(self, msg):
         t = self.get_clock().now().nanoseconds * 1e-9  # pose/info carries no stamp
@@ -101,10 +149,15 @@ class ConveyorTracker(Node):
             if n.startswith("product_"):
                 cls = "product_" + n.split("_")[1]
                 vx = self.belt_v["infeed"] if p.y < 0 else self.belt_v["outfeed"]
-                prods.append(Observation(p.x, p.y, p.z + PRODUCT_H.get(cls, 0.0), yaw_of(q), cls, t, vx=vx, key=n,
-                                         payload=(tilt_of(q),)))
+                prods.append(
+                    Observation(
+                        p.x, p.y, p.z + PRODUCT_H.get(cls, 0.0), yaw_of(q), cls, t, vx=vx, key=n, payload=(tilt_of(q),)
+                    )
+                )
             elif n.startswith("tray_"):
-                trays.append(Observation(p.x, p.y, p.z, yaw_of(q), "tray", t, vx=self.belt_v["outfeed"], key=n, payload=None))
+                trays.append(
+                    Observation(p.x, p.y, p.z, yaw_of(q), "tray", t, vx=self.belt_v["outfeed"], key=n, payload=None)
+                )
         with self.lock:
             self.products.update(prods, t_now=t)
             self.trays.update(trays, t_now=t)
@@ -143,8 +196,13 @@ class ConveyorTracker(Node):
             c = PickCandidate()
             if isinstance(tr.payload, PickCandidate):
                 c = PickCandidate()
-                c.tilt_deg, c.suction_margin_mm, c.occluded, c.score, c.mask_area_px = (tr.payload.tilt_deg, tr.payload.suction_margin_mm,
-                                                                                   tr.payload.occluded, tr.payload.score, tr.payload.mask_area_px)
+                c.tilt_deg, c.suction_margin_mm, c.occluded, c.score, c.mask_area_px = (
+                    tr.payload.tilt_deg,
+                    tr.payload.suction_margin_mm,
+                    tr.payload.occluded,
+                    tr.payload.score,
+                    tr.payload.mask_area_px,
+                )
                 c.centre_offset = tr.payload.centre_offset
             elif isinstance(tr.payload, tuple):  # gt: (tilt,)
                 c.tilt_deg = float(math.degrees(tr.payload[0]))
@@ -155,7 +213,10 @@ class ConveyorTracker(Node):
             c.grasp_pose = PoseStamped()
             c.grasp_pose.header = arr.header
             c.grasp_pose.pose.position.x, c.grasp_pose.pose.position.y, c.grasp_pose.pose.position.z = tr.x, tr.y, tr.z
-            c.grasp_pose.pose.orientation.z, c.grasp_pose.pose.orientation.w = math.sin(tr.yaw / 2), math.cos(tr.yaw / 2)
+            c.grasp_pose.pose.orientation.z, c.grasp_pose.pose.orientation.w = (
+                math.sin(tr.yaw / 2),
+                math.cos(tr.yaw / 2),
+            )
             c.yaw_deg = float(math.degrees(tr.yaw))
             c.height_m = tr.z
             c.belt_velocity.x, c.belt_velocity.y = tr.vx, tr.vy

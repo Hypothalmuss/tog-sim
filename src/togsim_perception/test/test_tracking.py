@@ -89,3 +89,24 @@ def test_occluded_observation_does_not_drag_the_track():
     assert abs(t2.x - 0.05) < 0.004, t2.x  # predicted along the belt, not dragged towards the visible half
     (t3,) = tr.update([Observation(0.06, -0.35, 0.54, 0.0, "product_bar", 0.6, vx=0.1, area=1000.0)])
     assert abs(t3.x - 0.06) < 0.004  # a clean observation fuses again
+
+
+def test_keyed_outlier_rejected_then_snapped():
+    """A keyed observation far from a settled track's prediction must not drag it; three in a row restart the track."""
+    tr = BeltTracker(gate_m=0.06, lost_s=5.0)
+    t = 0.0
+    for _ in range(5):
+        tr.update([Observation(0.1 + 0.08 * t, 0.35, 0.0, 0.0, "tray", t, vx=0.08, key="tray1")])
+        t += 0.1
+    (track,) = tr.predict(t)
+    x_pred = track.x
+    # an observation 55 mm behind the prediction (partial mask): ignored twice
+    for _ in range(2):
+        tr.update([Observation(x_pred - 0.055, 0.35, 0.0, 0.0, "tray", t, vx=0.08, key="tray1")])
+        (track,) = tr.predict(t)
+        assert abs(track.x - (0.1 + 0.08 * t)) < 0.01
+        t += 0.1
+    # the third consecutive outlier snaps the track onto the observations: same id, state restarted
+    tr.update([Observation(x_pred - 0.055, 0.35, 0.0, 0.0, "tray", t, vx=0.08, key="tray1")])
+    (snapped,) = tr.predict(t)
+    assert snapped.id == track.id and snapped.n_obs == 1 and abs(snapped.x - (x_pred - 0.055)) < 1e-9

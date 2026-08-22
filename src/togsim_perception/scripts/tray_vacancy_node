@@ -138,7 +138,8 @@ class TrayVacancyNode(Node):
         for tr in self.tracks:
             dt = max(0.0, stamp_s - tr[3])
             px = tr[1] + self.belt_v * dt
-            if math.hypot(px - x, tr[2] - y) < 0.12:
+            # trays move along the belt only: a lateral mismatch is another tray (they can sit at different y)
+            if abs(px - x) < 0.08 and abs(tr[2] - y) < 0.025:
                 if assign:
                     tr[1], tr[2], tr[3] = x, y, stamp_s
                 return tr[0]
@@ -195,7 +196,8 @@ class TrayVacancyNode(Node):
             # half hidden by the arm, gave poses up to 180 mm off with the axis flipped by 90 deg
             gsd = z_floor / self.k[0, 0]
             expected_px = (self.total[0] * self.total[1]) / (gsd * gsd)
-            full = (not partial) and (m | product_mask).sum() >= 0.8 * expected_px
+            # 95 %: at 80 % visible the centroid of the visible part is already ~35 mm off the tray centre
+            full = (not partial) and (m | product_mask).sum() >= 0.95 * expected_px
             if not full:
                 continue
             cu, cv_, ang, long_px, short_px = principal_axis(m)
@@ -302,6 +304,11 @@ class TrayVacancyNode(Node):
             msg.confidence = conf
             msg.tracked = not partial
             self.pub.publish(msg)
+            self.get_logger().debug(
+                f"tray obs id {tid} ({p_w[0]:.3f},{p_w[1]:.3f}) yaw {math.degrees(yaw):+.0f} vis"
+                f" {(m | product_mask).sum() / expected_px:.2f} fit n={n_fit} rms={1e3 * rms_fit:.1f}"
+                f" corr=({1e3 * self.corr.get(tid, (0, 0, 0))[0]:+.0f},{1e3 * self.corr.get(tid, (0, 0, 0))[1]:+.0f}) t {stamp_s:.2f}"
+            )
             if dbg is not None:
                 cv2.circle(dbg, (int(cu), int(cv_)), 6, (255, 0, 255), 2)
                 cv2.putText(

@@ -87,6 +87,11 @@ class EvalTrayState(Node):
             self.unmatched += 1
             return
         d, name, g = best
+        if d > 0.03:
+            self.get_logger().warn(
+                f"tray {int(msg.tray_id)} jump {1e3 * d:.0f} mm: vision ({p.x:.3f},{p.y:.3f}) vs GT {name} ({g[0]:.3f},{g[1]:.3f})"
+                f" at {t_ns * 1e-9:.2f}"
+            )
         self.err_xy.append(d)
         self.err_yaw.append(abs(math.degrees((vyaw - g[3] + math.pi / 2) % math.pi - math.pi / 2)))
         self.err_z.append(abs(p.z - g[2]))

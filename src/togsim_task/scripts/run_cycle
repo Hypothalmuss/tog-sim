@@ -17,6 +17,7 @@ from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String
 from tf2_msgs.msg import TFMessage
 
@@ -58,12 +59,19 @@ def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0,
     return s
 
 
+def nearest_branch(yaw, ref, period=math.pi):
+    """Representative of `yaw` modulo `period` closest to `ref`: products and pockets are symmetric under 180 deg, so
+    the cup only ever needs to turn by at most 90 deg."""
+    return yaw + round((ref - yaw) / period) * period
+
+
 class Candidate:
-    __slots__ = ("key", "cls", "x", "y", "top", "yaw", "tilt", "occluded", "vx", "tid", "off")
+    __slots__ = ("key", "cls", "x", "y", "top", "yaw", "tilt", "occluded", "vx", "tid", "off", "bp")
 
     def __init__(self, key, cls, x, y, top, yaw, tilt=0.0, occluded=False, vx=0.0, tid=None, off=(0.0, 0.0)):
         self.key, self.cls, self.x, self.y, self.top, self.yaw = key, cls, x, y, top, yaw
         self.tilt, self.occluded, self.vx, self.tid, self.off = tilt, occluded, vx, tid, off
+        self.bp = 0.0  # cup heading minus product yaw at pick (a multiple of pi: products are symmetric)
 
 
 class Tray:
@@ -137,6 +145,9 @@ class RunCycle(Node):
             VacuumState, "/togsim/vacuum/state_msg", self.on_vacuum_state, 10, callback_group=self.cb
         )
         self.vac_sealed, self.vac_attached, self.vac_t = False, "", 0.0
+        self.joints = {}
+        self.cur_goal = ""
+        self.create_subscription(JointState, "/joint_states", self.on_joint_state, 10)
         self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
         self.infeed = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
         self.outfeed = self.create_publisher(Float64, "/togsim/conveyor/outfeed/cmd_vel", 10)
@@ -149,6 +160,12 @@ class RunCycle(Node):
                 n = t.child_frame_id
                 if n.startswith(("product_", "tray_")):
                     tr, q = t.transform.translation, t.transform.rotation
+                    prev = self.gt.get(n)
+                    if n.startswith("tray_") and prev is not None and abs(tr.y - prev[0][1]) > 0.01:
+                        self.get_logger().warn(
+                            f"{n} shoved: y {prev[0][1]:.3f} -> {tr.y:.3f} at x {tr.x:.3f}, sim {self.sim_now():.2f},"
+                            f" during '{self.cur_goal}'"
+                        )
                     self.gt[n] = ((tr.x, tr.y, tr.z), yaw_of(q), tilt_of(q), now)
             for n in [k for k, v in self.gt.items() if now - v[3] > 2.0]:
                 self.gt.pop(n, None)
@@ -281,6 +298,7 @@ class RunCycle(Node):
     def send_goal(self, segments, label, on_feedback=None):
         """Asynchronous goal: returns the goal handle (None if rejected). A goal sent while another runs preempts it
         seamlessly in motion_server, so chaining goals early is how the arm never comes to a full stop."""
+        self.cur_goal = label
         goal = ExecuteMotion.Goal()
         goal.segments = segments
         fut = self.motion.send_goal_async(goal, feedback_callback=on_feedback)
@@ -305,6 +323,20 @@ class RunCycle(Node):
         if not res.success and res.error_code != ExecuteMotion.Result.PREEMPTED:
             self.get_logger().warn(f"{label}: {res.message} (code {res.error_code})")
         return res.success or res.error_code == ExecuteMotion.Result.PREEMPTED, res.message
+
+    def sim_now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def on_joint_state(self, msg):
+        with self.lock:
+            self.joints = dict(zip(msg.name, msg.position))
+
+    def cup_yaw(self):
+        """TCP heading from the measured joints (J1 + J2 + J4); None until joint states arrive."""
+        with self.lock:
+            js = self.joints
+        vals = [js[n] for n in js if n.endswith(("j1_joint", "j2_joint", "j4_joint"))]
+        return sum(vals) if len(vals) == 3 else None
 
     def on_vacuum_state(self, msg):
         with self.lock:
@@ -403,10 +435,13 @@ class RunCycle(Node):
 
             # fly through the predicted hover point at speed (a plain PTP/VIA is faster than converging a tracked target
             # from far away), then track: hover -> contact
+            cur = self.cup_yaw()
+            yaw_pick = c.yaw if cur is None else nearest_branch(c.yaw, cur)
+            c.bp = yaw_pick - c.yaw
             pick = [
-                seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, c.yaw, via_speed=0.4),
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, 0.0, tracked=frame),
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, 0.0, dwell=seal_budget, tracked=frame),
+                seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, yaw_pick, via_speed=0.4),
+                seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, c.bp, tracked=frame),
+                seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, c.bp, dwell=seal_budget, tracked=frame),
             ]
             gh = self.send_goal(pick, f"pick {c.key}", on_feedback=on_fb_pick)
             if gh is None:
@@ -446,8 +481,18 @@ class RunCycle(Node):
             tp = self.track_pose(c.tid)
             if g is not None and tp is not None:
                 ax, ay = g[0][0] - tp.x, g[0][1] - tp.y
+                dyaw = math.degrees(
+                    (c.yaw - g[1] + math.pi / 2) % math.pi - math.pi / 2
+                )  # mod 180: axis ambiguity is fine
+                psi = self.cup_yaw()
+                cupd = (
+                    ""
+                    if psi is None
+                    else f", cup-cmd {math.degrees((psi - c.yaw + math.pi) % (2 * math.pi) - math.pi):+.0f} deg"
+                )
                 self.get_logger().info(
-                    f"grasp offset {att}: actual ({1e3 * ax:+.0f},{1e3 * ay:+.0f}) mm, estimated ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm"
+                    f"grasp offset {att}: actual ({1e3 * ax:+.0f},{1e3 * ay:+.0f}) mm, estimated ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm,"
+                    f" pick yaw error {dyaw:+.0f} deg{cupd}"
                 )
             # place: the tray is chosen now (the one selected before the pick has moved on)
             fresh = []
@@ -466,23 +511,49 @@ class RunCycle(Node):
             ox, oy = self.tray.pocket_offset(pocket)
             # the cup holds the product off-centre by `off` (world, at pick); after J4 turns the product to the tray's
             # yaw that offset, expressed in the product frame, is constant -> aim the cup at pocket - offset
+            cur = self.cup_yaw()
+            yaw_place = tray.yaw if cur is None else nearest_branch(tray.yaw, cur)
+            bq = yaw_place - tray.yaw
+            sgn = round(math.cos(bq - c.bp))  # +-1: the product frame relative to the tray frame once placed
             cp, sp = math.cos(-c.yaw), math.sin(-c.yaw)
             offx, offy = cp * c.off[0] - sp * c.off[1], sp * c.off[0] + cp * c.off[1]
             if math.hypot(offx, offy) < 0.03:  # sanity: a bigger "offset" is a bad mask, not a real grasp offset
-                ox, oy = ox - offx, oy - offy
+                ox, oy = ox - sgn * offx, oy - sgn * offy
             z_place = self.tray.base_thickness + h + 0.004
+            # the product hangs below the cup: approach above the pocket walls (flying to a far pocket crosses the
+            # others), then descend vertically in the tray frame. Clipping a wall at belt speed throws the tray.
+            z_clear = self.tray.base_thickness + self.tray.pocket_depth + 0.02 + h
             rel = {"t": None}
 
             def on_fb_place(fb, n=3):
                 if abs(fb.feedback.progress - 2.5 / n) < 1e-3 and rel["t"] is None:  # pocket contact reached: release
                     self.vacuum_cmd(False)
                     rel["t"] = time.monotonic()
+                    psi = self.cup_yaw()
+                    with self.lock:
+                        g = self.gt.get(held)
+                    if (
+                        psi is not None and g is not None
+                    ):  # diagnostic: who is rotated at release, the cup or the product?
+                        wrap = lambda a: math.degrees((a + math.pi) % (2 * math.pi) - math.pi)  # noqa: E731
+                        wrap180 = lambda a: math.degrees((a + math.pi / 2) % math.pi - math.pi / 2)  # noqa: E731
+                        loc = self.in_tray_frame(g[0])
+                        where = (
+                            ""
+                            if loc is None
+                            else f", product at ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm in GT {loc[0]}"
+                        )
+                        self.get_logger().info(
+                            f"release yaw {held} -> {tray.key}[{pocket}]: cup-tray {wrap(psi - tray.yaw):+.0f} deg,"
+                            f" product-tray {wrap180(g[1] - tray.yaw):+.0f} deg, product-cup {wrap180(g[1] - psi):+.0f} deg"
+                            f"{where}; target pocket ({1e3 * ox:+.0f},{1e3 * oy:+.0f}) mm in {tray.key}"
+                        )
 
             px_w, py_w, zf = self.tray.pocket_world((tray.x + tray.vx * place_lead, tray.y, tray.z), tray.yaw, pocket)
             place = [
-                seg(MotionSegment.VIA_CART, px_w, py_w, zf + h + 0.004 + hover, tray.yaw, via_speed=0.1),
-                seg(MotionSegment.TRACK_CART, ox, oy, z_place + hover, 0.0, tracked=tframe),
-                seg(MotionSegment.TRACK_CART, ox, oy, z_place, 0.0, dwell=0.12, tracked=tframe),
+                seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.1),
+                seg(MotionSegment.TRACK_CART, ox, oy, z_clear, bq, tracked=tframe),
+                seg(MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=0.12, tracked=tframe),
             ]
             t_place0 = time.monotonic()
             ghp = self.send_goal(place, f"place {c.key} -> {tray.key}[{pocket}]", on_feedback=on_fb_place)
@@ -515,12 +586,38 @@ class RunCycle(Node):
             self.get_logger().info("timeline means " + " ".join(f"{k} {v:.2f}" for k, v in means.items()))
 
     # ---------------- placement accuracy (ground truth, metric only) ----------------
+    def in_tray_frame(self, pp, gt=None):
+        """(tray name, x, y) of world point pp in the frame of the nearest GT tray, or None."""
+        if gt is None:
+            with self.lock:
+                gt = dict(self.gt)
+        best = None
+        for tn, (tp, tyaw, _, _) in gt.items():
+            if not tn.startswith("tray_"):
+                continue
+            dx, dy = pp[0] - tp[0], pp[1] - tp[1]
+            d = math.hypot(dx, dy)
+            if best is None or d < best[0]:
+                c, s_ = math.cos(-tyaw), math.sin(-tyaw)
+                best = (d, tn, c * dx - s_ * dy, s_ * dx + c * dy)
+        return None if best is None else best[1:]
+
     def measure_placement(self, key, tray, pocket, held=""):
         """Offset of the product the gripper just released (`held`, GT name) from the nearest pocket centre of the tray
         it sits on, 0.4 s after release. Index-free: the vision tray yaw may be 180 deg from the GT convention."""
+        # pose at release (before the sleep) vs 0.4 s later: separates a bad placement from release dynamics
+        with self.lock:
+            g0 = self.gt.get(held)
         time.sleep(0.4)
         with self.lock:
             gt = dict(self.gt)
+            g1 = gt.get(held)
+        if g0 is not None and g1 is not None:
+            dmove = math.hypot(g1[0][0] - g0[0][0], g1[0][1] - g0[0][1])
+            dyaw = math.degrees((g1[1] - g0[1] + math.pi) % (2 * math.pi) - math.pi)
+            self.get_logger().info(
+                f"release dynamics {held}: moved {1e3 * dmove:.0f} mm, turned {dyaw:+.0f} deg in 0.4 s"
+            )
         trays = {n: v for n, v in gt.items() if n.startswith("tray_")}
         best = None
         for tn, (tp, tyaw, _, _) in trays.items():
@@ -537,8 +634,10 @@ class RunCycle(Node):
         if best is None:
             return
         if best[0] >= 0.05:
+            loc = self.in_tray_frame(gt[best[1]][0], gt)
+            where = "" if loc is None else f"; product at ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm in GT {loc[0]}"
             self.get_logger().warn(
-                f"placed {key} -> {tray.key}[{pocket}]: nearest product {1e3 * best[0]:.0f} mm from any pocket centre (not counted)"
+                f"placed {key} -> {tray.key}[{pocket}]: nearest product {1e3 * best[0]:.0f} mm from any pocket centre (not counted){where}"
             )
             return
         self.placements.append((best[0], abs(best[2])))

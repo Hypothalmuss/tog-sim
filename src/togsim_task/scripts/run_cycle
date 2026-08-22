@@ -17,11 +17,11 @@ from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, String
 from tf2_msgs.msg import TFMessage
 
 from togsim_msgs.action import ExecuteMotion
-from togsim_msgs.msg import MotionSegment, PickCandidateArray, TrayState
+from togsim_msgs.msg import MotionSegment, PickCandidateArray, TrayState, VacuumState
 from togsim_msgs.srv import SetVacuum
 from togsim_task.trays import TraySpec
 
@@ -132,6 +132,11 @@ class RunCycle(Node):
                 Float64, f"/togsim/conveyor/{b}/state", lambda m, b=b: self.belt_state.__setitem__(b, m.data), 10
             )
         self.motion = ActionClient(self, ExecuteMotion, "/togsim/execute_motion", callback_group=self.cb)
+        self.vac_cmd = self.create_publisher(String, "/togsim/vacuum/cmd", 10)
+        self.create_subscription(
+            VacuumState, "/togsim/vacuum/state_msg", self.on_vacuum_state, 10, callback_group=self.cb
+        )
+        self.vac_sealed, self.vac_attached, self.vac_t = False, "", 0.0
         self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
         self.infeed = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
         self.outfeed = self.create_publisher(Float64, "/togsim/conveyor/outfeed/cmd_vel", 10)
@@ -271,10 +276,51 @@ class RunCycle(Node):
                 return i
         return None
 
-    # ---------------- continuous (M4) ----------------
+    # ---------------- continuous (M4), event driven ----------------
+    def send_goal(self, segments, label, on_feedback=None):
+        """Asynchronous goal: returns the goal handle (None if rejected). A goal sent while another runs preempts it
+        seamlessly in motion_server, so chaining goals early is how the arm never comes to a full stop."""
+        goal = ExecuteMotion.Goal()
+        goal.segments = segments
+        fut = self.motion.send_goal_async(goal, feedback_callback=on_feedback)
+        t0 = time.monotonic()
+        while not fut.done():
+            time.sleep(0.002)
+            if time.monotonic() - t0 > 5.0:
+                self.get_logger().error(f"{label}: goal not accepted")
+                return None
+        gh = fut.result()
+        return gh if gh.accepted else None
+
+    def wait_result(self, gh, label, timeout=30.0):
+        rf = gh.get_result_async()
+        t0 = time.monotonic()
+        while not rf.done():
+            time.sleep(0.002)
+            if time.monotonic() - t0 > timeout:
+                gh.cancel_goal_async()
+                return False, "timeout"
+        res = rf.result().result
+        if not res.success and res.error_code != ExecuteMotion.Result.PREEMPTED:
+            self.get_logger().warn(f"{label}: {res.message} (code {res.error_code})")
+        return res.success or res.error_code == ExecuteMotion.Result.PREEMPTED, res.message
+
+    def on_vacuum_state(self, msg):
+        with self.lock:
+            changed = bool(msg.sealed) != self.vac_sealed
+            self.vac_sealed, self.vac_attached, self.vac_t = bool(msg.sealed), msg.attached_model, time.monotonic()
+        if changed:
+            self.get_logger().info(f"vacuum state sealed={msg.sealed} model={msg.attached_model}")
+
+    def vacuum_cmd(self, on):
+        self.vac_cmd.publish(String(data="on" if on else "off"))
+        self.get_logger().info(f"vacuum cmd {'on' if on else 'off'}")
+
     def run_continuous(self):
-        """Belts never stop: pick the most downstream product that will still be in the window when the cup arrives,
-        seal while tracking it, place into the next free pocket of a moving tray while tracking the tray."""
+        """Belts never stop. Pick: TRACK hover -> TRACK contact (dwell = seal budget); the vacuum is switched on when the
+        hover is reached and the place goal is sent the instant the gripper reports a seal (it preempts the dwell).
+        Place: lift -> TRACK pocket hover -> TRACK pocket contact; the release is commanded when the contact is reached
+        and the next pick goal follows right after the short settle dwell. No service round-trips in the cycle."""
         belt_speed = float(self.get_parameter("belt_speed").value)
         hover = float(self.get_parameter("hover").value)
         xmin, xmax = self.get_parameter("pick_x_min").value, self.get_parameter("pick_x_max").value
@@ -282,7 +328,7 @@ class RunCycle(Node):
             float(self.get_parameter("pick_lead_s").value),
             float(self.get_parameter("place_lead_s").value),
         )
-        dwell = float(self.get_parameter("track_dwell_s").value)
+        seal_budget = max(0.3, float(self.get_parameter("track_dwell_s").value) * 2.0)
         contact = float(self.get_parameter("contact_offset_m").value)
         fits = PRODUCT_FITS[self.tray.name]
         park = [float(v) for v in self.get_parameter("park").value]
@@ -305,14 +351,14 @@ class RunCycle(Node):
             cands = []
             for c in self.candidates(fits):
                 x_arrive = c.x + c.vx * lead
-                x_done = x_arrive + c.vx * 1.3  # still reachable once the cup has settled and sealed (fly+settle+dwell)
+                x_done = x_arrive + c.vx * 1.3  # still reachable once the cup has settled and sealed
                 if (
                     c.tid is not None
                     and xmin < x_arrive < xmax
                     and -0.6 < c.y < -0.1
                     and reachable(x_done, c.y)
-                    and math.hypot(x_arrive, c.y) > 0.28  # not folded against the base ...
-                    and math.hypot(c.x, c.y) > 0.30  # ... neither now (the TRACK segment starts from the current pose)
+                    and math.hypot(x_arrive, c.y) > 0.28
+                    and math.hypot(c.x, c.y) > 0.30
                     and not c.occluded
                     and c.tilt < math.radians(4)
                     and blacklist.get(c.key, 0) < now
@@ -321,24 +367,12 @@ class RunCycle(Node):
             if not trays or not cands:
                 if now - last_report > 5.0:
                     last_report = now
-                    raw_c, raw_t = self.candidates(fits), self.trays()
-                    with self.lock:
-                        age_c = None if self.vis_cands is None else round(now - self.vis_cands[1], 2)
-                        n_tr = len(self.vis_trays)
-                    self.get_logger().info(
-                        f"waiting: {len(cands)} pickable of {len(raw_c)} tracks (msg age {age_c}), {len(trays)} trays ready of "
-                        f"{len(raw_t)} ({n_tr} in cache)"
-                        + "".join(f" | {c.key} x{c.x + c.vx * lead:.2f} tid{c.tid}" for c in raw_c[:3])
-                        + "".join(
-                            f" | {t.key} x{t.x:.2f} z{t.z:.3f} tid{t.tid} occ{sum(t.occupied)}" for t in raw_t[:2]
-                        )
-                    )
-                if not parked and not self.product_due(fits, 3.0):  # stay near the belt when the next product is close
+                    self.get_logger().info(f"waiting: {len(cands)} pickable, {len(trays)} trays ready")
+                if not parked and not self.product_due(fits, 3.0):
                     parked = self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
-                time.sleep(0.05)
+                time.sleep(0.03)
                 continue
             c, x_arrive = max(cands, key=lambda ca: ca[1])
-            tray, pocket = trays[0]
             h = PRODUCT_HEIGHT[c.cls]
             if t_start is None:
                 t_start = time.monotonic()
@@ -347,40 +381,55 @@ class RunCycle(Node):
             attempts += 1
             parked = False
             frame = f"prod_{c.tid}"
-            seal = {}
+            n_pick = 3
+            ev = {"contact": None, "vac_on": None}
+
+            def on_fb_pick(fb, n=n_pick):
+                p = fb.feedback.progress
+                self.get_logger().info(f"fb pick seg {fb.feedback.segment_index} progress {p:.3f} t+{time.monotonic() - tc:.2f}")
+                if abs(p - 1.0 / n) < 1e-3 and ev["vac_on"] is None:  # lift done: nothing to do yet
+                    pass
+                if abs(p - 2.0 / n) < 1e-3 and ev["vac_on"] is None:  # hover reached: descending onto the product
+                    self.vacuum_cmd(True)
+                    ev["vac_on"] = time.monotonic()
+                if abs(p - 2.5 / n) < 1e-3 and ev["contact"] is None:  # contact reached, dwelling
+                    ev["contact"] = time.monotonic()
+
             pick = [
+                seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp"),  # clear the tray/product first
                 seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, 0.0, tracked=frame),
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, 0.0, dwell=dwell, tracked=frame),
+                seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, 0.0, dwell=seal_budget, tracked=frame),
             ]
-            if not bool(self.get_parameter("pick_direct").value):
-                pick.insert(0, seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, c.yaw, via_speed=0.5))
-            hover_idx = len(pick) - 2  # feedback index of the hover segment: start the vacuum once it is reached
-
-            def on_fb(fb, hover_idx=hover_idx):
-                if fb.feedback.segment_index == hover_idx and "t" not in seal:  # descending onto the moving product
-                    seal["t"] = threading.Thread(
-                        target=lambda: seal.__setitem__("r", self.vacuum(True, 0.6)), daemon=True
-                    )
-                    seal["t"].start()
-
-            ok = self.run_motion(pick, f"pick {c.key}", on_feedback=on_fb)
-            tl["approach"] = time.monotonic() - tc
-            t_seal0 = time.monotonic()
-            if "t" in seal:
-                seal["t"].join(timeout=4.0)  # the bridge waits in sim time: at RTF 0.5 a 0.6 s window is 1.2 s wall
-            tl["seal_wait"] = time.monotonic() - t_seal0
-            sealed = ok and seal.get("r") is not None and seal["r"].sealed
+            gh = self.send_goal(pick, f"pick {c.key}", on_feedback=on_fb_pick)
+            if gh is None:
+                blacklist[c.key] = time.monotonic() + 15.0
+                continue
+            rf = gh.get_result_async()
+            sealed = False
+            t_deadline = time.monotonic() + 12.0
+            while time.monotonic() < t_deadline:
+                with self.lock:
+                    if ev["vac_on"] and self.vac_sealed and self.vac_t > ev["vac_on"]:
+                        sealed = True
+                if sealed or rf.done():
+                    break
+                time.sleep(0.002)
+            t_sealed = time.monotonic()
             if not sealed:
+                ok, msg = (rf.result().result.success, rf.result().result.message) if rf.done() else (False, "no seal")
                 self.get_logger().warn(
-                    (f"no seal on {c.key}" if ok else f"pick {c.key} failed")
-                    + f" ({time.monotonic() - tc:.2f} s after start, selected at x_arrive {x_arrive:.3f}, y {c.y:.3f})"
+                    f"pick {c.key} failed: {msg} ({t_sealed - tc:.2f} s after start, x_arrive {x_arrive:.3f}, y {c.y:.3f})"
                 )
                 blacklist[c.key] = time.monotonic() + 15.0
-                self.vacuum(False, 0.0)
-                if time.monotonic() - tc > 0.3:  # the arm left the park pose: back off from the product
-                    self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "retreat")
+                self.vacuum_cmd(False)
+                if not rf.done():
+                    gh.cancel_goal_async()
+                time.sleep(0.05)
+                self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "retreat")
                 continue
-            # choose the tray now: the one selected before the pick has moved on
+            tl["approach"] = (ev["contact"] or t_sealed) - tc
+            tl["seal_wait"] = t_sealed - (ev["contact"] or t_sealed)
+            # place: the tray is chosen now (the one selected before the pick has moved on)
             fresh = []
             for t in self.trays():
                 if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
@@ -388,31 +437,33 @@ class RunCycle(Node):
                 pk = self.free_pocket_moving(t, place_lead)
                 if pk is not None:
                     fresh.append((t, pk))
-            if fresh:
-                tray, pocket = fresh[0]
+            tray, pocket = fresh[0] if fresh else trays[0]
             tframe = f"tray_{tray.tid}"
             ox, oy = self.tray.pocket_offset(pocket)
-            z_place = self.tray.base_thickness + h + 0.004  # relative to the tray origin (tray bottom)
+            z_place = self.tray.base_thickness + h + 0.004
+            rel = {"t": None}
+
+            def on_fb_place(fb, n=3):
+                if abs(fb.feedback.progress - 2.5 / n) < 1e-3 and rel["t"] is None:  # pocket contact reached: release
+                    self.vacuum_cmd(False)
+                    rel["t"] = time.monotonic()
+
             place = [
-                seg(
-                    MotionSegment.VIA_CART, 0.0, 0.0, hover, 0.0, via_speed=0.5, frame="tcp"
-                ),  # straight up from the cup
+                seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp"),
                 seg(MotionSegment.TRACK_CART, ox, oy, z_place + hover, 0.0, tracked=tframe),
-                seg(MotionSegment.TRACK_CART, ox, oy, z_place, 0.0, dwell=0.2, tracked=tframe),
+                seg(MotionSegment.TRACK_CART, ox, oy, z_place, 0.0, dwell=0.12, tracked=tframe),
             ]
             t_place0 = time.monotonic()
-            ok = self.run_motion(place, f"place {c.key} -> {tray.key}[{pocket}]")
-            tl["transfer"] = time.monotonic() - t_place0
-            t_rel0 = time.monotonic()
-            self.vacuum(False, 0.05)
-            tl["release"] = time.monotonic() - t_rel0
+            ghp = self.send_goal(place, f"place {c.key} -> {tray.key}[{pocket}]", on_feedback=on_fb_place)
+            ok = False
+            if ghp is not None:
+                ok, _ = self.wait_result(ghp, f"place {c.key} -> {tray.key}[{pocket}]")
+            if rel["t"] is None:  # the contact feedback never came (failed place): make sure the cup lets go
+                self.vacuum_cmd(False)
+            tl["transfer"] = (rel["t"] or time.monotonic()) - t_place0
+            tl["release"] = time.monotonic() - (rel["t"] or time.monotonic())
             self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
-            threading.Thread(
-                target=self.measure_placement, args=(c.key, tray, pocket), daemon=True
-            ).start()  # off the cycle
-            t_lift0 = time.monotonic()
-            self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "lift")
-            tl["lift"] = time.monotonic() - t_lift0
+            threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket), daemon=True).start()
             self.t_cycle_end = time.monotonic()
             self.timelines.append(tl)
             self.get_logger().info("timeline " + " ".join(f"{k} {v:.2f}" for k, v in tl.items()))
@@ -428,7 +479,7 @@ class RunCycle(Node):
         time.sleep(0.6)  # let the last placement measurement finish
         self.report_placement()
         if self.timelines:
-            keys = ["idle", "approach", "seal_wait", "transfer", "release", "lift"]
+            keys = ["idle", "approach", "seal_wait", "transfer", "release"]
             means = {k: sum(t.get(k, 0.0) for t in self.timelines) / len(self.timelines) for k in keys}
             self.get_logger().info("timeline means " + " ".join(f"{k} {v:.2f}" for k, v in means.items()))
 

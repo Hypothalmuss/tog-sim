@@ -162,6 +162,10 @@ class MotionServer : public rclcpp::Node {
       TcpPose cur = forward(input_.current_position, kin_);
       TcpPose t;
       t.x = cur.x + p.pose.position.x; t.y = cur.y + p.pose.position.y; t.z = cur.z + p.pose.position.z;
+      // a relative lift/descent cannot leave the vertical stroke: clamp to the TCP heights J3 can reach (at tilt 0)
+      const double zTcpMin = pmin_[2] + kin_.z_flange0 - kin_.tilt_pivot_drop - kin_.tool_length;
+      const double zTcpMax = pmax_[2] + kin_.z_flange0 - kin_.tilt_pivot_drop - kin_.tool_length;
+      t.z = std::clamp(t.z, zTcpMin, zTcpMax);
       t.yaw = cur.yaw + tf2::getYaw(p.pose.orientation);
       t.tilt = s.tilt_deg * M_PI / 180.0;
       return t;
@@ -393,8 +397,16 @@ class MotionServer : public rclcpp::Node {
       bool reached = (res == ruckig::Result::Finished);
       if (!reached && s.type == Segment::TRACK_CART)  // a tracked target is never "finished": settle within tolerance
         reached = trackPrevValid_ && trackErr_ < trackSettleTol_;
+      if (dwellUntil_) reached = true;  // once dwelling, the dwell expiry alone ends the segment (tracking continues)
       if (reached) {
-        if (s.dwell_s > 0.0f && !dwellUntil_) dwellUntil_ = now() + rclcpp::Duration::from_seconds(s.dwell_s);
+        if (s.dwell_s > 0.0f && !dwellUntil_) {
+          dwellUntil_ = now() + rclcpp::Duration::from_seconds(s.dwell_s);
+          // "reached, dwelling": clients use this to fire the vacuum / release exactly at contact (progress = idx + 0.5)
+          auto fb = std::make_shared<ExecuteMotion::Feedback>();
+          fb->segment_index = static_cast<uint8_t>(segIdx_);
+          fb->progress = (static_cast<float>(segIdx_) + 0.5f) / goal_->get_goal()->segments.size();
+          goal_->publish_feedback(fb);
+        }
         if (!dwellUntil_ || now() >= *dwellUntil_) {
           auto fb = std::make_shared<ExecuteMotion::Feedback>();
           fb->segment_index = static_cast<uint8_t>(segIdx_);

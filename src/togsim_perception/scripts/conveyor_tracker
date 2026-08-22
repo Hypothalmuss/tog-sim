@@ -64,8 +64,11 @@ class ConveyorTracker(Node):
         mature = float(self.get_parameter("mature_alpha").value)
         # trays ride the belt along x; their speed comes from the shared belt-speed estimate (never a per-track lateral
         # velocity: one drifted a hidden tray's frame by 100+ mm during a place)
+        # trays ride straight at the shared belt speed: once a track is settled it is dead-reckoned on the belt model
+        # and single observations barely move it (an arm-shadowed mask accepted just before the under-arm gate
+        # shifted frames by 5-10 mm); products keep the normal weight (they are tracked for a second or two)
         self.trays = BeltTracker(
-            gate_m=gate, lost_s=tray_lost, yaw_period=math.pi, mature_alpha=mature
+            gate_m=gate, lost_s=tray_lost, yaw_period=math.pi, mature_alpha=0.05, lateral_alpha_mature=0.05
         )  # the pocket grid is 180 deg symmetric
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
@@ -136,9 +139,9 @@ class ConveyorTracker(Node):
         tool = self.tool_xy()
         # the arm hides/biases a tray while the tool is above the tray or the forearm reaches over it (the forearm
         # occludes the tray well before the tool does; a biased observation then shifts the frame by ~15 mm right
-        # before the observations stop). 0.40 x 0.20 m around the tool: the next tray, 0.5 m behind, keeps its
-        # observations.
-        if tool is not None and abs(p.x - tool[0]) < 0.40 and abs(p.y - tool[1]) < 0.20:
+        # before the observations stop). 0.30 x 0.20 m around the tool: the next tray, 0.5 m behind, keeps its early
+        # observations even while the trailing pocket of the previous one is being filled (0.40 starved it).
+        if tool is not None and abs(p.x - tool[0]) < 0.30 and abs(p.y - tool[1]) < 0.20:
             self.get_logger().info(
                 f"tray obs tray{msg.tray_id} gated: tool ({p.x - tool[0]:+.2f},{p.y - tool[1]:+.2f}) m away",
                 throttle_duration_sec=1.0,
@@ -277,7 +280,7 @@ class ConveyorTracker(Node):
             self._pub_counts = {}
         for tr in trays:
             tfs.append(self._tf(now, f"tray_{tr.id}", tr.x, tr.y, tr.z, tr.yaw))
-            if tr.n_obs < 6 and self.source != "gt":
+            if tr.n_obs < 8 and self.source != "gt":
                 continue  # not placeable yet: still converging from the biased first observation at the view entry
             m = TrayState()
             if isinstance(tr.payload, TrayState):

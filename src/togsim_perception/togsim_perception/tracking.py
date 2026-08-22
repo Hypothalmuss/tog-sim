@@ -66,6 +66,7 @@ class BeltTracker:
         mature_alpha: float | None = None,
         key_gate_factor: float = 0.5,
         yaw_gate: float = math.radians(15.0),
+        lateral_alpha_mature: float | None = None,
         yaw_period: float = math.pi,
         estimate_velocity: bool = True,
         min_obs_velocity: int = 3,
@@ -83,6 +84,9 @@ class BeltTracker:
         # a settled track ignores heading observations that disagree by more than this (a merged or partially hidden
         # mask has the wrong axis); the cup seals on whatever heading the frame has at contact
         self.yaw_gate = yaw_gate
+        # objects on a belt do not move sideways or turn: once a track is settled its y and heading fuse with this
+        # small weight (None = same as the position weight), so an arm-shadowed mask cannot shift the frame laterally
+        self.lateral_alpha_mature = lateral_alpha_mature
         # objects slip on the belt: the measured speed of all settled tracks (robust, shared) refines the encoder prior.
         # A per-track estimate from a few biased observations is worse than the prior; a shared one is better than both.
         self.belt_vx: float | None = None
@@ -200,13 +204,14 @@ class BeltTracker:
         # observations less
         a = self.pos_alpha if tr.n_obs < 10 else self.mature_alpha
         tr.outliers = 0
+        al = a if (self.lateral_alpha_mature is None or tr.n_obs < 10) else self.lateral_alpha_mature
         tr.x = (1 - a) * px + a * o.x
-        tr.y = (1 - a) * py + a * o.y
+        tr.y = (1 - al) * py + al * o.y
         tr.z = (1 - a) * tr.z + a * o.z
         dyaw = _wrap(o.yaw - tr.yaw, tr.yaw_period)
         if tr.n_obs >= 5 and abs(dyaw) > self.yaw_gate:
             dyaw = 0.0
-        tr.yaw = tr.yaw + a * dyaw
+        tr.yaw = tr.yaw + al * dyaw
         tr.t = o.t
         tr.n_obs += 1
         tr.payload = o.payload

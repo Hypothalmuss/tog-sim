@@ -152,6 +152,8 @@ class RunCycle(Node):
         self.in_pocket = False
         self.gt_hist = {}  # tray name -> [(sim t, x, y)] recent GT samples (diagnostics)
         self.last_on_tray = time.monotonic()
+        self.approach_est = 1.4  # s, pick start -> contact, refined online
+        self.gt_tool = {}  # GT poses of tool-like links, if present in pose/info (calibration diagnostics)
         self.idle_why = dict.fromkeys(("seen", "occluded", "window", "reach", "blacklist", "no_tray", "polls"), 0)
         self.create_subscription(JointState, "/joint_states", self.on_joint_state, 10)
         self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
@@ -161,9 +163,18 @@ class RunCycle(Node):
     # ---------------- perception inputs ----------------
     def on_gt(self, msg):
         now = time.monotonic()
+        if not getattr(self, "_gt_names_logged", False) and len(msg.transforms) > 20:
+            self._gt_names_logged = True
+            names = sorted(
+                {t.child_frame_id for t in msg.transforms if not t.child_frame_id.startswith(("product_", "tray_"))}
+            )
+            self.get_logger().info(f"GT frames ({len(msg.transforms)}): {names[:60]}")
         with self.lock:
             for t in msg.transforms:
                 n = t.child_frame_id
+                if "tcp" in n or "vgc10_suction" in n:  # the tool itself, if Gazebo reports links
+                    tr = t.transform.translation
+                    self.gt_tool[n] = (tr.x, tr.y, tr.z, now)
                 if n.startswith(("product_", "tray_")):
                     tr, q = t.transform.translation, t.transform.rotation
                     prev = self.gt.get(n)
@@ -406,7 +417,10 @@ class RunCycle(Node):
             for t in self.trays():
                 if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
                     continue
-                pocket = self.free_pocket_moving(t, place_lead)
+                # the place starts only after the pick: the pocket must still be reachable then (approach_est = the
+                # running mean of the pick approach time; a check at the current lead chose pockets that had left
+                # the reach by the time the product was in hand)
+                pocket = self.free_pocket_moving(t, place_lead + self.approach_est, margin=0.0)
                 if pocket is not None:
                     trays.append((t, pocket))
                 elif -0.35 < t.x < 0.70 and self.rejected_log.get(t.key, 0) < now:
@@ -578,6 +592,7 @@ class RunCycle(Node):
                 self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "retreat")
                 continue
             tl["approach"] = (ev["contact"] or t_sealed) - tc
+            self.approach_est = 0.8 * self.approach_est + 0.2 * tl["approach"]
             tl["seal_wait"] = t_sealed - (ev["contact"] or t_sealed)
             # diagnostic (ground truth, metric only): where did the cup really seal relative to the product centre,
             # compared with the vision estimate the place compensates for
@@ -587,6 +602,18 @@ class RunCycle(Node):
             held = att
             blacklist[c.key] = time.monotonic() + 15.0  # its track lives on by prediction: never pick the ghost
             tp = self.track_pose(c.tid)
+            fk = self.fk_xy()
+            if tp is not None and fk is not None:
+                # the cup seals a few mm off the product centre (settle tolerance, tracker error, prediction during
+                # the occluded descent): measure it from the tracked centre and the cup (FK) and let the place
+                # compensate the measured offset instead of the vision estimate
+                off_meas = (tp.x - fk[0], tp.y - fk[1])
+                if math.hypot(*off_meas) < 0.03:
+                    self.get_logger().info(
+                        f"grasp offset measured ({1e3 * off_meas[0]:+.0f},{1e3 * off_meas[1]:+.0f}) mm"
+                        f" (vision estimate ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm)"
+                    )
+                    c.off = off_meas
             if g is not None and tp is not None:
                 ax, ay = g[0][0] - tp.x, g[0][1] - tp.y
                 dyaw = math.degrees(
@@ -622,12 +649,24 @@ class RunCycle(Node):
                         fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
                 if fresh:
                     self.get_logger().info("place: no pocket with reach margin, taking one reachable now")
+            t_wait0 = time.monotonic()
+            while not fresh and time.monotonic() - t_wait0 < 6.0:  # hold the product until a pocket comes in reach
+                if time.monotonic() - t_wait0 < 0.05:
+                    self.get_logger().info("place: waiting for a reachable pocket (holding the product)")
+                time.sleep(0.05)
+                for t in self.trays():
+                    if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
+                        continue
+                    pk = self.free_pocket_moving(t, place_lead, margin=0.0)
+                    if pk is not None:
+                        px, py, _ = self.tray.pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
+                        fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
             if fresh:
                 _, tray, pocket = min(fresh, key=lambda f: f[0])  # shortest transfer
             else:
                 tray, pocket = trays[0]
                 self.get_logger().warn(
-                    f"place: no reachable pocket now, falling back to {tray.key}[{pocket}] seen before the pick"
+                    f"place: no reachable pocket in 6 s, falling back to {tray.key}[{pocket}] seen before the pick"
                 )
             tframe = f"tray_{tray.tid}"
             ox, oy = self.tray.pocket_offset(pocket)
@@ -695,6 +734,7 @@ class RunCycle(Node):
                                 if getattr(self, "psi_seal", None) is None
                                 else f"; J4 turned {wrap(psi - self.psi_seal):+.0f} deg since seal"
                                 + self.frame_err_now(tray.tid)
+                                + self.fk_vs_gt(g[0])
                             )
                         )
 
@@ -713,6 +753,17 @@ class RunCycle(Node):
                 self.vacuum_cmd(False)
             tl["transfer"] = (rel["t"] or time.monotonic()) - t_place0
             tl["release"] = time.monotonic() - (rel["t"] or time.monotonic())
+            if rel["t"] is not None:
+                # the vacuum lets go with a delay: leaving before it does drags the product along the departure
+                t_u0 = time.monotonic()
+                while time.monotonic() - t_u0 < 0.5:
+                    with self.lock:
+                        if not self.vac_sealed:
+                            break
+                    time.sleep(0.005)
+                self.get_logger().info(
+                    f"unsealed after {time.monotonic() - rel['t']:.3f} s (release command to unsealed)"
+                )
             self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
             self.in_pocket = rel["t"] is not None  # the cup is down in the pocket: the next goal must lift first
             threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket, held), daemon=True).start()
@@ -736,6 +787,37 @@ class RunCycle(Node):
             self.get_logger().info("timeline means " + " ".join(f"{k} {v:.2f}" for k, v in means.items()))
 
     # ---------------- placement accuracy (ground truth, metric only) ----------------
+    def fk_xy(self):
+        """Planar FK of the measured joints (l1 0.40, l2 0.25; base at the world origin; matches the GT cup to 1 mm)."""
+        with self.lock:
+            js = dict(self.joints)
+        j1 = next((v for n, v in js.items() if n.endswith("j1_joint")), None)
+        j2 = next((v for n, v in js.items() if n.endswith("j2_joint")), None)
+        if j1 is None or j2 is None:
+            return None
+        return 0.40 * math.cos(j1) + 0.25 * math.cos(j1 + j2), 0.40 * math.sin(j1) + 0.25 * math.sin(j1 + j2)
+
+    def fk_vs_gt(self, gt_xy):
+        """Diagnostic: planar FK of the measured joints (model l1=0.40, l2=0.25, base at the world origin) vs a GT
+        point that should coincide with the cup (the product centre while it is held), with the elbow sign."""
+        with self.lock:
+            js = dict(self.joints)
+        j1 = next((v for n, v in js.items() if n.endswith("j1_joint")), None)
+        j2 = next((v for n, v in js.items() if n.endswith("j2_joint")), None)
+        if j1 is None or j2 is None:
+            return ""
+        x = 0.40 * math.cos(j1) + 0.25 * math.cos(j1 + j2)
+        y = 0.40 * math.sin(j1) + 0.25 * math.sin(j1 + j2)
+        with self.lock:
+            tools = dict(self.gt_tool)
+        tool_txt = ""
+        for n, (tx, ty, _tz, _t) in tools.items():
+            tool_txt += f", FK-GT[{n.split('/')[-1].split('::')[-1]}] ({1e3 * (x - tx):+.0f},{1e3 * (y - ty):+.0f}) mm"
+        return (
+            f"; FK-GT ({1e3 * (x - gt_xy[0]):+.0f},{1e3 * (y - gt_xy[1]):+.0f}) mm, elbow {'+' if j2 >= 0 else '-'}"
+            f" j1 {math.degrees(j1):.0f} j2 {math.degrees(j2):.0f} deg{tool_txt}"
+        )
+
     def frame_err_now(self, tid):
         """Diagnostic: the tracked tray frame (latest message, predicted to now) vs the GT tray, as text."""
         with self.lock:

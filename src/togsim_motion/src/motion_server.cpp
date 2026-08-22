@@ -62,7 +62,7 @@ class MotionServer : public rclcpp::Node {
     kin_.tool_length = declare_parameter("tool_length", 0.1992);
     kin_.elbow_right = declare_parameter("elbow_right", true);
     settleTol_ = declare_parameter("settle_tolerance", 0.002);
-    trackSettleTol_ = declare_parameter("track_settle_tolerance", 0.004);  // Cartesian, m
+    trackSettleTol_ = declare_parameter("track_settle_tolerance", 0.0025);  // Cartesian, m, on the measured arm
     trackYawTol_ = declare_parameter("track_yaw_tolerance", 0.02);  // rad: the cup must also have finished turning
     trackFilterTau_ = declare_parameter("track_filter_tau", 0.06);  // s: smooths the jumps of a tracked frame
     for (size_t i = 0; i < DOF; ++i) {

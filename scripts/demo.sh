@@ -25,6 +25,8 @@ fi
 echo "[demo] conveyor_tracker source=$mode"
 setsid ros2 run togsim_perception conveyor_tracker --ros-args -p use_sim_time:=true -p source:=$mode >"$log/tracker.log" 2>&1 </dev/null &
 wait_for 60 timeout 3 ros2 topic echo --once /togsim/tracks/products --field frame_seq || { echo "[demo] no tracks"; exit 1; }
+echo "[demo] operator HMI at http://localhost:${DEMO_HMI_PORT:-8080} (status, belts, start/stop, tray occupancy)"
+setsid ros2 run togsim_hmi hmi_server --ros-args -p use_sim_time:=true -p port:=${DEMO_HMI_PORT:-8080} >"$log/hmi.log" 2>&1 </dev/null &
 sleep 10
 echo "[demo] continuous pick & place (perception:=$mode, $cycles cycles) - stop everything with scripts/killall.sh"
 setsid ros2 run togsim_task run_cycle --ros-args -p perception:=$mode -p continuous:=true -p cycles:=$cycles -p belt_speed:=$speed -p use_sim_time:=true >"$log/run_cycle.log" 2>&1 </dev/null &

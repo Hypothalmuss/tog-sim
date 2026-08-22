@@ -302,8 +302,18 @@ class ConveyorTracker(Node):
             m.pose.pose.position.x, m.pose.pose.position.y, m.pose.pose.position.z = tr.x, tr.y, tr.z
             m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(tr.yaw / 2), math.cos(tr.yaw / 2)
             m.velocity.x, m.velocity.y = tr.vx, tr.vy
-            m.rows, m.cols = self.tray.rows, self.tray.cols
-            m.pitch_x, m.pitch_y = float(self.tray.pitch_x), float(self.tray.pitch_y)
+            if isinstance(tr.payload, TrayState) and tr.payload.model:
+                m.rows, m.cols, m.pitch_x, m.pitch_y, m.model = (
+                    tr.payload.rows,
+                    tr.payload.cols,
+                    tr.payload.pitch_x,
+                    tr.payload.pitch_y,
+                    tr.payload.model,
+                )
+            else:
+                m.rows, m.cols = self.tray.rows, self.tray.cols
+                m.pitch_x, m.pitch_y = float(self.tray.pitch_x), float(self.tray.pitch_y)
+                m.model = self.tray.name
             self.pub_t.publish(m)
             pc = getattr(self, "_pub_counts", None)
             if pc is None:

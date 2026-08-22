@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tog-sim HMI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>tog-sim &mdash; pick &amp; place cell</h1>
+  <div id="state" class="pill idle">idle</div>
+</header>
+<main>
+  <section class="cards">
+    <div class="card"><div class="label">cycles</div><div class="value" id="cycles">0</div><div class="sub" id="attempts">0 attempts</div></div>
+    <div class="card"><div class="label">rate</div><div class="value" id="cpm">0.0</div><div class="sub">cycles / min</div></div>
+    <div class="card"><div class="label">success</div><div class="value" id="success">&ndash;</div><div class="sub" id="failures">no failures</div></div>
+    <div class="card"><div class="label">placement</div><div class="value" id="placement">&ndash;</div><div class="sub" id="placement_p95">p95 &ndash;</div></div>
+    <div class="card"><div class="label">motion</div><div class="value" id="motion">&ndash;</div><div class="sub">s per cycle</div></div>
+  </section>
+
+  <section class="row">
+    <div class="panel">
+      <h2>Run</h2>
+      <div class="controls">
+        <label>cycles <input id="run_cycles" type="number" value="20" min="1" max="500"></label>
+        <label>perception
+          <select id="run_perception"><option value="vision">vision</option><option value="gt">ground truth</option></select>
+        </label>
+        <label>belt <input id="run_belt" type="number" value="0.10" step="0.01" min="0.02" max="0.30"> m/s</label>
+        <button id="btn_start" class="primary">Start</button>
+        <button id="btn_stop" class="danger">Stop</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Conveyors</h2>
+      <div class="controls">
+        <label>infeed <input id="belt_in" type="range" min="0" max="0.30" step="0.01" value="0.10"> <span id="belt_in_v">0.10</span> m/s <span class="meas" id="belt_in_m"></span></label>
+        <label>outfeed <input id="belt_out" type="range" min="0" max="0.30" step="0.01" value="0.10"> <span id="belt_out_v">0.10</span> m/s <span class="meas" id="belt_out_m"></span></label>
+        <button id="btn_belts">Apply</button>
+        <button id="btn_belts_stop" class="danger">Stop belts</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="panel">
+      <h2>Trays on the outfeed</h2>
+      <div id="trays" class="trays"></div>
+    </div>
+    <div class="panel">
+      <h2>Live</h2>
+      <div class="kv"><span>products tracked</span><span id="prod_n">0</span></div>
+      <div class="kv"><span>pickable</span><span id="prod_pickable">0</span></div>
+      <div class="kv"><span>vacuum</span><span id="vacuum">&ndash;</span></div>
+      <div class="kv"><span>joints</span><span id="joints" class="mono">&ndash;</span></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="panel"><h2>Events</h2><ul id="events" class="events"></ul></div>
+    <div class="panel"><h2>run_cycle log</h2><pre id="log" class="log"></pre></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

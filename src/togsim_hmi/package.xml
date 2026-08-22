@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>togsim_hmi</name>
+  <version>0.1.0</version>
+  <description>Operator HMI for the tog-sim cell: FastAPI + vanilla JS, status, belt speeds, start/stop of the pick-and-place cycle.</description>
+  <maintainer email="ntouil87@gmail.com">Med Nadim Touil</maintainer>
+  <license>Apache-2.0</license>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>togsim_msgs</depend>
+  <exec_depend>togsim_task</exec_depend>
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -5,6 +5,7 @@
 Same motion/vacuum logic as demo_pick_gt; the only difference is where candidates and trays come from.
 """
 
+import json
 import math
 import threading
 import time
@@ -76,10 +77,11 @@ class Candidate:
 
 
 class Tray:
-    __slots__ = ("key", "x", "y", "z", "yaw", "occupied", "tilt", "vx", "tid", "stamp", "x_raw", "rx_age")
+    __slots__ = ("key", "x", "y", "z", "yaw", "occupied", "tilt", "vx", "tid", "stamp", "x_raw", "rx_age", "spec")
 
     def __init__(self, key, x, y, z, yaw, occupied, tilt=0.0):
         self.key, self.x, self.y, self.z, self.yaw, self.occupied, self.tilt = key, x, y, z, yaw, occupied, tilt
+        self.spec = None  # TraySpec of this tray's model (set by the task from the message / the default)
         self.vx, self.tid = 0.0, None
 
 
@@ -113,6 +115,8 @@ class RunCycle(Node):
         self.continuous = bool(self.get_parameter("continuous").value)
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
+        self.tray_cfg = cfg
+        self.specs = {self.tray.name: self.tray}  # per tray model (several models can share the outfeed)
         self.cb = ReentrantCallbackGroup()
         self.lock = threading.Lock()
         self.gt = {}  # name -> ((x,y,z), yaw, tilt, t)
@@ -121,6 +125,17 @@ class RunCycle(Node):
         self.belt_state = {"infeed": 1.0, "outfeed": 1.0}
         self.latched = {}  # (tray_key, pocket) -> until
         self.placements = []  # (offset_m, yaw_err_deg) per placed product, from ground truth
+        # operator status for the HMI: one JSON message per event (cycle done, failure, state change)
+        self.status_pub = self.create_publisher(String, "/togsim/hmi/status", 10)
+        self.status = {
+            "state": "init",
+            "cycles": 0,
+            "attempts": 0,
+            "cpm": 0.0,
+            "motion_s": 0.0,
+            "failures": {},
+            "last": "",
+        }
         self.timelines = []  # per-cycle phase durations (wall seconds)
         self.t_cycle_end = None
         if self.continuous:  # tracks: stable ids + poses predicted to now, for both perception sources
@@ -251,7 +266,9 @@ class RunCycle(Node):
                             idx = self.tray.pocket_of_point(p, yaw, pp[0], pp[1])
                             if idx is not None:
                                 occ[idx] = True
-                    out.append(Tray(n, p[0], p[1], p[2], yaw, occ, tilt))
+                    tr = Tray(n, p[0], p[1], p[2], yaw, occ, tilt)
+                    tr.spec = self.tray
+                    out.append(tr)
             else:
                 now = time.monotonic()
                 t_sim = self.sim_now()
@@ -267,6 +284,7 @@ class RunCycle(Node):
                         f"t{tid}", p.x + m.velocity.x * dt, p.y, p.z, yaw_of(m.pose.pose.orientation), list(m.occupied)
                     )
                     tr.stamp, tr.x_raw = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9, p.x
+                    tr.spec = self.spec_for(getattr(m, "model", ""))
                     tr.rx_age = now - t  # monotonic age of the stored message (diagnostic)
                     tr.vx, tr.tid = m.velocity.x, int(tid)
                     out.append(tr)
@@ -321,12 +339,24 @@ class RunCycle(Node):
             time.sleep(0.002)
         return fut.result()
 
+    def spec_for(self, model):
+        """TraySpec for a tray model name (the default spec when the model is unknown or empty)."""
+        if not model or model == self.tray.name:
+            return self.tray
+        if model not in self.specs:
+            try:
+                self.specs[model] = TraySpec.from_yaml(self.tray_cfg, model)
+            except KeyError:
+                self.specs[model] = self.tray
+        return self.specs[model]
+
     def free_pocket(self, tray):
         now = time.monotonic()
-        for i in range(self.tray.n_pockets):
+        spec = tray.spec or self.tray
+        for i in range(spec.n_pockets):
             if tray.occupied[i] or self.latched.get((tray.key, i), 0) > now:
                 continue
-            px, py, _ = self.tray.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
+            px, py, _ = spec.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
             if reachable(px, py):
                 return i
         return None
@@ -403,7 +433,7 @@ class RunCycle(Node):
         )  # the place goal preempts on seal
         contact = float(self.get_parameter("contact_offset_m").value)
         seal_timeout = float(self.get_parameter("seal_timeout_s").value)
-        fits = PRODUCT_FITS[self.tray.name]
+        fits = sorted({cls for name in PRODUCT_FITS for cls in PRODUCT_FITS[name]})  # any class a known tray takes
         park = [float(v) for v in self.get_parameter("park").value]
         done, attempts = 0, 0
         cycle_times, t_start = [], None
@@ -411,6 +441,7 @@ class RunCycle(Node):
         self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
         parked = True
         self.belts(belt_speed)
+        self.publish_status("running", last="started")
         last_report = 0.0
         while rclpy.ok() and done < int(self.get_parameter("cycles").value):
             now = time.monotonic()
@@ -433,10 +464,11 @@ class RunCycle(Node):
                     loc = self.in_tray_frame((t.x, t.y), gt)
                     if loc is not None:
                         tp, tyaw = gt[loc[0]][0], gt[loc[0]][1]
-                        occ = [False] * self.tray.n_pockets
+                        sp_ = t.spec or self.tray
+                        occ = [False] * sp_.n_pockets
                         for pn, (pp, _, _, _) in gt.items():
                             if pn.startswith("product_") and abs(pp[2] - tp[2]) < 0.06:
-                                k = self.tray.pocket_of_point(tp, tyaw, pp[0], pp[1])
+                                k = sp_.pocket_of_point(tp, tyaw, pp[0], pp[1])
                                 if k is not None:
                                     occ[k] = True
                         occ_gt = "".join("x" if v else "." for v in occ) + f" ({loc[0]})"
@@ -444,6 +476,8 @@ class RunCycle(Node):
                         f"rejected tray {t.key} at x {t.x:.2f}: vision occupied"
                         f" {''.join('x' if v else '.' for v in t.occupied)} vs GT {occ_gt}"
                     )
+            # only products that a tray in the window can take (several tray models may share the outfeed)
+            fits_now = {cls for t, _ in trays for cls in PRODUCT_FITS.get((t.spec or self.tray).name, [])}
             cands = []
             why = self.idle_why  # why candidates are not pickable right now (diagnostic for the idle time)
             for c in self.candidates(fits):
@@ -460,6 +494,7 @@ class RunCycle(Node):
                     why["blacklist"] += 1
                 if (
                     c.tid is not None
+                    and c.cls in fits_now
                     and xmin < x_arrive < xmax
                     and -0.6 < c.y < -0.1
                     and reachable(x_done, c.y)
@@ -587,6 +622,9 @@ class RunCycle(Node):
                 self.get_logger().warn(
                     f"pick {c.key} failed: {msg} ({t_sealed - tc:.2f} s after start, x_arrive {x_arrive:.3f}, y {c.y:.3f}){why}"
                 )
+                fl = dict(self.status.get("failures", {}))
+                fl["pick"] = fl.get("pick", 0) + 1
+                self.publish_status("running", attempts=attempts, failures=fl, last=f"pick {c.key} failed: {msg}")
                 blacklist[c.key] = time.monotonic() + 15.0
                 self.vacuum_cmd(False)
                 if not rf.done():
@@ -638,17 +676,21 @@ class RunCycle(Node):
             for t in self.trays():
                 if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
                     continue
+                if c.cls not in PRODUCT_FITS.get((t.spec or self.tray).name, []):
+                    continue
                 pk = self.free_pocket_moving(t, place_lead)
                 if pk is not None:
-                    px, py, _ = self.tray.pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
+                    px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
                     fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
             if not fresh:  # nothing with margin: the pockets that are still reachable right now, no margin
                 for t in self.trays():
                     if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
                         continue
+                    if c.cls not in PRODUCT_FITS.get((t.spec or self.tray).name, []):
+                        continue
                     pk = self.free_pocket_moving(t, place_lead, margin=0.0)
                     if pk is not None:
-                        px, py, _ = self.tray.pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
+                        px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
                         fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
                 if fresh:
                     self.get_logger().info("place: no pocket with reach margin, taking one reachable now")
@@ -660,9 +702,11 @@ class RunCycle(Node):
                 for t in self.trays():
                     if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
                         continue
+                    if c.cls not in PRODUCT_FITS.get((t.spec or self.tray).name, []):
+                        continue
                     pk = self.free_pocket_moving(t, place_lead, margin=0.3)  # a pocket at the edge ends the place
                     if pk is not None:  # where the lift cannot be solved
-                        px, py, _ = self.tray.pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
+                        px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
                         fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
             if fresh:
                 _, tray, pocket = min(fresh, key=lambda f: f[0])  # shortest transfer
@@ -672,7 +716,8 @@ class RunCycle(Node):
                     f"place: no reachable pocket in 6 s, falling back to {tray.key}[{pocket}] seen before the pick"
                 )
             tframe = f"tray_{tray.tid}"
-            ox, oy = self.tray.pocket_offset(pocket)
+            spec = tray.spec or self.tray
+            ox, oy = spec.pocket_offset(pocket)
             loc = self.in_tray_frame((tray.x, tray.y))  # diagnostic (GT): tracked tray frame vs the real tray now
             ferr = "" if loc is None else f", frame err ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm vs {loc[0]}"
             st = getattr(tray, "stamp", None)
@@ -704,10 +749,10 @@ class RunCycle(Node):
             # release 10 mm above the pocket floor: the pocket walls (25 mm) still guide the product, and with 5 mm of
             # clearance per side a cup that is a few mm off would otherwise press the product onto a wall and drag the
             # tray along the belt
-            z_place = self.tray.base_thickness + h + 0.010
+            z_place = spec.base_thickness + h + 0.010
             # the product hangs below the cup: approach above the pocket walls (flying to a far pocket crosses the
             # others), then descend vertically in the tray frame. Clipping a wall at belt speed throws the tray.
-            z_clear = self.tray.base_thickness + self.tray.pocket_depth + 0.02 + h
+            z_clear = spec.base_thickness + spec.pocket_depth + 0.02 + h
             rel = {"t": None}
 
             def on_fb_place(fb, n=3):
@@ -741,7 +786,7 @@ class RunCycle(Node):
                             )
                         )
 
-            px_w, py_w, zf = self.tray.pocket_world((tray.x + tray.vx * place_lead, tray.y, tray.z), tray.yaw, pocket)
+            px_w, py_w, zf = spec.pocket_world((tray.x + tray.vx * place_lead, tray.y, tray.z), tray.yaw, pocket)
             place = [
                 seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.35),
                 seg(MotionSegment.TRACK_CART, ox, oy, z_clear, bq, tracked=tframe),
@@ -779,11 +824,20 @@ class RunCycle(Node):
                 done += 1
                 cycle_times.append(time.monotonic() - tc)
                 el = time.monotonic() - t_start
+                self.publish_status(
+                    "running",
+                    cycles=done,
+                    attempts=attempts,
+                    cpm=round(60.0 * done / el, 1),
+                    motion_s=round(sum(cycle_times) / len(cycle_times), 2),
+                    last=f"cycle {done} placed {c.key} -> {tray.key}[{pocket}]",
+                )
                 self.get_logger().info(
                     f"cycle {done}: {cycle_times[-1]:.2f} s | {60.0 * done / el:.1f} cpm | mean motion "
                     f"{sum(cycle_times) / len(cycle_times):.2f} s | success {done}/{attempts}"
                 )
         self.get_logger().info(f"finished: {done} cycles, {attempts} attempts, mode={self.mode} continuous")
+        self.publish_status("finished", cycles=done, attempts=attempts)
         time.sleep(0.6)  # let the last placement measurement finish
         self.report_placement()
         if self.timelines:
@@ -885,7 +939,8 @@ class RunCycle(Node):
         trays = {n: v for n, v in gt.items() if n.startswith("tray_")}
         best = None
         for tn, (tp, tyaw, _, _) in trays.items():
-            centres = [self.tray.pocket_world(tp, tyaw, k) for k in range(self.tray.n_pockets)]
+            spec = (tray.spec if tray is not None else None) or self.tray
+            centres = [spec.pocket_world(tp, tyaw, k) for k in range(spec.n_pockets)]
             for pn, (pp, pyaw, _, _) in gt.items():
                 if not pn.startswith("product_") or abs(pp[2] - tp[2]) > 0.06 or (held and pn != held):
                     continue
@@ -909,6 +964,18 @@ class RunCycle(Node):
             f"placed {key} -> {tray.key}[{pocket}] ({best[1]} in {best[3]}[{best[4]}]): {1e3 * best[0]:.1f} mm off centre, "
             f"yaw {best[2]:+.1f} deg"
         )
+
+    def publish_status(self, state=None, **kw):
+        if state is not None:
+            self.status["state"] = state
+        self.status.update(kw)
+        offs = [1e3 * o for o, _ in self.placements]
+        if offs:
+            srt = sorted(offs)
+            self.status["placement_mean_mm"] = round(sum(offs) / len(offs), 1)
+            self.status["placement_p95_mm"] = round(srt[int(0.95 * (len(srt) - 1))], 1)
+        self.status["t"] = round(time.time(), 2)
+        self.status_pub.publish(String(data=json.dumps(self.status)))
 
     def report_placement(self):
         if not self.placements:
@@ -950,18 +1017,19 @@ class RunCycle(Node):
         now = time.monotonic()
         # leading pockets first: they leave the reach first, and a tray that passes with empty trailing pockets is
         # cheaper than one that passes with empty leading ones (only the trailing ones are still reachable late)
+        spec = tray.spec or self.tray
         order = sorted(
-            range(self.tray.n_pockets),
-            key=lambda k: (-self.tray.pocket_offset(k)[0], abs(self.tray.pocket_offset(k)[1])),
+            range(spec.n_pockets),
+            key=lambda k: (-spec.pocket_offset(k)[0], abs(spec.pocket_offset(k)[1])),
         )
         for i in order:
             if tray.occupied[i] or self.latched.get((tray.key, i), 0) > now:
                 continue
-            px, py, _ = self.tray.pocket_world((tray.x + tray.vx * lead, tray.y, tray.z), tray.yaw, i)
+            px, py, _ = spec.pocket_world((tray.x + tray.vx * lead, tray.y, tray.z), tray.yaw, i)
             # comfortably inside the arc: not at the reach limit, not folded against the base, now and when the cup arrives
-            px0, py0, _ = self.tray.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
+            px0, py0, _ = spec.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
             # ... and a little later: settling the heading can make the place outlast the lead
-            px1, py1, _ = self.tray.pocket_world((tray.x + tray.vx * (lead + margin), tray.y, tray.z), tray.yaw, i)
+            px1, py1, _ = spec.pocket_world((tray.x + tray.vx * (lead + margin), tray.y, tray.z), tray.yaw, i)
             if (
                 reachable(px, py)
                 and reachable(px1, py1)

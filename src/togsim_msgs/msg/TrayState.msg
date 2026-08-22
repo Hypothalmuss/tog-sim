@@ -10,3 +10,4 @@ float32 pitch_y
 bool[] occupied                    # row-major, rows*cols
 float32[] confidence
 bool tracked                       # false if estimate is stale / lost
+string model                       # tray model name (trays.yaml key), e.g. tray_2x4 / tray_bar_2x3

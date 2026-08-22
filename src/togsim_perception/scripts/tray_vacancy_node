@@ -46,6 +46,7 @@ class TrayVacancyNode(Node):
         self.declare_parameter("world_frame", "world")
         self.declare_parameter("hfov_rad", 1.2043)  # D435 RGB, must match the world SDF
         self.declare_parameter("tray_model", "tray_2x4")
+        self.declare_parameter("tray_models_csv", "")  # several tray models in the cell: chosen per mask by size
         self.declare_parameter("coverage_threshold", 0.30)
         self.declare_parameter("depth_rise_m", 0.008)
         self.declare_parameter("belt_z", 0.52)
@@ -53,24 +54,15 @@ class TrayVacancyNode(Node):
         self.world = self.get_parameter("world_frame").value
         self.hfov = float(self.get_parameter("hfov_rad").value)
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
-        t = cfg["trays"][self.get_parameter("tray_model").value]
-        self.rows, self.cols = t["rows"], t["cols"]
-        self.pitch = (t["pitch_x"], t["pitch_y"])
-        self.pocket = (t["pocket_x"], t["pocket_y"])
-        self.base_t = t.get("base_thickness", 0.004)
+        names = [n.strip() for n in str(self.get_parameter("tray_models_csv").value).split(",") if n.strip()]
+        names = names or [self.get_parameter("tray_model").value]
+        self.specs = {n: self._spec(n, cfg["trays"][n]) for n in names}
+        t = cfg["trays"][names[0]]
+        sp0 = self.specs[names[0]]
+        self.rows, self.cols = sp0["rows"], sp0["cols"]
+        self.pitch, self.pocket, self.base_t = sp0["pitch"], sp0["pocket"], sp0["base_t"]
         self.depth_total = self.base_t + t["pocket_depth"]
-        self.total = (
-            self.cols * self.pitch[0] + 2 * t.get("margin", 0.01),
-            self.rows * self.pitch[1] + 2 * t.get("margin", 0.01),
-        )
-        self.pocket_offsets = [
-            (
-                -self.cols * self.pitch[0] / 2 + (c + 0.5) * self.pitch[0],
-                -self.rows * self.pitch[1] / 2 + (r + 0.5) * self.pitch[1],
-            )
-            for r in range(self.rows)
-            for c in range(self.cols)
-        ]
+        self.total, self.pocket_offsets = sp0["total"], sp0["pocket_offsets"]
         self.cov_thr = float(self.get_parameter("coverage_threshold").value)
         self.rise = float(self.get_parameter("depth_rise_m").value)
         self.belt_z = float(self.get_parameter("belt_z").value)
@@ -134,6 +126,26 @@ class TrayVacancyNode(Node):
         if det is not None:
             self.process(msg.header, img, det)
 
+    @staticmethod
+    def _spec(name, t):
+        rows, cols = t["rows"], t["cols"]
+        pitch = (t["pitch_x"], t["pitch_y"])
+        margin = t.get("margin", 0.01)
+        return {
+            "name": name,
+            "rows": rows,
+            "cols": cols,
+            "pitch": pitch,
+            "pocket": (t["pocket_x"], t["pocket_y"]),
+            "base_t": t.get("base_thickness", 0.004),
+            "total": (cols * pitch[0] + 2 * margin, rows * pitch[1] + 2 * margin),
+            "pocket_offsets": [
+                (-cols * pitch[0] / 2 + (c + 0.5) * pitch[0], -rows * pitch[1] / 2 + (r + 0.5) * pitch[1])
+                for r in range(rows)
+                for c in range(cols)
+            ],
+        }
+
     def track_id(self, x, y, stamp_s, assign=True):
         for tr in self.tracks:
             dt = max(0.0, stamp_s - tr[3])
@@ -195,15 +207,20 @@ class TrayVacancyNode(Node):
             # only a fully visible tray has a meaningful centroid / axis: a tray entering or leaving the view, or one
             # half hidden by the arm, gave poses up to 180 mm off with the axis flipped by 90 deg
             gsd = z_floor / self.k[0, 0]
-            expected_px = (self.total[0] * self.total[1]) / (gsd * gsd)
+            cu, cv_, ang, long_px, short_px = principal_axis(m)
+            # several tray models in the cell: the mask's metric extents pick the spec (360x140 vs the bar tray)
+            sp = min(
+                self.specs.values(),
+                key=lambda s_: abs(long_px * gsd - s_["total"][0]) + abs(short_px * gsd - s_["total"][1]),
+            )
+            expected_px = (sp["total"][0] * sp["total"][1]) / (gsd * gsd)
             # 95 %: at 80 % visible the centroid of the visible part is already ~35 mm off the tray centre
             full = (not partial) and (m | product_mask).sum() >= 0.95 * expected_px
             if not full:
                 continue
-            cu, cv_, ang, long_px, short_px = principal_axis(m)
             p_cam = pixel_to_point(cu, cv_, z_floor, self.k)
             p_w = transform_points(p_cam[None, :], rot, trans)[0]
-            z_bottom = p_w[2] - self.base_t
+            z_bottom = p_w[2] - sp["base_t"]
             if abs(z_bottom - self.belt_z) < 0.03:  # trays ride on the belt: snap to the known belt height
                 z_bottom = self.belt_z
             dir_w = rot @ np.array([math.cos(ang), math.sin(ang), 0.0])
@@ -224,7 +241,7 @@ class TrayVacancyNode(Node):
                         pixel_to_point(cents[k][0], cents[k][1], z_floor, self.k)[None, :], rot, trans
                     )[0]
                     blobs.append((pw[0], pw[1]))
-            fx, fy, fyaw, n_fit, rms_fit = fit_pocket_lattice(blobs, self.pocket_offsets, (p_w[0], p_w[1]), yaw)
+            fx, fy, fyaw, n_fit, rms_fit = fit_pocket_lattice(blobs, sp["pocket_offsets"], (p_w[0], p_w[1]), yaw)
             # the lattice is periodic: a fit shifted by a pitch looks just as good, so the mask pose anchors it - accept
             # only a small correction of a fully visible tray with most pockets matched
             if not partial and n_fit >= 5 and rms_fit < 0.006 and math.hypot(fx - p_w[0], fy - p_w[1]) < 0.035:
@@ -243,17 +260,17 @@ class TrayVacancyNode(Node):
             tid = self.track_id(p_w[0], p_w[1], stamp_s)
             occupied, conf = [], []
             c, s = math.cos(yaw), math.sin(yaw)
-            for r in range(self.rows):
-                for col in range(self.cols):
-                    ox = -self.cols * self.pitch[0] / 2 + (col + 0.5) * self.pitch[0]
-                    oy = -self.rows * self.pitch[1] / 2 + (r + 0.5) * self.pitch[1]
+            for r in range(sp["rows"]):
+                for col in range(sp["cols"]):
+                    ox = -sp["cols"] * sp["pitch"][0] / 2 + (col + 0.5) * sp["pitch"][0]
+                    oy = -sp["rows"] * sp["pitch"][1] / 2 + (r + 0.5) * sp["pitch"][1]
                     corners = []
                     for dx, dy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
-                        lx = ox + dx * self.pocket[0] * 0.45
-                        ly = oy + dy * self.pocket[1] * 0.45
+                        lx = ox + dx * sp["pocket"][0] * 0.45
+                        ly = oy + dy * sp["pocket"][1] * 0.45
                         wx = p_w[0] + c * lx - s * ly
                         wy = p_w[1] + s * lx + c * ly
-                        pc = rot_inv @ (np.array([wx, wy, z_bottom + self.base_t + 0.012]) - trans)
+                        pc = rot_inv @ (np.array([wx, wy, z_bottom + sp["base_t"] + 0.012]) - trans)
                         corners.append(point_to_pixel(pc, self.k))
                     poly = np.array(corners)
                     cov = polygon_coverage(product_mask, poly)
@@ -298,8 +315,9 @@ class TrayVacancyNode(Node):
             msg.pose.pose.orientation.z = math.sin(yaw / 2)
             msg.pose.pose.orientation.w = math.cos(yaw / 2)
             msg.velocity.x = float(self.belt_v)
-            msg.rows, msg.cols = self.rows, self.cols
-            msg.pitch_x, msg.pitch_y = float(self.pitch[0]), float(self.pitch[1])
+            msg.rows, msg.cols = sp["rows"], sp["cols"]
+            msg.pitch_x, msg.pitch_y = float(sp["pitch"][0]), float(sp["pitch"][1])
+            msg.model = sp["name"]
             msg.occupied = occupied
             msg.confidence = conf
             msg.tracked = not partial

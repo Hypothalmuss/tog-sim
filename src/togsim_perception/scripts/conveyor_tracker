@@ -49,6 +49,8 @@ class ConveyorTracker(Node):
         self.declare_parameter("tray_lost_s", 4.0)  # trays are occluded by the arm during a place: predict through it
         self.declare_parameter("mature_alpha", 0.25)
         self.declare_parameter("tool_frame", "tcp")  # observations near the tool are hidden/biased by the arm: ignored
+        # vision observations trail ground truth by ~3 mm at 0.09 m/s (eval_tray_state by_x): capture-to-stamp latency
+        self.declare_parameter("latency_s", 0.03)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tool_warned = False
@@ -87,7 +89,7 @@ class ConveyorTracker(Node):
 
     # ---------------- inputs ----------------
     def _t(self, stamp):
-        return stamp.sec + stamp.nanosec * 1e-9
+        return stamp.sec + stamp.nanosec * 1e-9 - float(self.get_parameter("latency_s").value)
 
     def on_cands(self, msg):
         obs = []
@@ -132,7 +134,13 @@ class ConveyorTracker(Node):
             return  # partial / unreliable observation: never create or drag a track with it
         p = msg.pose.pose.position
         tool = self.tool_xy()
-        if tool is not None and math.hypot(p.x - tool[0], p.y - tool[1]) < 0.30:
+        # the arm hides/biases a tray only when the tool is above its footprint (a circle of 0.30 m also starved the
+        # next tray of its early observations while the previous one was being filled)
+        if tool is not None and abs(p.x - tool[0]) < 0.23 and abs(p.y - tool[1]) < 0.12:
+            self.get_logger().info(
+                f"tray obs tray{msg.tray_id} gated: tool ({p.x - tool[0]:+.2f},{p.y - tool[1]:+.2f}) m away",
+                throttle_duration_sec=1.0,
+            )
             return  # the arm is over the tray: the mask/lattice are biased, keep predicting
         o = Observation(
             p.x,
@@ -252,6 +260,16 @@ class ConveyorTracker(Node):
             c.observed = now.to_msg()
             arr.candidates.append(c)
         self.pub_p.publish(arr)
+        if t - getattr(self, "_dump_t", 0.0) > 1.0:
+            self._dump_t = t
+            self.get_logger().info(
+                "tray tracks: "
+                + "; ".join(
+                    f"{tr.id}/{tr.key} ({tr.x:.3f},{tr.y:.3f}) n={tr.n_obs} age={tr.age(t):.1f} v={tr.vx:.3f}"
+                    for tr in trays
+                )
+                + f" | belt_vx={self.trays.belt_vx}"
+            )
         for tr in trays:
             tfs.append(self._tf(now, f"tray_{tr.id}", tr.x, tr.y, tr.z, tr.yaw))
             if tr.n_obs < 12 and self.source != "gt":

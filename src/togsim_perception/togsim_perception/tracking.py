@@ -208,7 +208,8 @@ class BeltTracker:
         tr.t = o.t
         tr.n_obs += 1
         tr.payload = o.payload
-        tr.history.append((o.t, o.x, o.y))
+        if tr.n_obs >= 4:  # the first observations of an object entering the view are biased: not for velocity
+            tr.history.append((o.t, o.x, o.y))
         if len(tr.history) > 10:
             tr.history.pop(0)
         # velocity: the belt encoder value is the prior; the shared belt-speed estimate (objects slip a few percent)
@@ -218,7 +219,9 @@ class BeltTracker:
             span = t1 - t0
             if span > 0.5 and tr.n_obs >= 8:
                 mvx = (x1 - x0) / span
-                if abs(mvx - o.vx) < 0.04:  # sane: within 4 cm/s of the encoder (partial masks drift much faster)
+                if (
+                    abs(mvx - o.vx) < 0.02
+                ):  # sane: within 2 cm/s of the encoder (slip is ~10 %, partial masks drift more)
                     self._v_samples.append(mvx)
                     del self._v_samples[:-60]
                     if len(self._v_samples) >= 5:

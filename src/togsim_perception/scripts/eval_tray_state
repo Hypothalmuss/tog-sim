@@ -37,6 +37,7 @@ class EvalTrayState(Node):
         self.declare_parameter("tray_model", "tray_2x4")
         self.declare_parameter("out", os.path.expanduser("~/togsim_data/eval_tray_state.json"))
         self.frames = int(self.get_parameter("frames").value)
+        self.by_x = {}  # GT tray x bin -> [n, sum dx, sum dy, sum d] (vision - GT)
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
         self.lock = threading.Lock()
@@ -87,6 +88,11 @@ class EvalTrayState(Node):
             self.unmatched += 1
             return
         d, name, g = best
+        b = self.by_x.setdefault(f"{math.floor(g[0] * 10) / 10:.1f}", [0, 0.0, 0.0, 0.0])
+        b[0] += 1
+        b[1] += p.x - g[0]
+        b[2] += p.y - g[1]
+        b[3] += d
         if d > 0.03:
             self.get_logger().warn(
                 f"tray {int(msg.tray_id)} jump {1e3 * d:.0f} mm: vision ({p.x:.3f},{p.y:.3f}) vs GT {name} ({g[0]:.3f},{g[1]:.3f})"
@@ -126,6 +132,15 @@ class EvalTrayState(Node):
         tot = self.tp + self.fp + self.fn + self.tn
         return {
             "frames": self.n,
+            "by_x": {
+                k: {
+                    "n": v[0],
+                    "dx_mm": round(1e3 * v[1] / v[0], 1),
+                    "dy_mm": round(1e3 * v[2] / v[0], 1),
+                    "d_mm": round(1e3 * v[3] / v[0], 1),
+                }
+                for k, v in self.by_x.items()
+            },
             "unmatched": self.unmatched,
             "xy_error_mm": st([1e3 * e for e in self.err_xy]),
             "yaw_error_deg": st(self.err_yaw),

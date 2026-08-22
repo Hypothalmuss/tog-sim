@@ -592,6 +592,10 @@ class RunCycle(Node):
                 tray, pocket = trays[0]
             tframe = f"tray_{tray.tid}"
             ox, oy = self.tray.pocket_offset(pocket)
+            self.get_logger().info(
+                f"place decision {c.key} -> {tray.key}[{pocket}]: tray x {tray.x:.2f}, occupied"
+                f" {''.join('x' if v else '.' for v in tray.occupied)}"
+            )
             # the cup holds the product off-centre by `off` (world, at pick); after J4 turns the product to the tray's
             # yaw that offset, expressed in the product frame, is constant -> aim the cup at pocket - offset
             cur = self.cup_yaw()
@@ -602,7 +606,10 @@ class RunCycle(Node):
             offx, offy = cp * c.off[0] - sp * c.off[1], sp * c.off[0] + cp * c.off[1]
             if math.hypot(offx, offy) < 0.03:  # sanity: a bigger "offset" is a bad mask, not a real grasp offset
                 ox, oy = ox - sgn * offx, oy - sgn * offy
-            z_place = self.tray.base_thickness + h + 0.004
+            # release 10 mm above the pocket floor: the pocket walls (25 mm) still guide the product, and with 5 mm of
+            # clearance per side a cup that is a few mm off would otherwise press the product onto a wall and drag the
+            # tray along the belt
+            z_place = self.tray.base_thickness + h + 0.010
             # the product hangs below the cup: approach above the pocket walls (flying to a far pocket crosses the
             # others), then descend vertically in the tray frame. Clipping a wall at belt speed throws the tray.
             z_clear = self.tray.base_thickness + self.tray.pocket_depth + 0.02 + h
@@ -784,7 +791,7 @@ class RunCycle(Node):
             if (
                 reachable(px, py)
                 and reachable(px1, py1)
-                and -0.20 < px < 0.45
+                and -0.20 < px < 0.52  # the reach checks bound the far side; this keeps the cup off the robot side
                 and math.hypot(px, py) > 0.30
                 and math.hypot(px0, py0) > 0.30
             ):

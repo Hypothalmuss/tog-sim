@@ -24,9 +24,13 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Demos
 
-| Continuous vision-driven pick & place from the moving belts (before the 2026-08-22 polish pass) |
-|---|
-| ![demo before](docs/media/demo_before.gif) |
+| Before the polish pass (2026-08-22) | After: enclosure moved off the belts, smoother arm, gentler belts, occlusion-gated tracking |
+|---|---|
+| ![demo before](docs/media/demo_before.gif) | ![demo after](docs/media/demo_after.gif) |
+
+Both: continuous vision-driven pick & place from the *moving* belts (YOLO11n-seg → pick poses → conveyor tracker →
+`TRACK_CART` motions), recorded live from Gazebo. Placement accuracy (product vs pocket centre, ground truth):
+GT perception 8.6 mm / 0.2°, vision 14.6 mm / 3.7° (10/10 cycles).
 
 ## Quick start (native)
 

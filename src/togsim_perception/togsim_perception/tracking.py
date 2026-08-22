@@ -21,6 +21,7 @@ class Observation:
     vy: float = 0.0
     key: str | None = None  # stable identity if known (GT mode)
     payload: object = None  # anything the consumer wants back (e.g. the original message)
+    area: float = 0.0  # observation quality (mask area in px); a collapse below the track's usual area means occlusion
 
 
 @dataclass
@@ -39,6 +40,7 @@ class Track:
     payload: object = None
     yaw_period: float = math.pi
     history: list = field(default_factory=list)  # (t, x, y) of the last observations, for velocity estimation
+    area: float = 0.0  # running estimate of the observation area (0 = unknown)
 
     def predicted(self, t: float):
         """(x, y) extrapolated to time t."""
@@ -63,6 +65,7 @@ class BeltTracker:
         yaw_period: float = math.pi,
         estimate_velocity: bool = True,
         min_obs_velocity: int = 3,
+        min_area_ratio: float = 0.6,
     ):
         self.gate = gate_m
         self.lost_s = lost_s
@@ -71,6 +74,9 @@ class BeltTracker:
         self.yaw_period = yaw_period
         self.estimate_velocity = estimate_velocity
         self.min_obs_velocity = min_obs_velocity
+        # an observation whose area dropped below this fraction of the track's usual area is a partially occluded
+        # object (the arm over it, the image border): its centroid is biased, so the track keeps predicting instead
+        self.min_area_ratio = min_area_ratio
         self.tracks: dict[int, Track] = {}
         self._next_id = 1
 
@@ -138,6 +144,7 @@ class BeltTracker:
     # ---------------- internals ----------------
     def _create(self, o: Observation) -> Track:
         tr = Track(self._next_id, o.cls, o.x, o.y, o.z, o.yaw, o.vx, o.vy, o.t, 1, o.key, o.payload, self.yaw_period)
+        tr.area = o.area
         tr.history.append((o.t, o.x, o.y))
         self.tracks[tr.id] = tr
         self._next_id += 1
@@ -147,6 +154,11 @@ class BeltTracker:
         dt = o.t - tr.t
         if dt < 0:  # out-of-order frame: ignore the stale one
             return
+        if o.area > 0 and tr.area > 0 and tr.n_obs >= 3 and o.area < self.min_area_ratio * tr.area:
+            tr.payload = o.payload  # occluded: keep the geometry predicted, refresh only the attributes
+            return
+        if o.area > 0:
+            tr.area = o.area if tr.area <= 0 else 0.8 * tr.area + 0.2 * o.area
         px, py = tr.predicted(o.t)
         a = self.pos_alpha
         tr.x = (1 - a) * px + a * o.x

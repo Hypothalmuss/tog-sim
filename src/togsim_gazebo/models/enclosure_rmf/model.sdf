@@ -5,15 +5,15 @@
         <static>true</static>
         <link name="enclosure_link">
                         <visual name="visual_0">
-                <geometry><mesh><uri>model://enclosure_rmf/meshes/enclosure_rmf_0.obj</uri><scale>1.9 1.35 1.0</scale></mesh></geometry>
+                <geometry><mesh><uri>model://enclosure_rmf/meshes/enclosure_rmf_0.obj</uri><scale>1.67 1.67 1.0</scale></mesh></geometry>
                 <material><ambient>0.800 0.800 0.800 0.051</ambient><diffuse>0.800 0.800 0.800 0.051</diffuse><specular>0.2 0.2 0.2 1</specular></material>
             </visual>
             <visual name="visual_1">
-                <geometry><mesh><uri>model://enclosure_rmf/meshes/enclosure_rmf_1.obj</uri><scale>1.9 1.35 1.0</scale></mesh></geometry>
+                <geometry><mesh><uri>model://enclosure_rmf/meshes/enclosure_rmf_1.obj</uri><scale>1.67 1.67 1.0</scale></mesh></geometry>
                 <material><ambient>0.200 0.200 0.200 1.000</ambient><diffuse>0.200 0.200 0.200 1.000</diffuse><specular>0.2 0.2 0.2 1</specular></material>
             </visual>
             <visual name="visual_2">
-                <geometry><mesh><uri>model://enclosure_rmf/meshes/enclosure_rmf_2.obj</uri><scale>1.9 1.35 1.0</scale></mesh></geometry>
+                <geometry><mesh><uri>model://enclosure_rmf/meshes/enclosure_rmf_2.obj</uri><scale>1.67 1.67 1.0</scale></mesh></geometry>
                 <material><ambient>0.031 0.031 0.031 1.000</ambient><diffuse>0.031 0.031 0.031 1.000</diffuse><specular>0.2 0.2 0.2 1</specular></material>
             </visual>
         </link>

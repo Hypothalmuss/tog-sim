@@ -79,14 +79,14 @@ class ConveyorTracker(Node):
         for c in msg.candidates:
             p = c.grasp_pose.pose.position
             obs.append(Observation(p.x, p.y, p.z, math.radians(c.yaw_deg), c.class_name, self._t(c.observed),
-                                   vx=c.belt_velocity.x, vy=c.belt_velocity.y, payload=c))
+                                   vx=c.belt_velocity.x, vy=c.belt_velocity.y, payload=c, area=float(c.mask_area_px)))
         with self.lock:
             self.products.update(obs, t_now=self._t(msg.header.stamp))
 
     def on_tray(self, msg):
         p = msg.pose.pose.position
         o = Observation(p.x, p.y, p.z, yaw_of(msg.pose.pose.orientation), "tray", self._t(msg.header.stamp),
-                        vx=msg.velocity.x, vy=msg.velocity.y, key=f"tray{msg.tray_id}", payload=msg)
+                        vx=msg.velocity.x, vy=msg.velocity.y, key=f"tray{msg.tray_id}", payload=msg, area=1.0 if msg.tracked else 0.1)
         with self.lock:
             self.trays.update([o])
 

@@ -76,3 +76,16 @@ def test_predict_drops_tracks_when_the_source_stops():
     tr.update(_frame(0.0, [(0.0, -0.35, 0.0, "product_bar")]))
     assert len(tr.predict(0.5)) == 1
     assert tr.predict(5.0) == []  # no update() calls any more: predict must not extrapolate a dead track for ever
+
+
+def test_occluded_observation_does_not_drag_the_track():
+    tr = BeltTracker()
+    for k in range(5):
+        tr.update([Observation(0.1 * k * 0.1, -0.35, 0.54, 0.0, "product_bar", k * 0.1, vx=0.1, area=1000.0)])
+    # the arm covers half of the product: the visible half's centroid is 3 cm off, the mask area halves
+    (t,) = tr.update([Observation(0.05 + 0.03, -0.35, 0.54, 0.0, "product_bar", 0.5, vx=0.1, area=400.0)])
+    assert abs(t.t - 0.4) < 1e-9  # not fused: the state still refers to the last clean observation
+    (t2,) = tr.predict(0.5)
+    assert abs(t2.x - 0.05) < 0.004, t2.x  # predicted along the belt, not dragged towards the visible half
+    (t3,) = tr.update([Observation(0.06, -0.35, 0.54, 0.0, "product_bar", 0.6, vx=0.1, area=1000.0)])
+    assert abs(t3.x - 0.06) < 0.004  # a clean observation fuses again

@@ -227,6 +227,7 @@ class MotionServer : public rclcpp::Node {
     segScale_ = (s.velocity_scale > 0.0f) ? std::clamp(static_cast<double>(s.velocity_scale), 0.05, 1.0) : 1.0;
     applyLimits();
     dwellUntil_.reset();
+    segStartTime_ = now();
     trackPrevValid_ = false;
     trackVel_.fill(0.0);
     trackErr_ = 1.0;
@@ -367,8 +368,11 @@ class MotionServer : public rclcpp::Node {
         if (actual_[i] < pmin_[i] - 0.02 || actual_[i] > pmax_[i] + 0.02) plausible = false;
       const bool commanded = std::fabs(input_.current_velocity[2]) > 0.03;
       const bool stalled = !haveActualVel_ || std::fabs(actualVel_[2]) < 0.01;
-      jamTicks_ = (plausible && err > tol && commanded && stalled) ? jamTicks_ + 1 : 0;
-      if (jamTicks_ > static_cast<int>(0.15 * rate_)) {
+      // onset grace: for the first 0.25 s of a segment the controller is still catching up with a fast command and the
+      // measured joint legitimately has not moved yet - that is not a jam
+      const bool settledStart = segStarted_ && (now() - segStartTime_).seconds() > 0.25;
+      jamTicks_ = (plausible && err > tol && commanded && stalled && settledStart) ? jamTicks_ + 1 : 0;
+      if (jamTicks_ > static_cast<int>(0.2 * rate_)) {
         jamTicks_ = 0;
         // resync the generator to where the arm really is, then fail the goal
         input_.current_position = actual_;
@@ -395,8 +399,14 @@ class MotionServer : public rclcpp::Node {
     if (goal_ && segStarted_) {
       const auto& s = goal_->get_goal()->segments[segIdx_];
       bool reached = (res == ruckig::Result::Finished);
-      if (!reached && s.type == Segment::TRACK_CART)  // a tracked target is never "finished": settle within tolerance
-        reached = trackPrevValid_ && trackErr_ < trackSettleTol_;
+      if (!reached && s.type == Segment::TRACK_CART) {  // a tracked target is never "finished": settle within tolerance
+        // an intermediate tracked segment (the next one tracks the same frame, e.g. hover before contact) only needs to
+        // be roughly there: the tight tolerance is for the segment that ends on the product / in the pocket
+        const auto& segs = goal_->get_goal()->segments;
+        const bool intermediate = segIdx_ + 1 < segs.size() && segs[segIdx_ + 1].type == Segment::TRACK_CART &&
+                                  segs[segIdx_ + 1].tracked_frame == s.tracked_frame;
+        reached = trackPrevValid_ && trackErr_ < (intermediate ? 3.0 * trackSettleTol_ : trackSettleTol_);
+      }
       if (dwellUntil_) reached = true;  // once dwelling, the dwell expiry alone ends the segment (tracking continues)
       if (reached) {
         if (s.dwell_s > 0.0f && !dwellUntil_) {
@@ -453,6 +463,7 @@ class MotionServer : public rclcpp::Node {
   bool segStarted_{false};
   rclcpp::Time goalStart_;
   std::optional<rclcpp::Time> dwellUntil_;
+  rclcpp::Time segStartTime_;
   bool stopRequested_{false}, manualMove_{false}, lastBusy_{false};
 
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr cmdPub_;

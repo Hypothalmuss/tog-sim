@@ -110,3 +110,19 @@ def test_keyed_outlier_rejected_then_snapped():
     tr.update([Observation(x_pred - 0.055, 0.35, 0.0, 0.0, "tray", t, vx=0.08, key="tray1")])
     (snapped,) = tr.predict(t)
     assert snapped.id == track.id and snapped.n_obs == 1 and abs(snapped.x - (x_pred - 0.055)) < 1e-9
+
+
+def test_settled_track_ignores_yaw_outliers():
+    """A merged/partial mask with the wrong axis must not turn a settled track's heading."""
+    tr = BeltTracker(gate_m=0.06, lost_s=5.0)
+    t = 0.0
+    for _ in range(6):
+        tr.update([Observation(0.1 + 0.08 * t, 0.3, 0.0, 0.0, "carton", t, vx=0.08)])
+        t += 0.1
+    tr.update([Observation(0.1 + 0.08 * t, 0.3, 0.0, math.radians(60.0), "carton", t, vx=0.08)])
+    (track,) = tr.predict(t)
+    assert abs(track.yaw) < math.radians(1.0)
+    # small corrections still fuse
+    tr.update([Observation(0.1 + 0.08 * (t + 0.1), 0.3, 0.0, math.radians(5.0), "carton", t + 0.1, vx=0.08)])
+    (track,) = tr.predict(t + 0.1)
+    assert math.radians(1.0) < track.yaw < math.radians(5.0)

@@ -91,6 +91,7 @@ class RunCycle(Node):
         self.declare_parameter("pick_x_min", 0.10)
         self.declare_parameter("pick_x_max", 0.50)
         self.declare_parameter("hover", 0.03)
+        self.declare_parameter("seal_timeout_s", 2.5)
         self.declare_parameter("belt_speed", 0.10)
         # waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for every |y| < 1.1, so anywhere else within
         # reach the arm hides products (bar recall 0.5-0.64 with the arm parked over the belt)
@@ -365,6 +366,7 @@ class RunCycle(Node):
             0.8, float(self.get_parameter("track_dwell_s").value) * 3.0
         )  # the place goal preempts on seal
         contact = float(self.get_parameter("contact_offset_m").value)
+        seal_timeout = float(self.get_parameter("seal_timeout_s").value)
         fits = PRODUCT_FITS[self.tray.name]
         park = [float(v) for v in self.get_parameter("park").value]
         done, attempts = 0, 0
@@ -449,7 +451,9 @@ class RunCycle(Node):
                 continue
             rf = gh.get_result_async()
             sealed = False
-            t_deadline = time.monotonic() + 12.0
+            # a contact that does not seal within a couple of seconds never will (cup on a seam, pushed product):
+            # give the product up instead of riding it down the belt
+            t_deadline = time.monotonic() + seal_timeout
             while time.monotonic() < t_deadline:
                 with self.lock:
                     if ev["vac_on"] and self.vac_sealed and self.vac_t > ev["vac_on"]:
@@ -460,8 +464,28 @@ class RunCycle(Node):
             t_sealed = time.monotonic()
             if not sealed:
                 ok, msg = (rf.result().result.success, rf.result().result.message) if rf.done() else (False, "no seal")
+                # diagnostic (GT): was the estimate wrong (top height, position) or the product unpickable?
+                with self.lock:
+                    gt = dict(self.gt)
+                xe = c.x + c.vx * (t_sealed - tc)
+                near = min(
+                    (
+                        (math.hypot(g[0][0] - xe, g[0][1] - c.y), n, g)
+                        for n, g in gt.items()
+                        if n.startswith("product_")
+                    ),
+                    default=None,
+                )
+                why = ""
+                if near is not None:
+                    d, n, g = near
+                    hgt = PRODUCT_HEIGHT.get("product_" + n.split("_")[1], 0.0)
+                    why = (
+                        f"; nearest GT {n} {1e3 * d:.0f} mm from the estimate, top est {1e3 * c.top:.1f} vs GT"
+                        f" {1e3 * (g[0][2] + hgt):.1f} mm, tilt {math.degrees(g[2]):.0f} deg"
+                    )
                 self.get_logger().warn(
-                    f"pick {c.key} failed: {msg} ({t_sealed - tc:.2f} s after start, x_arrive {x_arrive:.3f}, y {c.y:.3f})"
+                    f"pick {c.key} failed: {msg} ({t_sealed - tc:.2f} s after start, x_arrive {x_arrive:.3f}, y {c.y:.3f}){why}"
                 )
                 blacklist[c.key] = time.monotonic() + 15.0
                 self.vacuum_cmd(False)
@@ -690,7 +714,15 @@ class RunCycle(Node):
             px, py, _ = self.tray.pocket_world((tray.x + tray.vx * lead, tray.y, tray.z), tray.yaw, i)
             # comfortably inside the arc: not at the reach limit, not folded against the base, now and when the cup arrives
             px0, py0, _ = self.tray.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
-            if reachable(px, py) and -0.20 < px < 0.45 and math.hypot(px, py) > 0.30 and math.hypot(px0, py0) > 0.30:
+            # ... and a second later: settling the heading can make the place outlast the lead
+            px1, py1, _ = self.tray.pocket_world((tray.x + tray.vx * (lead + 1.0), tray.y, tray.z), tray.yaw, i)
+            if (
+                reachable(px, py)
+                and reachable(px1, py1)
+                and -0.20 < px < 0.45
+                and math.hypot(px, py) > 0.30
+                and math.hypot(px0, py0) > 0.30
+            ):
                 return i
         return None
 

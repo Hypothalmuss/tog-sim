@@ -65,6 +65,7 @@ class BeltTracker:
         vel_alpha: float = 0.3,
         mature_alpha: float | None = None,
         key_gate_factor: float = 0.5,
+        yaw_gate: float = math.radians(15.0),
         yaw_period: float = math.pi,
         estimate_velocity: bool = True,
         min_obs_velocity: int = 3,
@@ -79,6 +80,9 @@ class BeltTracker:
         # keyed observations farther than key_gate_factor * gate from a settled track's prediction are outliers (a belt
         # track predicts to a few mm); after three in a row the track snaps to the observations (same id, fresh state)
         self.key_gate_factor = key_gate_factor
+        # a settled track ignores heading observations that disagree by more than this (a merged or partially hidden
+        # mask has the wrong axis); the cup seals on whatever heading the frame has at contact
+        self.yaw_gate = yaw_gate
         self.vel_alpha = vel_alpha  # weight of the measured velocity in the velocity update
         self.yaw_period = yaw_period
         self.estimate_velocity = estimate_velocity
@@ -191,7 +195,10 @@ class BeltTracker:
         tr.x = (1 - a) * px + a * o.x
         tr.y = (1 - a) * py + a * o.y
         tr.z = (1 - a) * tr.z + a * o.z
-        tr.yaw = tr.yaw + a * _wrap(o.yaw - tr.yaw, tr.yaw_period)
+        dyaw = _wrap(o.yaw - tr.yaw, tr.yaw_period)
+        if tr.n_obs >= 5 and abs(dyaw) > self.yaw_gate:
+            dyaw = 0.0
+        tr.yaw = tr.yaw + a * dyaw
         tr.t = o.t
         tr.n_obs += 1
         tr.payload = o.payload

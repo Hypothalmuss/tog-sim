@@ -41,6 +41,9 @@ CLASS_TO_PRODUCT = {"bar": "product_bar", "carton": "product_carton"}
 # long/short side ratio of a clean mask per class (bar ~150x25 mm, carton 70x50 mm); a mask far from it is occluded,
 # merged with a neighbour or cut - its axis (and centre) cannot be trusted for a pick
 CLASS_ASPECT = {"bar": (3.0, 9.0), "carton": (1.15, 1.75)}
+# top-face area (m^2): two cartons side by side merge into one near-square mask that passes the aspect gate, with the
+# axis 90 deg off and the suction point on the seam
+CLASS_AREA = {"bar": 0.168 * 0.042, "carton": 0.07 * 0.05}
 
 
 class PickPoseNode(Node):
@@ -220,7 +223,10 @@ class PickPoseNode(Node):
             c.mask_area_px = float(mask.sum())
             lo, hi = CLASS_ASPECT.get(cls, (0.0, 99.0))
             aspect = long_px / max(short_px, 1.0)
-            c.occluded = bool(occluded) or tilt > self.max_tilt or not (lo <= aspect <= hi)
+            area_ratio = float(mask.sum()) * gsd * gsd / CLASS_AREA.get(cls, 1e9)
+            c.occluded = (
+                bool(occluded) or tilt > self.max_tilt or not (lo <= aspect <= hi) or not (0.5 <= area_ratio <= 1.4)
+            )
             c.belt_velocity.x = float(self.belt_v)
             c.observed = header.stamp
             cands.append(c)

@@ -447,7 +447,8 @@ class MotionServer : public rclcpp::Node {
                                   segs[segIdx_ + 1].tracked_frame == s.tracked_frame;
         // position and heading: releasing or sealing while J4 is still turning puts the product down rotated
         const double k = intermediate ? 3.0 : 1.0;
-        reached = trackPrevValid_ && trackErr_ < k * trackSettleTol_ && trackYawErr_ < k * trackYawTol_;
+        const double tol = s.settle_tolerance_m > 0.0f ? s.settle_tolerance_m : trackSettleTol_;
+        reached = trackPrevValid_ && trackErr_ < k * tol && trackYawErr_ < k * trackYawTol_;
       }
       if (dwellUntil_) reached = true;  // once dwelling, the dwell expiry alone ends the segment (tracking continues)
       if (reached && s.type == Segment::TRACK_CART && !dwellUntil_)

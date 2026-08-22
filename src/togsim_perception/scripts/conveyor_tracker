@@ -68,8 +68,14 @@ class ConveyorTracker(Node):
         # and single observations barely move it (an arm-shadowed mask accepted just before the under-arm gate
         # shifted frames by 5-10 mm); products keep the normal weight (they are tracked for a second or two)
         self.trays = BeltTracker(
-            gate_m=gate, lost_s=tray_lost, yaw_period=math.pi, mature_alpha=0.05, lateral_alpha_mature=0.05
-        )  # the pocket grid is 180 deg symmetric
+            gate_m=gate,
+            lost_s=tray_lost,
+            yaw_period=math.pi,
+            mature_alpha=mature,
+            lateral_alpha_mature=0.05,
+            settled_alpha=0.05,
+            settled_after=20,
+        )  # the pocket grid is 180 deg symmetric; 0.6 -> 0.25 -> 0.05 over the first two seconds in view
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
         self.lock = threading.Lock()
@@ -280,8 +286,8 @@ class ConveyorTracker(Node):
             self._pub_counts = {}
         for tr in trays:
             tfs.append(self._tf(now, f"tray_{tr.id}", tr.x, tr.y, tr.z, tr.yaw))
-            if tr.n_obs < 8 and self.source != "gt":
-                continue  # not placeable yet: still converging from the biased first observation at the view entry
+            if tr.n_obs < 10 and self.source != "gt":
+                continue  # not placeable yet: still converging from the lagging first observations at the view entry
             m = TrayState()
             if isinstance(tr.payload, TrayState):
                 m.occupied, m.confidence, m.tracked = tr.payload.occupied, tr.payload.confidence, tr.payload.tracked

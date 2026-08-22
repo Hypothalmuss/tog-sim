@@ -44,9 +44,10 @@ def tilt_of(q):
     return math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (q.x * q.x + q.y * q.y))))
 
 
-def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0, frame="world", tracked=""):
+def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0, frame="world", tracked="", settle=0.0):
     s = MotionSegment()
     s.type = type_
+    s.settle_tolerance_m = float(settle)  # TRACK_CART: 0 = the motion server's default
     s.pose = PoseStamped()
     s.pose.header.frame_id = tracked or frame  # TRACK_CART: the pose lives in the moving frame
     s.pose.pose.position.x, s.pose.pose.position.y, s.pose.pose.position.z = float(x), float(y), float(z)
@@ -498,7 +499,7 @@ class RunCycle(Node):
             attempts += 1
             parked = False
             frame = f"prod_{c.tid}"
-            lift = [seg(MotionSegment.PTP_CART, 0.0, 0.0, 0.04, 0.0, frame="tcp")] if self.in_pocket else []
+            lift = self.joint_lift(0.04) if self.in_pocket else []
             n_pick = 3 + len(lift)
             ev = {"contact": None, "vac_on": None, "contact_gt": None}
 
@@ -536,7 +537,9 @@ class RunCycle(Node):
             pick = lift + [
                 seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, yaw_pick, via_speed=0.4),
                 seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, c.bp, tracked=frame),
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, c.bp, dwell=seal_budget, tracked=frame),
+                # the pick contact may settle loosely: the grasp offset is measured at the seal and compensated at the
+                # place, where the tight tolerance matters
+                seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, c.bp, dwell=seal_budget, tracked=frame, settle=0.005),
             ]
             self.in_pocket = False
             gh = self.send_goal(pick, f"pick {c.key}", on_feedback=on_fb_pick)
@@ -657,8 +660,8 @@ class RunCycle(Node):
                 for t in self.trays():
                     if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
                         continue
-                    pk = self.free_pocket_moving(t, place_lead, margin=0.0)
-                    if pk is not None:
+                    pk = self.free_pocket_moving(t, place_lead, margin=0.3)  # a pocket at the edge ends the place
+                    if pk is not None:  # where the lift cannot be solved
                         px, py, _ = self.tray.pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
                         fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
             if fresh:
@@ -787,6 +790,21 @@ class RunCycle(Node):
             self.get_logger().info("timeline means " + " ".join(f"{k} {v:.2f}" for k, v in means.items()))
 
     # ---------------- placement accuracy (ground truth, metric only) ----------------
+    def joint_lift(self, dz):
+        """A straight lift as a joint-space PTP (J3 + dz): always solvable, even when the place tracked a pocket to the
+        edge of the workspace where a Cartesian lift at the current xy has no IK solution."""
+        with self.lock:
+            js = dict(self.joints)
+        names = ("j1_joint", "j2_joint", "j3_joint", "j4_joint", "tilt_joint")
+        q = [next((v for n, v in js.items() if n.endswith(nm)), None) for nm in names]
+        if any(v is None for v in q):
+            return [seg(MotionSegment.PTP_CART, 0.0, 0.0, dz, 0.0, frame="tcp")]
+        s = MotionSegment()
+        s.type = MotionSegment.PTP_JOINT
+        q[2] = min(0.0, q[2] + dz)
+        s.joint_target = [float(v) for v in q]
+        return [s]
+
     def fk_xy(self):
         """Planar FK of the measured joints (l1 0.40, l2 0.25; base at the world origin; matches the GT cup to 1 mm)."""
         with self.lock:

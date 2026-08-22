@@ -11,3 +11,4 @@ float32 via_speed_mps              # VIA_CART only: velocity magnitude carried t
 string tracked_frame               # TRACK_CART only
 float32 dwell_s
 float32 velocity_scale             # 0..1 (multiplied with global speed override), 0 = use 1.0
+float32 settle_tolerance_m         # TRACK_CART only: Cartesian settle tolerance on the measured arm, 0 = server default

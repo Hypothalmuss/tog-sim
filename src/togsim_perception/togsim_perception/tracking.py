@@ -67,6 +67,8 @@ class BeltTracker:
         key_gate_factor: float = 0.5,
         yaw_gate: float = math.radians(15.0),
         lateral_alpha_mature: float | None = None,
+        settled_alpha: float | None = None,
+        settled_after: int = 20,
         yaw_period: float = math.pi,
         estimate_velocity: bool = True,
         min_obs_velocity: int = 3,
@@ -87,6 +89,11 @@ class BeltTracker:
         # objects on a belt do not move sideways or turn: once a track is settled its y and heading fuse with this
         # small weight (None = same as the position weight), so an arm-shadowed mask cannot shift the frame laterally
         self.lateral_alpha_mature = lateral_alpha_mature
+        # third stage: after settled_after observations the track is dead-reckoned on the belt model and single
+        # observations barely move it (None = keep mature_alpha). Starting this too early froze in the lag a track
+        # still carries from the lagging first frames at the view entry.
+        self.settled_alpha = settled_alpha
+        self.settled_after = settled_after
         # objects slip on the belt: the measured speed of all settled tracks (robust, shared) refines the encoder prior.
         # A per-track estimate from a few biased observations is worse than the prior; a shared one is better than both.
         self.belt_vx: float | None = None
@@ -203,8 +210,10 @@ class BeltTracker:
         # converge fast from the (biased) first observations of an object entering the view, then trust single
         # observations less
         a = self.pos_alpha if tr.n_obs < 10 else self.mature_alpha
+        if self.settled_alpha is not None and tr.n_obs >= self.settled_after:
+            a = self.settled_alpha
         tr.outliers = 0
-        al = a if (self.lateral_alpha_mature is None or tr.n_obs < 10) else self.lateral_alpha_mature
+        al = a if (self.lateral_alpha_mature is None or tr.n_obs < self.settled_after) else self.lateral_alpha_mature
         tr.x = (1 - a) * px + a * o.x
         tr.y = (1 - al) * py + al * o.y
         tr.z = (1 - a) * tr.z + a * o.z

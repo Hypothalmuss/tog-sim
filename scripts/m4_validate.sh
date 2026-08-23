@@ -15,7 +15,7 @@ echo "[m4] launching cell (headless, products on) -> $out"
 launch_cell() {  # Fortress occasionally hangs at robot spawn (controller_manager never appears): relaunch once
   for attempt in 1 2; do
     cleanup
-    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=$speed product_rate:=${M4_RATE:-24.0} ${M4_TRAYS:+tray_models:=$M4_TRAYS} product_classes:=${M4_CLASSES:-product_bar,product_carton} motion_profile:=${M4_PROFILE:-smooth} spawn_seed:=${M4_SEED:-0} >"$out/sim$attempt.log" 2>&1 </dev/null &
+    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=${M4_OUTFEED:-$speed} product_rate:=${M4_RATE:-24.0} ${M4_TRAYS:+tray_models:=$M4_TRAYS} product_classes:=${M4_CLASSES:-product_bar,product_carton} motion_profile:=${M4_PROFILE:-smooth} spawn_seed:=${M4_SEED:-0} >"$out/sim$attempt.log" 2>&1 </dev/null &
     wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || continue
     wait_for 60 timeout 3 ros2 topic echo --once /joint_states --field header && return 0
     echo "[m4] simulator hung at start-up (no joint states), relaunching"
@@ -33,6 +33,6 @@ setsid ros2 run togsim_perception conveyor_tracker --ros-args -p use_sim_time:=t
 wait_for 60 timeout 3 ros2 topic echo --once /togsim/tracks/products --field frame_seq || { echo "[m4] no tracks"; exit 1; }
 sleep ${M4_WARMUP:-20}
 echo "[m4] run_cycle continuous perception:=$mode cycles:=$cycles belt $speed m/s"
-timeout ${M4_TIMEOUT:-900} ros2 run togsim_task run_cycle --ros-args -p perception:=$mode -p continuous:=true -p cycles:="$cycles" -p belt_speed:=$speed -p use_sim_time:=true >"$out/run_cycle.log" 2>&1
+timeout ${M4_TIMEOUT:-900} ros2 run togsim_task run_cycle --ros-args -p perception:=$mode -p continuous:=true -p cycles:="$cycles" -p belt_speed:=$speed -p outfeed_speed:=${M4_OUTFEED:-0.0} -p use_sim_time:=true >"$out/run_cycle.log" 2>&1
 grep -E "cycle [0-9]+:|finished|no seal|failed|jam" "$out/run_cycle.log" | tail -8
 echo "[m4] done -> $out"

@@ -95,6 +95,7 @@ class RunCycle(Node):
         self.declare_parameter("pick_x_max", 0.50)
         self.declare_parameter("hover", 0.03)
         self.declare_parameter("seal_timeout_s", 2.5)
+        self.declare_parameter("outfeed_speed", 0.0)  # 0 = same as belt_speed
         self.declare_parameter("belt_speed", 0.10)
         # waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for every |y| < 1.1, so anywhere else within
         # reach the arm hides products (bar recall 0.5-0.64 with the arm parked over the belt)
@@ -292,9 +293,11 @@ class RunCycle(Node):
 
     # ---------------- actuation helpers ----------------
     def belts(self, speed):
+        out = float(self.get_parameter("outfeed_speed").value)
+        out = out if out > 0.0 else float(speed)  # a slower outfeed widens each tray's placeable window
         for _ in range(2):
             self.infeed.publish(Float64(data=float(speed)))
-            self.outfeed.publish(Float64(data=float(speed)))
+            self.outfeed.publish(Float64(data=out))
             time.sleep(0.05)
 
     def wait_belts_stopped(self, timeout=2.0):

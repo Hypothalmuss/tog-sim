@@ -78,6 +78,7 @@ Placement = released product vs the centre of the pocket it sits in (ground trut
 |---|---|---|---|---|---|
 | cartons only, 60/min, `fast` profile, belts 0.10 m/s | 20/20, 20/21 | 10–14 | 4–6 mm | 5–12 mm | ~2° |
 | bars + cartons, 24/min, `smooth` profile | 20/21, 20/24 | 5–6 (carton arrivals 12/min) | 5–6 mm | 6–20 mm | 2–3° |
+| cartons only, 60/min, `fast`, **outfeed 0.06 m/s** (`M4_OUTFEED=0.06`, `outfeed_speed` param) | 20/22, 20/20 | 10–14.5 | 2.4–3.3 mm | 6.7–6.9 mm | 1–2° |
 
 Motion profiles (`motion_profile:=fast|smooth`, `scripts/joint_metrics.py` samples `/joint_states`, cartons 60/min):
 
@@ -89,8 +90,9 @@ Motion profiles (`motion_profile:=fast|smooth`, `scripts/joint_metrics.py` sampl
 What made the difference (details in the commit log): tracked segments settle on the *measured* arm including the
 heading, the place approach clears the pocket walls, the grasp offset is measured at the seal and compensated at the
 place, tray tracks are dead-reckoned on a shared belt-speed estimate (objects slip ~10 % on the belts) and observations
-taken while the arm is over a tray are ignored. Throughput is now bounded by the tray window: a tray is placeable for
-~3 s of its passage at 0.10 m/s, so cycles of ~3 s allow one or two placements per tray.
+taken while the arm is over a tray are ignored. Throughput is bounded by the tray window: a tray is placeable for
+~3 s of its passage at 0.10 m/s, so cycles of ~3 s allow one or two placements per tray; a slower outfeed (0.06 m/s)
+widens the window and also improves precision (last row).
 
 Several tray models can share the outfeed (`tray_models:=tray_2x4,tray_bar_2x3` on `sim_full.launch.py` and
 `perception.launch.py`): the vacancy node picks the spec per mask from the pocket size and `run_cycle` places each

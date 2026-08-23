@@ -15,7 +15,7 @@ echo "[m4] launching cell (headless, products on) -> $out"
 launch_cell() {  # Fortress occasionally hangs at robot spawn (controller_manager never appears): relaunch once
   for attempt in 1 2; do
     cleanup
-    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=${M4_OUTFEED:-$speed} product_rate:=${M4_RATE:-24.0} ${M4_TRAYS:+tray_models:=$M4_TRAYS} product_classes:=${M4_CLASSES:-product_bar,product_carton} motion_profile:=${M4_PROFILE:-smooth} spawn_seed:=${M4_SEED:-0} >"$out/sim$attempt.log" 2>&1 </dev/null &
+    setsid ros2 launch togsim_bringup sim_full.launch.py gui:=false infeed_speed:=$speed outfeed_speed:=${M4_OUTFEED:-$speed} product_rate:=${M4_RATE:-24.0} ${M4_TRAYS:+tray_models:=$M4_TRAYS} ${M4_PITCH:+tray_pitch:=$M4_PITCH} product_classes:=${M4_CLASSES:-product_bar,product_carton} motion_profile:=${M4_PROFILE:-smooth} spawn_seed:=${M4_SEED:-0} >"$out/sim$attempt.log" 2>&1 </dev/null &
     wait_for 150 bash -c "ros2 action list | grep -q /togsim/execute_motion" || continue
     wait_for 60 timeout 3 ros2 topic echo --once /joint_states --field header && return 0
     echo "[m4] simulator hung at start-up (no joint states), relaunching"
@@ -29,7 +29,7 @@ if [ "$mode" = vision ]; then
   wait_for 90 timeout 3 ros2 topic echo --once /togsim/pick_candidates --field frame_seq || { echo "[m4] no pick candidates"; exit 1; }
 fi
 echo "[m4] conveyor_tracker source=$mode"
-setsid ros2 run togsim_perception conveyor_tracker --ros-args -p use_sim_time:=true -p source:=$mode >"$out/tracker.log" 2>&1 </dev/null &
+setsid ros2 run togsim_perception conveyor_tracker --ros-args --params-file "$(ros2 pkg prefix togsim_perception)/share/togsim_perception/config/perception_tuning.yaml" -p use_sim_time:=true -p source:=$mode >"$out/tracker.log" 2>&1 </dev/null &
 wait_for 60 timeout 3 ros2 topic echo --once /togsim/tracks/products --field frame_seq || { echo "[m4] no tracks"; exit 1; }
 sleep ${M4_WARMUP:-20}
 echo "[m4] run_cycle continuous perception:=$mode cycles:=$cycles belt $speed m/s"

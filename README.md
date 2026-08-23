@@ -72,8 +72,17 @@ activates it when present and the nodes pick CUDA automatically (`device:=auto`)
 ## Benchmarks
 
 `scripts/bench.sh <name> [repeats] [cycles] [vision|gt]` runs seeded repeats of `scripts/m4_validate.sh` and writes one JSON
-per run (cycles, attempts, cpm, motion time, placement mean/p95 from ground truth, per-phase timeline, failures).
-Placement = released product vs the centre of the pocket it sits in (ground truth); the pocket clearance is 5 mm per side.
+per run (cycles, attempts, cpm, motion time, placement mean/p95 from ground truth, per-phase timeline, failures);
+`scripts/bench_report.py <name> ...` aggregates them with 95 % confidence intervals into
+[docs/benchmarks.md](docs/benchmarks.md) (Wilson for success, bootstrap over cycles for picks/min and over placed
+products for placement). Placement = released product vs the centre of the pocket it sits in (ground truth); the pocket
+clearance is 5 mm per side. The tuned perception gates live in
+[`src/togsim_perception/config/perception_tuning.yaml`](src/togsim_perception/config/perception_tuning.yaml) with
+their rationale; `run_cycle` keeps all ground-truth evaluation in `togsim_task/diagnostics.py` (`eval:=false` for a plain
+demo), and the scheduling rules in `togsim_task/scheduler.py` (unit-tested).
+
+**Reference (3×40 cycles, cartons 60/min, `fast`, outfeed 0.06 m/s): 120/120 = 100 % [97–100], 13.4 [12.2–14.7]
+picks/min, placement 2.7 [2.4–3.0] mm mean, 5.8 [4.8–7.1] mm p95** — see the report for every configuration.
 
 | scenario (vision) | success | cpm | placement mean | p95 | yaw |
 |---|---|---|---|---|---|

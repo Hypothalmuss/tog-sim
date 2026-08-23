@@ -1,3 +1,6 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -28,7 +31,11 @@ def generate_launch_description():
                 package="togsim_perception",
                 executable="tray_vacancy_node",
                 output="screen",
-                parameters=[sim, {"tray_models_csv": LaunchConfiguration("tray_models")}],
+                parameters=[
+                    os.path.join(get_package_share_directory("togsim_perception"), "config", "perception_tuning.yaml"),
+                    sim,
+                    {"tray_models_csv": LaunchConfiguration("tray_models")},
+                ],
             ),
         ]
     )

@@ -47,6 +47,21 @@ class TrayVacancyNode(Node):
         self.declare_parameter("hfov_rad", 1.2043)  # D435 RGB, must match the world SDF
         self.declare_parameter("tray_model", "tray_2x4")
         self.declare_parameter("tray_models_csv", "")  # several tray models in the cell: chosen per mask by size
+        # tuned gates (documented in config/perception_tuning.yaml)
+        for name, default in (
+            ("visibility_min", 0.95),
+            ("lattice_gate_m", 0.035),
+            ("lattice_min_fit", 5),
+            ("lattice_rms_max", 0.006),
+            ("id_gate_x_m", 0.08),
+            ("id_gate_y_m", 0.025),
+            ("floor_band_m", 0.004),
+            ("blob_min_px", 120),
+        ):
+            self.declare_parameter(name, default)
+        self.tune = {n: self.get_parameter(n).value for n in (
+            "visibility_min", "lattice_gate_m", "lattice_min_fit", "lattice_rms_max", "id_gate_x_m", "id_gate_y_m",
+            "floor_band_m", "blob_min_px")}
         self.declare_parameter("coverage_threshold", 0.30)
         self.declare_parameter("depth_rise_m", 0.008)
         self.declare_parameter("belt_z", 0.52)
@@ -151,7 +166,7 @@ class TrayVacancyNode(Node):
             dt = max(0.0, stamp_s - tr[3])
             px = tr[1] + self.belt_v * dt
             # trays move along the belt only: a lateral mismatch is another tray (they can sit at different y)
-            if abs(px - x) < 0.08 and abs(tr[2] - y) < 0.025:
+            if abs(px - x) < self.tune["id_gate_x_m"] and abs(tr[2] - y) < self.tune["id_gate_y_m"]:
                 if assign:
                     tr[1], tr[2], tr[3] = x, y, stamp_s
                 return tr[0]
@@ -211,11 +226,11 @@ class TrayVacancyNode(Node):
             # pocket floors: blobs at the floor depth separated by the (closer) walls. Computed before the spec choice
             # because the pocket size tells the tray model apart even on a partial mask (a 620 mm bar tray is never
             # fully in view and its visible part has the extents of the carton tray)
-            floor_band = floor_px & np.isfinite(depth) & (np.abs(depth - z_floor) < 0.004)
+            floor_band = floor_px & np.isfinite(depth) & (np.abs(depth - z_floor) < self.tune["floor_band_m"])
             n_cc, _labels, stats, cents = cv2.connectedComponentsWithStats(floor_band.astype(np.uint8), connectivity=4)
             blobs, blob_len = [], []
             for k in range(1, n_cc):
-                if stats[k, cv2.CC_STAT_AREA] >= 120:
+                if stats[k, cv2.CC_STAT_AREA] >= self.tune["blob_min_px"]:
                     pw = transform_points(
                         pixel_to_point(cents[k][0], cents[k][1], z_floor, self.k)[None, :], rot, trans
                     )[0]
@@ -233,7 +248,7 @@ class TrayVacancyNode(Node):
                 )
             expected_px = (sp["total"][0] * sp["total"][1]) / (gsd * gsd)
             # 95 %: at 80 % visible the centroid of the visible part is already ~35 mm off the tray centre
-            full = (not partial) and (m | product_mask).sum() >= 0.95 * expected_px
+            full = (not partial) and (m | product_mask).sum() >= self.tune["visibility_min"] * expected_px
             if not full:
                 continue
             p_cam = pixel_to_point(cu, cv_, z_floor, self.k)
@@ -253,7 +268,12 @@ class TrayVacancyNode(Node):
             fx, fy, fyaw, n_fit, rms_fit = fit_pocket_lattice(blobs, sp["pocket_offsets"], (p_w[0], p_w[1]), yaw)
             # the lattice is periodic: a fit shifted by a pitch looks just as good, so the mask pose anchors it - accept
             # only a small correction of a fully visible tray with most pockets matched
-            if not partial and n_fit >= 5 and rms_fit < 0.006 and math.hypot(fx - p_w[0], fy - p_w[1]) < 0.035:
+            if (
+                not partial
+                and n_fit >= self.tune["lattice_min_fit"]
+                and rms_fit < self.tune["lattice_rms_max"]
+                and math.hypot(fx - p_w[0], fy - p_w[1]) < self.tune["lattice_gate_m"]
+            ):
                 # apply the correction through a per-track EMA so the pose does not jump between frames where the fit is
                 # accepted and frames where it is not (jumps spawn new track ids and break the tray_<id> frame mid-place)
                 key = self.track_id(p_w[0], p_w[1], stamp_s, assign=False)

@@ -12,7 +12,7 @@ def generate_launch_description():
     profile = PathJoinSubstitution([share, "config", ["profile_", LaunchConfiguration("profile"), ".yaml"]])
     return LaunchDescription(
         [
-            DeclareLaunchArgument("profile", default_value="smooth", description="motion profile: smooth | fast"),
+            DeclareLaunchArgument("profile", default_value="smooth", description="motion profile: smooth | fast | max"),
             Node(
                 package="togsim_motion",
                 executable="motion_server",

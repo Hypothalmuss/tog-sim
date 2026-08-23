@@ -140,6 +140,7 @@ def generate_launch_description():
                 "products.max_alive": LaunchConfiguration("max_products"),
                 "products.classes_csv": LaunchConfiguration("product_classes"),
                 "trays.models_csv": LaunchConfiguration("tray_models"),
+                "trays.pitch": LaunchConfiguration("tray_pitch"),
                 "seed": LaunchConfiguration("spawn_seed"),
             },
         ],
@@ -217,6 +218,7 @@ def generate_launch_description():
                 default_value="",
                 description="csv of tray models spawned in turn, e.g. tray_2x4,tray_bar_2x3",
             ),
+            DeclareLaunchArgument("tray_pitch", default_value="0.55", description="distance between spawned trays, m"),
             DeclareLaunchArgument(
                 "spawn_seed", default_value="0", description="random seed of the product/tray spawner"
             ),

@@ -1,0 +1,7 @@
+# "max" profile: accelerations/jerks the GX8 class of SCARA actually uses (a 25/305/25 mm cycle in 0.32 s implies
+# joint accelerations well above 100 rad/s^2). Velocities stay at the datasheet values (motion.yaml). For the
+# throughput benchmarks; the demo profile is "smooth".
+motion_server:
+  ros__parameters:
+    max_acceleration: [80.0, 100.0, 30.0, 300.0, 120.0]
+    max_jerk:         [800.0, 1000.0, 300.0, 3000.0, 1200.0]

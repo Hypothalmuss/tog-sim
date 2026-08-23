@@ -34,8 +34,20 @@ PRODUCT_H = {"product_bar": 0.0186, "product_carton": 0.025}
 
 
 def q_from_rpy(r, p, y):
-    cy, sy, cp, sp, cr, sr = math.cos(y / 2), math.sin(y / 2), math.cos(p / 2), math.sin(p / 2), math.cos(r / 2), math.sin(r / 2)
-    return (sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy)
+    cy, sy, cp, sp, cr, sr = (
+        math.cos(y / 2),
+        math.sin(y / 2),
+        math.cos(p / 2),
+        math.sin(p / 2),
+        math.cos(r / 2),
+        math.sin(r / 2),
+    )
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
 
 
 class DataGen(Node):
@@ -63,7 +75,9 @@ class DataGen(Node):
         for cam in self.cams:
             self.create_subscription(Image, f"/{cam}/image", self._cb(cam, "rgb"), 2)
             self.create_subscription(Image, f"/{cam}/segmentation/labels_map", self._cb(cam, "labels"), 2)
-        self.belt_pubs = [self.create_publisher(Float64, f"/togsim/conveyor/{b}/cmd_vel", 10) for b in ("infeed", "outfeed")]
+        self.belt_pubs = [
+            self.create_publisher(Float64, f"/togsim/conveyor/{b}/cmd_vel", 10) for b in ("infeed", "outfeed")
+        ]
         self.client = IgnClient(self, WORLD)
         if not self.client.wait(60.0):
             raise SystemExit("ign_service_bridge not available (launch the cell with sim.launch.py)")
@@ -79,7 +93,11 @@ class DataGen(Node):
         """Index after the last scene that has an image for every camera (incomplete scenes are redone)."""
         done = None
         for cam in self.cams:
-            idx = {int(m.group(1)) for f in os.listdir(os.path.join(self.out, "images")) if (m := re.fullmatch(rf"{cam}_(\d+)\.png", f))}
+            idx = {
+                int(m.group(1))
+                for f in os.listdir(os.path.join(self.out, "images"))
+                if (m := re.fullmatch(rf"{cam}_(\d+)\.png", f))
+            }
             done = idx if done is None else done & idx
         return (max(done) + 1) if done else 0
 
@@ -89,6 +107,7 @@ class DataGen(Node):
             img = self.br.imgmsg_to_cv2(m, "rgb8")
             with self.lock:
                 self.latest[(cam, kind)] = (stamp, img)
+
         return f
 
     # ---------------- gazebo helpers ----------------
@@ -102,8 +121,10 @@ class DataGen(Node):
 
     def spawn(self, model, name, x, y, z, roll=0.0, pitch=0.0, yaw=0.0):
         qx, qy, qz, qw = q_from_rpy(roll, pitch, yaw)
-        req = (f'sdf_filename: "model://{model}", name: "{name}", allow_renaming: false, '
-               f"pose: {{position: {{x: {x:.4f}, y: {y:.4f}, z: {z:.4f}}}, orientation: {{x: {qx:.5f}, y: {qy:.5f}, z: {qz:.5f}, w: {qw:.5f}}}}}")
+        req = (
+            f'sdf_filename: "model://{model}", name: "{name}", allow_renaming: false, '
+            f"pose: {{position: {{x: {x:.4f}, y: {y:.4f}, z: {z:.4f}}}, orientation: {{x: {qx:.5f}, y: {qy:.5f}, z: {qz:.5f}, w: {qw:.5f}}}}}"
+        )
         if self.ign(f"/world/{WORLD}/create", "ignition.msgs.EntityFactory", req):
             self.spawned.append(name)
 
@@ -141,18 +162,24 @@ class DataGen(Node):
         d = [0.9] * 3 if default else [random.uniform(0.55, 1.2) * random.uniform(0.92, 1.0) for _ in range(3)]
         dx, dy = (-0.3, 0.2) if default else (random.uniform(-0.6, 0.6), random.uniform(-0.6, 0.6))
         shadows = "true" if default or random.random() < 0.7 else "false"
-        self.ign(f"/world/{WORLD}/light_config", "ignition.msgs.Light",
-                 f'name: "sun", type: DIRECTIONAL, diffuse: {{r: {d[0]:.2f}, g: {d[1]:.2f}, b: {d[2]:.2f}, a: 1}}, '
-                 f"specular: {{r: 0.2, g: 0.2, b: 0.2, a: 1}}, direction: {{x: {dx:.2f}, y: {dy:.2f}, z: -0.9}}, "
-                 f"cast_shadows: {shadows}, intensity: 1.0")
+        self.ign(
+            f"/world/{WORLD}/light_config",
+            "ignition.msgs.Light",
+            f'name: "sun", type: DIRECTIONAL, diffuse: {{r: {d[0]:.2f}, g: {d[1]:.2f}, b: {d[2]:.2f}, a: 1}}, '
+            f"specular: {{r: 0.2, g: 0.2, b: 0.2, a: 1}}, direction: {{x: {dx:.2f}, y: {dy:.2f}, z: -0.9}}, "
+            f"cast_shadows: {shadows}, intensity: 1.0",
+        )
         for lamp, (x, y) in (("lamp_pick", (0.35, -0.35)), ("lamp_place", (0.35, 0.35))):
             i = 0.6 if default else random.uniform(0.25, 1.0)
             g, b = (1.0, 1.0) if default else (random.uniform(0.85, 1.0), random.uniform(0.8, 1.0))
-            self.ign(f"/world/{WORLD}/light_config", "ignition.msgs.Light",
-                     f'name: "{lamp}", type: POINT, pose: {{position: {{x: {x}, y: {y}, z: 2.2}}}}, '
-                     f"diffuse: {{r: {i:.2f}, g: {i * g:.2f}, b: {i * b:.2f}, a: 1}}, specular: {{r: 0.1, g: 0.1, b: 0.1, a: 1}}, "
-                     f"range: 6, attenuation_constant: 0.6, attenuation_linear: 0.1, attenuation_quadratic: 0.02, "
-                     f"cast_shadows: false, intensity: 1.0")
+            self.ign(
+                f"/world/{WORLD}/light_config",
+                "ignition.msgs.Light",
+                f'name: "{lamp}", type: POINT, pose: {{position: {{x: {x}, y: {y}, z: 2.2}}}}, '
+                f"diffuse: {{r: {i:.2f}, g: {i * g:.2f}, b: {i * b:.2f}, a: 1}}, specular: {{r: 0.1, g: 0.1, b: 0.1, a: 1}}, "
+                f"range: 6, attenuation_constant: 0.6, attenuation_linear: 0.1, attenuation_quadratic: 0.02, "
+                f"cast_shadows: false, intensity: 1.0",
+            )
 
     # ---------------- scene ----------------
     def build_scene(self):
@@ -164,23 +191,54 @@ class DataGen(Node):
             yaw = random.uniform(-math.pi, math.pi)
             lean = random.random() < 0.3
             z = BELT_Z + 0.02 + (0.06 if lean else 0.0)
-            self.spawn(cls, f"dg_p{self.counter}_{i}", x, y, z,
-                       random.uniform(-0.4, 0.4) if lean else 0.0, random.uniform(-0.4, 0.4) if lean else 0.0, yaw)
-        for t in range(random.randint(0, 2)):  # outfeed: trays with random occupancy
-            tx, ty = random.uniform(0.0, 0.65), 0.35 + random.uniform(-0.03, 0.03)
+            self.spawn(
+                cls,
+                f"dg_p{self.counter}_{i}",
+                x,
+                y,
+                z,
+                random.uniform(-0.4, 0.4) if lean else 0.0,
+                random.uniform(-0.4, 0.4) if lean else 0.0,
+                yaw,
+            )
+        for t in range(random.randint(0, 2)):  # outfeed: trays with random occupancy (carton tray 2:1 bar tray)
+            bar_tray = random.random() < 0.33
+            model, (rows, cols), pitch, filler = (
+                ("tray_bar_2x3", (2, 3), (0.200, 0.065), "product_bar")
+                if bar_tray
+                else ("tray_2x4", TRAY_GRID, TRAY_PITCH, "product_carton")
+            )
+            tx, ty = random.uniform(0.0, 0.45 if bar_tray else 0.65), 0.35 + random.uniform(-0.03, 0.03)
             tyaw = random.uniform(-0.08, 0.08)
-            self.spawn("tray_2x4", f"dg_t{self.counter}_{t}", tx, ty, BELT_Z + 0.012, 0, 0, tyaw)
-            rows, cols = TRAY_GRID
+            self.spawn(model, f"dg_t{self.counter}_{t}", tx, ty, BELT_Z + 0.012, 0, 0, tyaw)
             for r in range(rows):
                 for c in range(cols):
                     if random.random() < 0.45:
-                        ox = -cols * TRAY_PITCH[0] / 2 + (c + 0.5) * TRAY_PITCH[0]
-                        oy = -rows * TRAY_PITCH[1] / 2 + (r + 0.5) * TRAY_PITCH[1]
+                        ox = -cols * pitch[0] / 2 + (c + 0.5) * pitch[0]
+                        oy = -rows * pitch[1] / 2 + (r + 0.5) * pitch[1]
                         px = tx + math.cos(tyaw) * ox - math.sin(tyaw) * oy
                         py = ty + math.sin(tyaw) * ox + math.cos(tyaw) * oy
-                        self.spawn("product_carton", f"dg_tp{self.counter}_{t}_{r}{c}", px, py, BELT_Z + 0.03, 0, 0, tyaw + random.uniform(-0.15, 0.15))
+                        self.spawn(
+                            filler,
+                            f"dg_tp{self.counter}_{t}_{r}{c}",
+                            px,
+                            py,
+                            BELT_Z + 0.03,
+                            0,
+                            0,
+                            tyaw + random.uniform(-0.15, 0.15),
+                        )
         if random.random() < 0.3:  # a loose product on the outfeed
-            self.spawn("product_bar", f"dg_lo{self.counter}", random.uniform(0.0, 0.7), random.uniform(0.2, 0.5), BELT_Z + 0.02, 0, 0, random.uniform(-3, 3))
+            self.spawn(
+                "product_bar",
+                f"dg_lo{self.counter}",
+                random.uniform(0.0, 0.7),
+                random.uniform(0.2, 0.5),
+                BELT_Z + 0.02,
+                0,
+                0,
+                random.uniform(-3, 3),
+            )
 
     def grab_pair(self, cam, after_ns, timeout=3.0):
         """Return (rgb, labels) captured after `after_ns` with identical stamps."""
@@ -228,20 +286,29 @@ class DataGen(Node):
                 lines = yolo_seg_lines(labels)
                 stem = f"{cam}_{i:05d}"
                 cv2.imwrite(os.path.join(self.out, "images", stem + ".png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-                cv2.imwrite(os.path.join(self.out, "labels_raw", stem + ".png"), cv2.cvtColor(labels, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(
+                    os.path.join(self.out, "labels_raw", stem + ".png"), cv2.cvtColor(labels, cv2.COLOR_RGB2BGR)
+                )
                 with open(os.path.join(self.out, "labels", stem + ".txt"), "w") as f:
                     f.write("\n".join(lines) + ("\n" if lines else ""))
                 if i % 25 == 0:
-                    cv2.imwrite(os.path.join(self.out, "preview", stem + ".jpg"), cv2.cvtColor(overlay(rgb, labels), cv2.COLOR_RGB2BGR))
+                    cv2.imwrite(
+                        os.path.join(self.out, "preview", stem + ".jpg"),
+                        cv2.cvtColor(overlay(rgb, labels), cv2.COLOR_RGB2BGR),
+                    )
                 saved += 1
             if j % 10 == 0:
                 el = time.time() - t_start
-                self.get_logger().info(f"scene {i + 1}/{self.frames} ({j + 1}/{n} this run), {saved} images, {el / (j + 1):.1f} s/scene")
+                self.get_logger().info(
+                    f"scene {i + 1}/{self.frames} ({j + 1}/{n} this run), {saved} images, {el / (j + 1):.1f} s/scene"
+                )
             if j % 25 == 24:
                 self.write_dataset_yaml()  # keep the split files usable if the run is interrupted
             silent = silent + 1 if got == 0 else 0
             if silent >= 3:
-                self.get_logger().error("cameras silent for 3 scenes: the simulator is stalled, exiting (resume after a restart)")
+                self.get_logger().error(
+                    "cameras silent for 3 scenes: the simulator is stalled, exiting (resume after a restart)"
+                )
                 raise SystemExit(3)
             every = int(self.get_parameter("restart_every").value)
             if every and j + 1 >= every and i + 1 < self.frames:

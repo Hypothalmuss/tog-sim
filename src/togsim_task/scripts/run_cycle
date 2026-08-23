@@ -468,6 +468,7 @@ class RunCycle(Node):
             if t_start is None:
                 t_start = time.monotonic()
             tc = time.monotonic()
+            tc_sim = self.sim_now()  # kinematic leads are simulation time (RTF-invariant)
             tl = {"idle": tc - self.t_cycle_end if self.t_cycle_end else 0.0}
             if tl["idle"] > 0.5 and why["polls"]:
                 n = why["polls"]
@@ -483,7 +484,7 @@ class RunCycle(Node):
             frame = f"prod_{c.tid}"
             lift = self.joint_lift(0.04) if self.in_pocket else []
             n_pick = 3 + len(lift)
-            ev = {"contact": None, "vac_on": None, "contact_gt": None}
+            ev = {"contact": None, "vac_on": None, "contact_gt": None, "contact_sim": None}
 
             def on_fb_pick(fb, n=n_pick):
                 p = fb.feedback.progress
@@ -496,6 +497,7 @@ class RunCycle(Node):
                     ev["vac_on"] = time.monotonic()
                 if abs(p - (n - 0.5) / n) < 1e-3 and ev["contact"] is None:  # contact reached, dwelling
                     ev["contact"] = time.monotonic()
+                    ev["contact_sim"] = self.sim_now()
                     # diagnostic (GT): where is the product relative to the estimate the cup just landed on?
                     xe = c.x + c.vx * (ev["contact"] - tc)
                     with self.lock:
@@ -580,7 +582,8 @@ class RunCycle(Node):
                 self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "retreat")
                 continue
             tl["approach"] = (ev["contact"] or t_sealed) - tc
-            self.approach_est = 0.8 * self.approach_est + 0.2 * tl["approach"]
+            # the look-ahead must be in simulation seconds: below real time a wall-clock estimate is too long
+            self.approach_est = 0.8 * self.approach_est + 0.2 * ((ev["contact_sim"] or self.sim_now()) - tc_sim)
             tl["seal_wait"] = t_sealed - (ev["contact"] or t_sealed)
             # diagnostic (ground truth, metric only): where did the cup really seal relative to the product centre,
             # compared with the vision estimate the place compensates for

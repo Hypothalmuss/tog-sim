@@ -7,6 +7,7 @@ Same motion/vacuum logic as demo_pick_gt; the only difference is where candidate
 
 import json
 import math
+from collections import deque
 import threading
 import time
 
@@ -171,6 +172,8 @@ class RunCycle(Node):
         self.psi_seal = None  # cup yaw at the last seal (diagnostic)
         self.last_on_tray = time.monotonic()
         self.approach_est = 1.4  # s, pick start -> contact, refined online
+        self.rtf = 1.0  # simulation seconds per wall second, measured (see rtf_now)
+        self.rtf_hist = deque()
         self.idle_why = dict.fromkeys(
             ("seen", "occluded", "window", "reach", "blacklist", "no tray for class", "other", "no_tray", "polls"), 0
         )
@@ -370,6 +373,21 @@ class RunCycle(Node):
     def sim_now(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def rtf_now(self):
+        """Simulation seconds per wall second over the last ~3 s. The leads are wall-clock motion durations while the
+        belts move in simulation time: during a motion of `lead` seconds a product travels vx * lead * rtf, so every
+        look-ahead is scaled by this, and every wait that is belt time (seal deadline, pocket hold, blacklist, pocket
+        latch) by its inverse. At real time it is 1; below it (a loaded simulator) the unscaled leads aimed ~100 mm
+        ahead of the product and the seal deadline expired during the approach."""
+        w, sim = time.monotonic(), self.sim_now()
+        self.rtf_hist.append((w, sim))
+        while len(self.rtf_hist) > 2 and w - self.rtf_hist[0][0] > 3.0:
+            self.rtf_hist.popleft()
+        w0, s0 = self.rtf_hist[0]
+        if w - w0 >= 1.0:
+            self.rtf = min(1.2, max(0.2, (sim - s0) / (w - w0)))
+        return self.rtf
+
     def on_joint_state(self, msg):
         with self.lock:
             self.joints = dict(zip(msg.name, msg.position))
@@ -466,7 +484,7 @@ class RunCycle(Node):
                 )
                 self.get_logger().info(
                     f"cycle {done}: {cycle_times[-1]:.2f} s | {60.0 * done / el:.1f} cpm | mean motion "
-                    f"{sum(cycle_times) / len(cycle_times):.2f} s | success {done}/{attempts}"
+                    f"{sum(cycle_times) / len(cycle_times):.2f} s | success {done}/{attempts} | rtf {self.rtf:.2f}"
                 )
         self.get_logger().info(f"finished: {done} cycles, {attempts} attempts, mode={self.mode} continuous")
         self.publish_status("finished", cycles=done, attempts=attempts)
@@ -486,6 +504,8 @@ class RunCycle(Node):
         product is in hand, as (tray, pocket), and the products a tray in the window takes, as (candidate, x at the
         pick lead). Keeps the idle accounting (`idle_why`) and logs the trays rejected for occupancy (vs GT)."""
         cfg = self.cfg
+        rtf = self.rtf_now()
+        lead, place_lead = cfg.lead * rtf, cfg.place_lead * rtf  # wall-clock motion durations in belt (sim) seconds
         trays = []
         for t in self.trays():
             if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
@@ -493,7 +513,7 @@ class RunCycle(Node):
             # the place starts only after the pick: the pocket must still be reachable then (approach_est = the
             # running mean of the pick approach time; a check at the current lead chose pockets that had left
             # the reach by the time the product was in hand)
-            pocket = self.free_pocket_moving(t, cfg.place_lead + self.approach_est, margin=0.0)
+            pocket = self.free_pocket_moving(t, place_lead + self.approach_est, margin=0.0)
             if pocket is not None:
                 trays.append((t, pocket))
             elif -0.35 < t.x < 0.70 and self.rejected_log.get(t.key, 0) < now:
@@ -509,9 +529,9 @@ class RunCycle(Node):
         why = self.idle_why  # why candidates are not pickable right now (diagnostic for the idle time)
         for c in self.candidates(cfg.fits):
             why["seen"] += 1
-            reason = candidate_reason(c, cfg.lead, cfg.x_window, fits_now, BELT_Z, self.blacklist, now)
+            reason = candidate_reason(c, lead, cfg.x_window, fits_now, BELT_Z, self.blacklist, now)
             if reason is None and c.tid is not None:
-                cands.append((c, c.x + c.vx * cfg.lead))
+                cands.append((c, c.x + c.vx * lead))
             elif reason is not None:
                 why[reason if reason in why else "other"] += 1
         if not trays:
@@ -557,7 +577,7 @@ class RunCycle(Node):
                 ev["contact"] = time.monotonic()
                 ev["contact_sim"] = self.sim_now()
                 # diagnostic (GT): where is the product relative to the estimate the cup just landed on?
-                ev["contact_gt"] = self.gteval.nearest_product(c.x + c.vx * (ev["contact"] - tc), c.y)
+                ev["contact_gt"] = self.gteval.nearest_product(c.x + c.vx * (ev["contact"] - tc) * self.rtf, c.y)
 
         # fly through the predicted hover point at speed (a plain PTP/VIA is faster than converging a tracked target
         # from far away), then track: hover -> contact
@@ -578,13 +598,13 @@ class RunCycle(Node):
         self.in_pocket = False
         gh = self.send_goal(pick, f"pick {c.key}", on_feedback=on_fb_pick)
         if gh is None:
-            self.blacklist[c.key] = time.monotonic() + 15.0
+            self.blacklist[c.key] = time.monotonic() + 15.0 / self.rtf
             return False, None
         rf = gh.get_result_async()
         sealed = False
         # a contact that does not seal within a couple of seconds never will (cup on a seam, pushed product):
         # give the product up instead of riding it down the belt
-        t_deadline = time.monotonic() + cfg.seal_timeout
+        t_deadline = time.monotonic() + cfg.seal_timeout / self.rtf  # belt seconds: the approach is physics too
         while time.monotonic() < t_deadline:
             with self.lock:
                 if ev["vac_on"] and self.vac_sealed and self.vac_t > ev["vac_on"]:
@@ -595,7 +615,7 @@ class RunCycle(Node):
         t_sealed = time.monotonic()
         if not sealed:
             _ok, msg = (rf.result().result.success, rf.result().result.message) if rf.done() else (False, "no seal")
-            detail = self.gteval.no_seal_detail(c, ev["contact_gt"], c.x + c.vx * (t_sealed - tc))
+            detail = self.gteval.no_seal_detail(c, ev["contact_gt"], c.x + c.vx * (t_sealed - tc) * self.rtf)
             self.get_logger().warn(
                 f"pick {c.key} failed: {msg} ({t_sealed - tc:.2f} s after start, x_arrive {x_arrive:.3f}, y {c.y:.3f})"
                 f"{detail}"
@@ -603,7 +623,7 @@ class RunCycle(Node):
             fl = dict(self.status.get("failures", {}))
             fl["pick"] = fl.get("pick", 0) + 1
             self.publish_status("running", attempts=attempts, failures=fl, last=f"pick {c.key} failed: {msg}")
-            self.blacklist[c.key] = time.monotonic() + 15.0
+            self.blacklist[c.key] = time.monotonic() + 15.0 / self.rtf
             self.vacuum_cmd(False)
             if not rf.done():
                 gh.cancel_goal_async()
@@ -616,7 +636,7 @@ class RunCycle(Node):
         tl["seal_wait"] = t_sealed - (ev["contact"] or t_sealed)
         with self.lock:
             held = self.vac_attached
-        self.blacklist[c.key] = time.monotonic() + 15.0  # its track lives on by prediction: never pick the ghost
+        self.blacklist[c.key] = time.monotonic() + 15.0 / self.rtf  # its track lives on by prediction: never pick the ghost
         tp = self.track_pose(c.tid)
         fk = self.fk_xy()
         if tp is not None and fk is not None:
@@ -638,7 +658,7 @@ class RunCycle(Node):
         """Phase 3: the tray is chosen now (the one selected before the pick has moved on). The nearest free pocket
         that will still be reachable with margin; else one reachable right now; else hold the product up to 6 s for
         a pocket to come in reach; as a last resort the pre-pick choice `trays[0]`."""
-        cfg = self.cfg
+        place_lead = self.cfg.place_lead * self.rtf  # belt seconds during the wall-clock transfer
 
         def reachable_pockets(margin):
             fresh = []
@@ -647,9 +667,9 @@ class RunCycle(Node):
                     continue
                 if c.cls not in PRODUCT_FITS.get((t.spec or self.tray).name, []):
                     continue
-                pk = self.free_pocket_moving(t, cfg.place_lead, margin=margin)
+                pk = self.free_pocket_moving(t, place_lead, margin=margin)
                 if pk is not None:
-                    px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * cfg.place_lead, t.y, t.z), t.yaw, pk)
+                    px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
                     fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
             return fresh
 
@@ -659,7 +679,8 @@ class RunCycle(Node):
             if fresh:
                 self.get_logger().info("place: no pocket with reach margin, taking one reachable now")
         t_wait0 = time.monotonic()
-        while not fresh and time.monotonic() - t_wait0 < 6.0:  # hold the product until a pocket comes in reach
+        hold = 6.0 / self.rtf  # belt seconds
+        while not fresh and time.monotonic() - t_wait0 < hold:  # hold the product until a pocket comes in reach
             if time.monotonic() - t_wait0 < 0.05:
                 self.get_logger().info("place: waiting for a reachable pocket (holding the product)")
             time.sleep(0.05)
@@ -669,7 +690,7 @@ class RunCycle(Node):
             return tray, pocket
         tray, pocket = trays[0]
         self.get_logger().warn(
-            f"place: no reachable pocket in 6 s, falling back to {tray.key}[{pocket}] seen before the pick"
+            f"place: no reachable pocket in {hold:.0f} s, falling back to {tray.key}[{pocket}] seen before the pick"
         )
         return tray, pocket
 
@@ -678,7 +699,7 @@ class RunCycle(Node):
         The cup holds the product off-centre by the measured grasp offset: expressed in the product frame that
         offset is constant through the J4 turn, so the cup aims at pocket - offset. Returns the motion result; sets
         tl['transfer'] / tl['release'], latches the pocket and starts the (GT) placement measurement."""
-        cfg = self.cfg
+        place_lead = self.cfg.place_lead * self.rtf
         h = PRODUCT_HEIGHT[c.cls]
         tframe = f"tray_{tray.tid}"
         spec = tray.spec or self.tray
@@ -710,7 +731,7 @@ class RunCycle(Node):
                 rel["t"] = time.monotonic()
                 self.gteval.log_release_yaw(held, tray, pocket, (ox, oy), self.psi_seal)
 
-        px_w, py_w, _zf = spec.pocket_world((tray.x + tray.vx * cfg.place_lead, tray.y, tray.z), tray.yaw, pocket)
+        px_w, py_w, _zf = spec.pocket_world((tray.x + tray.vx * place_lead, tray.y, tray.z), tray.yaw, pocket)
         place = [
             seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.35),
             seg(MotionSegment.TRACK_CART, ox, oy, z_clear, bq, tracked=tframe),
@@ -736,7 +757,7 @@ class RunCycle(Node):
                         break
                 time.sleep(0.005)
             self.get_logger().info(f"unsealed after {time.monotonic() - rel['t']:.3f} s (release command to unsealed)")
-        self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
+        self.latched[(tray.key, pocket)] = time.monotonic() + 2.0 / self.rtf  # until the vacancy view catches up
         self.in_pocket = rel["t"] is not None  # the cup is down in the pocket: the next goal must lift first
         threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket, held), daemon=True).start()
         return ok

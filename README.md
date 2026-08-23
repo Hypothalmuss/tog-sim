@@ -75,10 +75,11 @@ activates it when present and the nodes pick CUDA automatically (`device:=auto`)
 per run (cycles, attempts, cpm, motion time, placement mean/p95 from ground truth, per-phase timeline, failures);
 `scripts/bench_report.py <name> ...` aggregates them with 95 % confidence intervals into
 [docs/benchmarks.md](docs/benchmarks.md) (Wilson for success, bootstrap over cycles for picks/min and over placed
-products for placement). Placement = released product vs the centre of the pocket it sits in (ground truth); the pocket
+products for placement). The table is regenerated; the reading of the numbers is kept under its `## Notes`. Placement = released product vs the centre of the pocket it sits in (ground truth); the pocket
 clearance is 5 mm per side. The tuned perception gates live in
-[`src/togsim_perception/config/perception_tuning.yaml`](src/togsim_perception/config/perception_tuning.yaml) with
-their rationale. `run_cycle` is one cycle in four phase methods - `schedule` (what is pickable now and where it can
+[`src/togsim_perception/config/perception_tuning.yaml`](src/togsim_perception/config/perception_tuning.yaml) and the
+cycle parameters in [`src/togsim_task/config/task_tuning.yaml`](src/togsim_task/config/task_tuning.yaml), each with its
+rationale and the levers rejected on the benches. `run_cycle` is one cycle in four phase methods - `schedule` (what is pickable now and where it can
 go), `pick` (fly, track, seal; measures the grasp offset), `choose_pocket` (after the pick: the tray chosen before has
 moved on) and `place` (track the pocket, release, unseal) - with the run constants in a `CycleConfig`; the scheduling
 rules are in `togsim_task/scheduler.py` (unit-tested) and every ground-truth diagnostic in `togsim_task/diagnostics.py`

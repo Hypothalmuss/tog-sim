@@ -1,0 +1,22 @@
+# Tuned parameters of the continuous cycle (run_cycle). Values settled on the 3x40-cycle benches in docs/benchmarks.md
+# (baseline 13.4 [12.2-14.7] picks/min, 2.7 mm mean / 5.8 mm p95 placement, 100 % success); the levers tried and
+# rejected there are noted. Loaded by scripts/m4_validate.sh, scripts/demo.sh and the HMI; -p overrides still win.
+run_cycle:
+  ros__parameters:
+    pick_x_min: 0.10          # m, pick window along the infeed, x of the product at arrival: below 0.10 the cup
+    pick_x_max: 0.50          # folds towards the base (elbow flip), above 0.50 the fly-through is a stretch
+    hover: 0.03               # m above the product top where the tracked descent starts (a lower hover clipped
+                              # neighbouring products at 60/min)
+    pick_lead_s: 0.9          # s, wall-clock time of the fly-through: the product is predicted this far ahead.
+                              # Scaled by the measured real-time factor at run time (belt seconds per wall second)
+    place_lead_s: 1.2         # s, pick -> pocket transfer time, same scaling; a pocket must still be reachable then
+    track_dwell_s: 0.25       # s, hold on the moving product while the cup seals; the seal budget is max(0.8, 3x)
+                              # and the place goal preempts it the instant the gripper reports a seal
+    contact_offset_m: -0.002  # m, cup target relative to the estimated product top: a 2 mm press absorbs the vision
+                              # top error against the gripper's 4 mm proximity rule (seal misses at 0)
+    seal_timeout_s: 2.5       # belt seconds from goal send: a contact that has not sealed by then never will (cup on
+                              # a seam, pushed product) - give it up instead of riding it down the belt
+    park: [-0.25, -0.25, 0.75]  # m, waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for |y| < 1.1;
+                              # parked over the belt the arm hid products (bar recall 0.5-0.64)
+    # rejected on the benches (docs/benchmarks.md): leaving the place during the unseal dwell (P1c, precision),
+    # outfeed 0.05 m/s (P1a, fewer trays), tray pitch 0.45 m (P1b), max motion profile (P1d, 3x jerk for no gain)

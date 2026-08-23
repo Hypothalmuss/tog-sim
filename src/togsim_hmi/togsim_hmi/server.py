@@ -197,6 +197,8 @@ class HmiBridge(Node):
             "togsim_task",
             "run_cycle",
             "--ros-args",
+            "--params-file",
+            os.path.join(get_package_share_directory("togsim_task"), "config", "task_tuning.yaml"),
             "-p",
             f"perception:={perception}",
             "-p",

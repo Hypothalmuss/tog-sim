@@ -36,5 +36,5 @@ echo "[demo] operator HMI at http://localhost:${DEMO_HMI_PORT:-8080} (status, be
 setsid ros2 run togsim_hmi hmi_server --ros-args -p use_sim_time:=true -p port:=${DEMO_HMI_PORT:-8080} >"$log/hmi.log" 2>&1 </dev/null &
 sleep 10
 echo "[demo] continuous pick & place (perception:=$mode, $cycles cycles) - stop everything with scripts/killall.sh"
-setsid ros2 run togsim_task run_cycle --ros-args -p perception:=$mode -p continuous:=true -p cycles:=$cycles -p belt_speed:=$speed -p outfeed_speed:=${DEMO_OUTFEED:-0.0} -p use_sim_time:=true >"$log/run_cycle.log" 2>&1 </dev/null &
+setsid ros2 run togsim_task run_cycle --ros-args --params-file "$(ros2 pkg prefix togsim_task)/share/togsim_task/config/task_tuning.yaml" -p perception:=$mode -p continuous:=true -p cycles:=$cycles -p belt_speed:=$speed -p outfeed_speed:=${DEMO_OUTFEED:-0.0} -p use_sim_time:=true >"$log/run_cycle.log" 2>&1 </dev/null &
 echo "[demo] running; progress: tail -f $log/run_cycle.log"

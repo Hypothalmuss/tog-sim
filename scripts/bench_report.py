@@ -138,8 +138,13 @@ def main():
             "bootstrap over cycles (picks/min) and over placed products (placement).\n\n"
         )
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        notes = ""  # hand-written reading of the numbers: kept across regenerations
+        if os.path.exists(out):
+            prev = open(out).read()
+            if "\n## Notes" in prev:
+                notes = prev[prev.index("\n## Notes") :]
         with open(out, "w") as f:
-            f.write(head + table)
+            f.write(head + table + notes)
 
 
 if __name__ == "__main__":

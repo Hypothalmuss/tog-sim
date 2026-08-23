@@ -26,12 +26,20 @@ from togsim_msgs.action import ExecuteMotion
 from togsim_msgs.msg import MotionSegment, PickCandidateArray, TrayState, VacuumState
 from togsim_msgs.srv import SetVacuum
 from togsim_task.diagnostics import GroundTruthEval
-from togsim_task.scheduler import REACH_MAX, REACH_MIN, candidate_reason, free_pocket, nearest_branch, reachable
+from togsim_task.scheduler import (
+    BELT_Z,
+    PRODUCT_FITS,
+    PRODUCT_HEIGHT,
+    REACH_MAX,
+    REACH_MIN,
+    CycleConfig,
+    candidate_reason,
+    free_pocket,
+    nearest_branch,
+    reachable,
+)
 from togsim_task.trays import TraySpec
 
-PRODUCT_HEIGHT = {"product_bar": 0.0186, "product_carton": 0.025}
-PRODUCT_FITS = {"tray_2x4": ["product_carton"], "tray_bar_2x3": ["product_bar"]}
-BELT_Z = 0.52
 
 
 def yaw_of(q):
@@ -158,6 +166,9 @@ class RunCycle(Node):
         self.cur_goal = ""
         self.rejected_log = {}
         self.in_pocket = False
+        self.cfg = None  # CycleConfig of the running continuous cycle
+        self.blacklist = {}  # product key -> monotonic time until which it is not picked again
+        self.psi_seal = None  # cup yaw at the last seal (diagnostic)
         self.last_on_tray = time.monotonic()
         self.approach_est = 1.4  # s, pick start -> contact, refined online
         self.idle_why = dict.fromkeys(
@@ -381,392 +392,63 @@ class RunCycle(Node):
         self.vac_cmd.publish(String(data="on" if on else "off"))
         self.get_logger().info(f"vacuum cmd {'on' if on else 'off'}")
 
+    # ---------------- continuous cycle: schedule -> pick -> choose pocket -> place ----------------
     def run_continuous(self):
         """Belts never stop. Pick: TRACK hover -> TRACK contact (dwell = seal budget); the vacuum is switched on when the
         hover is reached and the place goal is sent the instant the gripper reports a seal (it preempts the dwell).
         Place: lift -> TRACK pocket hover -> TRACK pocket contact; the release is commanded when the contact is reached
-        and the next pick goal follows right after the short settle dwell. No service round-trips in the cycle."""
-        belt_speed = float(self.get_parameter("belt_speed").value)
-        hover = float(self.get_parameter("hover").value)
-        xmin, xmax = self.get_parameter("pick_x_min").value, self.get_parameter("pick_x_max").value
-        lead, place_lead = (
-            float(self.get_parameter("pick_lead_s").value),
-            float(self.get_parameter("place_lead_s").value),
+        and the next pick goal follows right after the short settle dwell. No service round-trips in the cycle.
+
+        A cycle is four phases, one method each: `schedule` (what is pickable now and where it can go), `pick` (fly,
+        track, seal; measures the grasp offset), `choose_pocket` (chosen after the pick: the tray picked before has
+        moved on) and `place` (track the pocket, release, unseal). Ground-truth diagnostics live in `self.gteval`
+        and are inert without `eval`."""
+        p = self.get_parameter
+        self.cfg = CycleConfig(
+            belt_speed=float(p("belt_speed").value),
+            hover=float(p("hover").value),
+            x_window=(p("pick_x_min").value, p("pick_x_max").value),
+            lead=float(p("pick_lead_s").value),
+            place_lead=float(p("place_lead_s").value),
+            seal_budget=max(0.8, float(p("track_dwell_s").value) * 3.0),  # the place goal preempts on seal
+            contact=float(p("contact_offset_m").value),
+            seal_timeout=float(p("seal_timeout_s").value),
+            fits=sorted({cls for name in PRODUCT_FITS for cls in PRODUCT_FITS[name]}),  # any class a known tray takes
+            park=[float(v) for v in p("park").value],
         )
-        seal_budget = max(
-            0.8, float(self.get_parameter("track_dwell_s").value) * 3.0
-        )  # the place goal preempts on seal
-        contact = float(self.get_parameter("contact_offset_m").value)
-        seal_timeout = float(self.get_parameter("seal_timeout_s").value)
-        fits = sorted({cls for name in PRODUCT_FITS for cls in PRODUCT_FITS[name]})  # any class a known tray takes
-        park = [float(v) for v in self.get_parameter("park").value]
+        cfg = self.cfg
         done, attempts = 0, 0
         cycle_times, t_start = [], None
-        blacklist = {}
-        self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
+        self.blacklist = {}
+        self.go_park()
         parked = True
-        self.belts(belt_speed)
+        self.belts(cfg.belt_speed)
         self.publish_status("running", last="started")
         last_report = 0.0
-        while rclpy.ok() and done < int(self.get_parameter("cycles").value):
+        while rclpy.ok() and done < int(p("cycles").value):
             now = time.monotonic()
-            trays = []
-            for t in self.trays():
-                if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
-                    continue
-                # the place starts only after the pick: the pocket must still be reachable then (approach_est = the
-                # running mean of the pick approach time; a check at the current lead chose pockets that had left
-                # the reach by the time the product was in hand)
-                pocket = self.free_pocket_moving(t, place_lead + self.approach_est, margin=0.0)
-                if pocket is not None:
-                    trays.append((t, pocket))
-                elif -0.35 < t.x < 0.70 and self.rejected_log.get(t.key, 0) < now:
-                    # diagnostic: a tray in the window with no usable pocket - vision occupancy vs GT occupancy
-                    self.rejected_log[t.key] = now + 2.0
-                    with self.lock:
-                        gt = dict(self.gt)
-                    occ_gt = "?"
-                    loc = self.in_tray_frame((t.x, t.y), gt)
-                    if loc is not None:
-                        tp, tyaw = gt[loc[0]][0], gt[loc[0]][1]
-                        sp_ = t.spec or self.tray
-                        occ = [False] * sp_.n_pockets
-                        for pn, (pp, _, _, _) in gt.items():
-                            if pn.startswith("product_") and abs(pp[2] - tp[2]) < 0.06:
-                                k = sp_.pocket_of_point(tp, tyaw, pp[0], pp[1])
-                                if k is not None:
-                                    occ[k] = True
-                        occ_gt = "".join("x" if v else "." for v in occ) + f" ({loc[0]})"
-                    self.get_logger().info(
-                        f"rejected tray {t.key} at x {t.x:.2f}: vision occupied"
-                        f" {''.join('x' if v else '.' for v in t.occupied)} vs GT {occ_gt}"
-                    )
-            # only products that a tray in the window can take (several tray models may share the outfeed)
-            fits_now = {cls for t, _ in trays for cls in PRODUCT_FITS.get((t.spec or self.tray).name, [])}
-            cands = []
-            why = self.idle_why  # why candidates are not pickable right now (diagnostic for the idle time)
-            for c in self.candidates(fits):
-                why["seen"] += 1
-                reason = candidate_reason(c, lead, (xmin, xmax), fits_now, BELT_Z, blacklist, now)
-                if reason is None and c.tid is not None:
-                    cands.append((c, c.x + c.vx * lead))
-                elif reason is not None:
-                    why[reason if reason in why else "other"] += 1
-            if not trays:
-                why["no_tray"] += 1
-            why["polls"] += 1
+            trays, cands = self.schedule(now)
             if not trays or not cands:
                 if now - last_report > 5.0:
                     last_report = now
                     self.get_logger().info(f"waiting: {len(cands)} pickable, {len(trays)} trays ready")
-                if not parked and not self.product_due(fits, 3.0):
-                    parked = self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
+                if not parked and not self.product_due(cfg.fits, 3.0):
+                    parked = self.go_park()
                 time.sleep(0.03)
                 continue
             c, x_arrive = max(cands, key=lambda ca: ca[1])
-            h = PRODUCT_HEIGHT[c.cls]
             if t_start is None:
                 t_start = time.monotonic()
             tc = time.monotonic()
-            tc_sim = self.sim_now()  # kinematic leads are simulation time (RTF-invariant)
             tl = {"idle": tc - self.t_cycle_end if self.t_cycle_end else 0.0}
-            if tl["idle"] > 0.5 and why["polls"]:
-                n = why["polls"]
-                self.get_logger().info(
-                    f"idle {tl['idle']:.1f} s: per poll {why['seen'] / n:.1f} tracked, {why['occluded'] / n:.1f} occluded,"
-                    f" {why['window'] / n:.1f} outside x-window, {why['reach'] / n:.1f} unreachable,"
-                    f" {why['blacklist'] / n:.1f} blacklisted, {why['no tray for class'] / n:.1f} no tray for class,"
-                    f" {why['other'] / n:.1f} other; no tray {100 * why['no_tray'] / n:.0f} % of polls"
-                )
-            self.idle_why = dict.fromkeys(self.idle_why, 0)
+            self.log_idle(tl["idle"])
             attempts += 1
             parked = False
-            frame = f"prod_{c.tid}"
-            lift = self.joint_lift(0.04) if self.in_pocket else []
-            n_pick = 3 + len(lift)
-            ev = {"contact": None, "vac_on": None, "contact_gt": None, "contact_sim": None}
-
-            def on_fb_pick(fb, n=n_pick):
-                p = fb.feedback.progress
-                self.get_logger().debug(
-                    f"fb pick seg {fb.feedback.segment_index} progress {p:.3f} t+{time.monotonic() - tc:.2f}"
-                )
-                # progress is (idx + 1) / n when a segment completes and (idx + 0.5) / n when the last one is reached
-                if abs(p - (n - 1.0) / n) < 1e-3 and ev["vac_on"] is None:  # hover reached: descending onto the product
-                    self.vacuum_cmd(True)
-                    ev["vac_on"] = time.monotonic()
-                if abs(p - (n - 0.5) / n) < 1e-3 and ev["contact"] is None:  # contact reached, dwelling
-                    ev["contact"] = time.monotonic()
-                    ev["contact_sim"] = self.sim_now()
-                    # diagnostic (GT): where is the product relative to the estimate the cup just landed on?
-                    xe = c.x + c.vx * (ev["contact"] - tc)
-                    with self.lock:
-                        near = min(
-                            (
-                                (math.hypot(g[0][0] - xe, g[0][1] - c.y), nm, g[0][0] - xe, g[0][1] - c.y)
-                                for nm, g in self.gt.items()
-                                if nm.startswith("product_")
-                            ),
-                            default=None,
-                        )
-                    ev["contact_gt"] = near
-
-            # fly through the predicted hover point at speed (a plain PTP/VIA is faster than converging a tracked target
-            # from far away), then track: hover -> contact
-            cur = self.cup_yaw()
-            yaw_pick = c.yaw if cur is None else nearest_branch(c.yaw, cur)
-            c.bp = yaw_pick - c.yaw
-            # straight up first when the cup is still in the pocket it just filled (at wall-top height): a diagonal
-            # departure clips the rim and drags the tray. A PTP: a via point at the current pose never completes.
-            pick = lift + [
-                seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + hover, yaw_pick, via_speed=0.5),
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, hover, c.bp, tracked=frame),
-                # the pick contact may settle loosely: the grasp offset is measured at the seal and compensated at the
-                # place, where the tight tolerance matters
-                seg(MotionSegment.TRACK_CART, 0.0, 0.0, contact, c.bp, dwell=seal_budget, tracked=frame, settle=0.005),
-            ]
-            self.in_pocket = False
-            gh = self.send_goal(pick, f"pick {c.key}", on_feedback=on_fb_pick)
-            if gh is None:
-                blacklist[c.key] = time.monotonic() + 15.0
-                continue
-            rf = gh.get_result_async()
-            sealed = False
-            # a contact that does not seal within a couple of seconds never will (cup on a seam, pushed product):
-            # give the product up instead of riding it down the belt
-            t_deadline = time.monotonic() + seal_timeout
-            while time.monotonic() < t_deadline:
-                with self.lock:
-                    if ev["vac_on"] and self.vac_sealed and self.vac_t > ev["vac_on"]:
-                        sealed = True
-                if sealed or rf.done():
-                    break
-                time.sleep(0.002)
-            t_sealed = time.monotonic()
+            sealed, held = self.pick(c, x_arrive, tc, tl, attempts)
             if not sealed:
-                ok, msg = (rf.result().result.success, rf.result().result.message) if rf.done() else (False, "no seal")
-                # diagnostic (GT): was the estimate wrong (top height, position) or the product unpickable?
-                with self.lock:
-                    gt = dict(self.gt)
-                xe = c.x + c.vx * (t_sealed - tc)
-                near = min(
-                    (
-                        (math.hypot(g[0][0] - xe, g[0][1] - c.y), n, g)
-                        for n, g in gt.items()
-                        if n.startswith("product_")
-                    ),
-                    default=None,
-                )
-                why = ""
-                if ev["contact_gt"] is not None:
-                    _d, nm, dx, dy = ev["contact_gt"]
-                    why = f"; at contact GT {nm} was ({1e3 * dx:+.0f},{1e3 * dy:+.0f}) mm from the estimate"
-                if near is not None:
-                    d, n, g = near
-                    hgt = PRODUCT_HEIGHT.get("product_" + n.split("_")[1], 0.0)
-                    why += (
-                        f"; at failure nearest GT {n} {1e3 * d:.0f} mm from the estimate, top est {1e3 * c.top:.1f} vs GT"
-                        f" {1e3 * (g[0][2] + hgt):.1f} mm, tilt {math.degrees(g[2]):.0f} deg"
-                    )
-                self.get_logger().warn(
-                    f"pick {c.key} failed: {msg} ({t_sealed - tc:.2f} s after start, x_arrive {x_arrive:.3f}, y {c.y:.3f}){why}"
-                )
-                fl = dict(self.status.get("failures", {}))
-                fl["pick"] = fl.get("pick", 0) + 1
-                self.publish_status("running", attempts=attempts, failures=fl, last=f"pick {c.key} failed: {msg}")
-                blacklist[c.key] = time.monotonic() + 15.0
-                self.vacuum_cmd(False)
-                if not rf.done():
-                    gh.cancel_goal_async()
-                time.sleep(0.05)
-                self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, hover, 0.0, frame="tcp")], "retreat")
                 continue
-            tl["approach"] = (ev["contact"] or t_sealed) - tc
-            # the look-ahead must be in simulation seconds: below real time a wall-clock estimate is too long
-            self.approach_est = 0.8 * self.approach_est + 0.2 * ((ev["contact_sim"] or self.sim_now()) - tc_sim)
-            tl["seal_wait"] = t_sealed - (ev["contact"] or t_sealed)
-            # diagnostic (ground truth, metric only): where did the cup really seal relative to the product centre,
-            # compared with the vision estimate the place compensates for
-            with self.lock:
-                att = self.vac_attached
-                g = self.gt.get(att)
-            held = att
-            blacklist[c.key] = time.monotonic() + 15.0  # its track lives on by prediction: never pick the ghost
-            tp = self.track_pose(c.tid)
-            fk = self.fk_xy()
-            if tp is not None and fk is not None:
-                # the cup seals a few mm off the product centre (settle tolerance, tracker error, prediction during
-                # the occluded descent): measure it from the tracked centre and the cup (FK) and let the place
-                # compensate the measured offset instead of the vision estimate
-                off_meas = (tp.x - fk[0], tp.y - fk[1])
-                if math.hypot(*off_meas) < 0.03:
-                    self.get_logger().info(
-                        f"grasp offset measured ({1e3 * off_meas[0]:+.0f},{1e3 * off_meas[1]:+.0f}) mm"
-                        f" (vision estimate ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm)"
-                    )
-                    c.off = off_meas
-            if g is not None and tp is not None:
-                ax, ay = g[0][0] - tp.x, g[0][1] - tp.y
-                dyaw = math.degrees(
-                    (c.yaw - g[1] + math.pi / 2) % math.pi - math.pi / 2
-                )  # mod 180: axis ambiguity is fine
-                psi = self.cup_yaw()
-                self.psi_seal = psi
-                cupd = (
-                    ""
-                    if psi is None
-                    else f", cup-cmd {math.degrees((psi - c.yaw + math.pi) % (2 * math.pi) - math.pi):+.0f} deg"
-                )
-                self.get_logger().info(
-                    f"grasp offset {att}: actual ({1e3 * ax:+.0f},{1e3 * ay:+.0f}) mm, estimated ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm,"
-                    f" pick yaw error {dyaw:+.0f} deg{cupd}"
-                )
-            # place: the tray is chosen now (the one selected before the pick has moved on)
-            fresh = []
-            for t in self.trays():
-                if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
-                    continue
-                if c.cls not in PRODUCT_FITS.get((t.spec or self.tray).name, []):
-                    continue
-                pk = self.free_pocket_moving(t, place_lead)
-                if pk is not None:
-                    px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
-                    fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
-            if not fresh:  # nothing with margin: the pockets that are still reachable right now, no margin
-                for t in self.trays():
-                    if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
-                        continue
-                    if c.cls not in PRODUCT_FITS.get((t.spec or self.tray).name, []):
-                        continue
-                    pk = self.free_pocket_moving(t, place_lead, margin=0.0)
-                    if pk is not None:
-                        px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
-                        fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
-                if fresh:
-                    self.get_logger().info("place: no pocket with reach margin, taking one reachable now")
-            t_wait0 = time.monotonic()
-            while not fresh and time.monotonic() - t_wait0 < 6.0:  # hold the product until a pocket comes in reach
-                if time.monotonic() - t_wait0 < 0.05:
-                    self.get_logger().info("place: waiting for a reachable pocket (holding the product)")
-                time.sleep(0.05)
-                for t in self.trays():
-                    if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
-                        continue
-                    if c.cls not in PRODUCT_FITS.get((t.spec or self.tray).name, []):
-                        continue
-                    pk = self.free_pocket_moving(t, place_lead, margin=0.3)  # a pocket at the edge ends the place
-                    if pk is not None:  # where the lift cannot be solved
-                        px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * place_lead, t.y, t.z), t.yaw, pk)
-                        fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
-            if fresh:
-                _, tray, pocket = min(fresh, key=lambda f: f[0])  # shortest transfer
-            else:
-                tray, pocket = trays[0]
-                self.get_logger().warn(
-                    f"place: no reachable pocket in 6 s, falling back to {tray.key}[{pocket}] seen before the pick"
-                )
-            tframe = f"tray_{tray.tid}"
-            spec = tray.spec or self.tray
-            ox, oy = spec.pocket_offset(pocket)
-            loc = self.in_tray_frame((tray.x, tray.y))  # diagnostic (GT): tracked tray frame vs the real tray now
-            ferr = "" if loc is None else f", frame err ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm vs {loc[0]}"
-            st = getattr(tray, "stamp", None)
-            if st is not None and loc is not None:
-                # the same message against GT at its own stamp: separates a stale delivery from a lagging track
-                with self.lock:
-                    hist = list(self.gt_hist.get(loc[0], []))
-                if hist:
-                    tg, xg, _ = min(hist, key=lambda e: abs(e[0] - st))
-                    ferr += (
-                        f"; stamp age {self.sim_now() - st:.2f} s, raw x - GT x at stamp {1e3 * (tray.x_raw - xg):+.0f} mm"
-                        f" (GT dt {tg - st:+.2f}), vx {tray.vx:.3f}, predicted +{1e3 * (tray.x - tray.x_raw):.0f} mm,"
-                        f" rx age {getattr(tray, 'rx_age', -1.0):.2f} s"
-                    )
-            self.get_logger().info(
-                f"place decision {c.key} -> {tray.key}[{pocket}]: tray x {tray.x:.2f}, occupied"
-                f" {''.join('x' if v else '.' for v in tray.occupied)}{ferr}"
-            )
-            # the cup holds the product off-centre by `off` (world, at pick); after J4 turns the product to the tray's
-            # yaw that offset, expressed in the product frame, is constant -> aim the cup at pocket - offset
-            cur = self.cup_yaw()
-            yaw_place = tray.yaw if cur is None else nearest_branch(tray.yaw, cur)
-            bq = yaw_place - tray.yaw
-            sgn = round(math.cos(bq - c.bp))  # +-1: the product frame relative to the tray frame once placed
-            cp, sp = math.cos(-c.yaw), math.sin(-c.yaw)
-            offx, offy = cp * c.off[0] - sp * c.off[1], sp * c.off[0] + cp * c.off[1]
-            if math.hypot(offx, offy) < 0.03:  # sanity: a bigger "offset" is a bad mask, not a real grasp offset
-                ox, oy = ox - sgn * offx, oy - sgn * offy
-            # release 10 mm above the pocket floor: the pocket walls (25 mm) still guide the product, and with 5 mm of
-            # clearance per side a cup that is a few mm off would otherwise press the product onto a wall and drag the
-            # tray along the belt
-            z_place = spec.base_thickness + h + 0.010
-            # the product hangs below the cup: approach above the pocket walls (flying to a far pocket crosses the
-            # others), then descend vertically in the tray frame. Clipping a wall at belt speed throws the tray.
-            z_clear = spec.base_thickness + spec.pocket_depth + 0.02 + h
-            rel = {"t": None}
-
-            def on_fb_place(fb, n=3):
-                if abs(fb.feedback.progress - 2.5 / n) < 1e-3 and rel["t"] is None:  # pocket contact reached: release
-                    self.vacuum_cmd(False)
-                    rel["t"] = time.monotonic()
-                    psi = self.cup_yaw()
-                    with self.lock:
-                        g = self.gt.get(held)
-                    if (
-                        psi is not None and g is not None
-                    ):  # diagnostic: who is rotated at release, the cup or the product?
-                        wrap = lambda a: math.degrees((a + math.pi) % (2 * math.pi) - math.pi)  # noqa: E731
-                        wrap180 = lambda a: math.degrees((a + math.pi / 2) % math.pi - math.pi / 2)  # noqa: E731
-                        loc = self.in_tray_frame(g[0])
-                        where = (
-                            ""
-                            if loc is None
-                            else f", product at ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm in GT {loc[0]}"
-                        )
-                        self.get_logger().info(
-                            f"release yaw {held} -> {tray.key}[{pocket}]: cup-tray {wrap(psi - tray.yaw):+.0f} deg,"
-                            f" product-tray {wrap180(g[1] - tray.yaw):+.0f} deg, product-cup {wrap180(g[1] - psi):+.0f} deg"
-                            f"{where}; target pocket ({1e3 * ox:+.0f},{1e3 * oy:+.0f}) mm in {tray.key}"
-                            + (
-                                ""
-                                if getattr(self, "psi_seal", None) is None
-                                else f"; J4 turned {wrap(psi - self.psi_seal):+.0f} deg since seal"
-                                + self.frame_err_now(tray.tid)
-                                + self.fk_vs_gt(g[0])
-                            )
-                        )
-
-            px_w, py_w, zf = spec.pocket_world((tray.x + tray.vx * place_lead, tray.y, tray.z), tray.yaw, pocket)
-            place = [
-                seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.35),
-                seg(MotionSegment.TRACK_CART, ox, oy, z_clear, bq, tracked=tframe),
-                # 3.5 mm on the measured arm: the steady command-measured lag while tracking is ~2 mm, a 2.5 mm
-                # tolerance hovered at the threshold for a second
-                seg(MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=0.08, tracked=tframe, settle=0.0035),
-            ]
-            t_place0 = time.monotonic()
-            ghp = self.send_goal(place, f"place {c.key} -> {tray.key}[{pocket}]", on_feedback=on_fb_place)
-            ok = False
-            if ghp is not None:
-                ok, _ = self.wait_result(ghp, f"place {c.key} -> {tray.key}[{pocket}]")
-            if rel["t"] is None:  # the contact feedback never came (failed place): make sure the cup lets go
-                self.vacuum_cmd(False)
-            tl["transfer"] = (rel["t"] or time.monotonic()) - t_place0
-            tl["release"] = time.monotonic() - (rel["t"] or time.monotonic())
-            if rel["t"] is not None:
-                # the vacuum lets go with a delay: leaving before it does drags the product along the departure
-                t_u0 = time.monotonic()
-                while time.monotonic() - t_u0 < 0.5:
-                    with self.lock:
-                        if not self.vac_sealed:
-                            break
-                    time.sleep(0.005)
-                self.get_logger().info(
-                    f"unsealed after {time.monotonic() - rel['t']:.3f} s (release command to unsealed)"
-                )
-            self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
-            self.in_pocket = rel["t"] is not None  # the cup is down in the pocket: the next goal must lift first
-            threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket, held), daemon=True).start()
+            tray, pocket = self.choose_pocket(c, trays)
+            ok = self.place(c, held, tray, pocket, tl)
             self.t_cycle_end = time.monotonic()
             self.timelines.append(tl)
             self.get_logger().info("timeline " + " ".join(f"{k} {v:.2f}" for k, v in tl.items()))
@@ -794,6 +476,270 @@ class RunCycle(Node):
             keys = ["idle", "approach", "seal_wait", "transfer", "release"]
             means = {k: sum(t.get(k, 0.0) for t in self.timelines) / len(self.timelines) for k in keys}
             self.get_logger().info("timeline means " + " ".join(f"{k} {v:.2f}" for k, v in means.items()))
+
+    def go_park(self):
+        park = self.cfg.park
+        return self.run_motion([seg(MotionSegment.PTP_CART, *park, math.atan2(park[1], park[0]))], "park")
+
+    def schedule(self, now):
+        """Phase 1, what can be done right now: the trays with a free pocket that will still be reachable once the
+        product is in hand, as (tray, pocket), and the products a tray in the window takes, as (candidate, x at the
+        pick lead). Keeps the idle accounting (`idle_why`) and logs the trays rejected for occupancy (vs GT)."""
+        cfg = self.cfg
+        trays = []
+        for t in self.trays():
+            if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
+                continue
+            # the place starts only after the pick: the pocket must still be reachable then (approach_est = the
+            # running mean of the pick approach time; a check at the current lead chose pockets that had left
+            # the reach by the time the product was in hand)
+            pocket = self.free_pocket_moving(t, cfg.place_lead + self.approach_est, margin=0.0)
+            if pocket is not None:
+                trays.append((t, pocket))
+            elif -0.35 < t.x < 0.70 and self.rejected_log.get(t.key, 0) < now:
+                # diagnostic: a tray in the window with no usable pocket - vision occupancy vs GT occupancy
+                self.rejected_log[t.key] = now + 2.0
+                self.get_logger().info(
+                    f"rejected tray {t.key} at x {t.x:.2f}: vision occupied"
+                    f" {''.join('x' if v else '.' for v in t.occupied)} vs GT {self.gteval.occupancy_gt(t)}"
+                )
+        # only products that a tray in the window can take (several tray models may share the outfeed)
+        fits_now = {cls for t, _ in trays for cls in PRODUCT_FITS.get((t.spec or self.tray).name, [])}
+        cands = []
+        why = self.idle_why  # why candidates are not pickable right now (diagnostic for the idle time)
+        for c in self.candidates(cfg.fits):
+            why["seen"] += 1
+            reason = candidate_reason(c, cfg.lead, cfg.x_window, fits_now, BELT_Z, self.blacklist, now)
+            if reason is None and c.tid is not None:
+                cands.append((c, c.x + c.vx * cfg.lead))
+            elif reason is not None:
+                why[reason if reason in why else "other"] += 1
+        if not trays:
+            why["no_tray"] += 1
+        why["polls"] += 1
+        return trays, cands
+
+    def log_idle(self, idle):
+        """Why the arm waited before this cycle, per scheduler poll (then reset the accounting)."""
+        why = self.idle_why
+        if idle > 0.5 and why["polls"]:
+            n = why["polls"]
+            self.get_logger().info(
+                f"idle {idle:.1f} s: per poll {why['seen'] / n:.1f} tracked, {why['occluded'] / n:.1f} occluded,"
+                f" {why['window'] / n:.1f} outside x-window, {why['reach'] / n:.1f} unreachable,"
+                f" {why['blacklist'] / n:.1f} blacklisted, {why['no tray for class'] / n:.1f} no tray for class,"
+                f" {why['other'] / n:.1f} other; no tray {100 * why['no_tray'] / n:.0f} % of polls"
+            )
+        self.idle_why = dict.fromkeys(self.idle_why, 0)
+
+    def pick(self, c, x_arrive, tc, tl, attempts):
+        """Phase 2: fly through the predicted hover point, track the product down to contact and wait for the seal.
+        Returns (sealed, held product name as the gripper reports it). A failed pick is blacklisted, retreated from
+        and counted. On success tl['approach'] / tl['seal_wait'] are set, `approach_est` is refined (simulation
+        seconds) and the vision grasp offset `c.off` is replaced by the one measured at the seal."""
+        cfg = self.cfg
+        tc_sim = self.sim_now()  # kinematic leads are simulation time (RTF-invariant)
+        frame = f"prod_{c.tid}"
+        lift = self.joint_lift(0.04) if self.in_pocket else []
+        n_pick = 3 + len(lift)
+        ev = {"contact": None, "vac_on": None, "contact_gt": None, "contact_sim": None}
+
+        def on_fb_pick(fb, n=n_pick):
+            p = fb.feedback.progress
+            self.get_logger().debug(
+                f"fb pick seg {fb.feedback.segment_index} progress {p:.3f} t+{time.monotonic() - tc:.2f}"
+            )
+            # progress is (idx + 1) / n when a segment completes and (idx + 0.5) / n when the last one is reached
+            if abs(p - (n - 1.0) / n) < 1e-3 and ev["vac_on"] is None:  # hover reached: descending onto the product
+                self.vacuum_cmd(True)
+                ev["vac_on"] = time.monotonic()
+            if abs(p - (n - 0.5) / n) < 1e-3 and ev["contact"] is None:  # contact reached, dwelling
+                ev["contact"] = time.monotonic()
+                ev["contact_sim"] = self.sim_now()
+                # diagnostic (GT): where is the product relative to the estimate the cup just landed on?
+                ev["contact_gt"] = self.gteval.nearest_product(c.x + c.vx * (ev["contact"] - tc), c.y)
+
+        # fly through the predicted hover point at speed (a plain PTP/VIA is faster than converging a tracked target
+        # from far away), then track: hover -> contact
+        cur = self.cup_yaw()
+        yaw_pick = c.yaw if cur is None else nearest_branch(c.yaw, cur)
+        c.bp = yaw_pick - c.yaw
+        # straight up first when the cup is still in the pocket it just filled (at wall-top height): a diagonal
+        # departure clips the rim and drags the tray. A PTP: a via point at the current pose never completes.
+        pick = lift + [
+            seg(MotionSegment.VIA_CART, x_arrive, c.y, c.top + cfg.hover, yaw_pick, via_speed=0.5),
+            seg(MotionSegment.TRACK_CART, 0.0, 0.0, cfg.hover, c.bp, tracked=frame),
+            # the pick contact may settle loosely: the grasp offset is measured at the seal and compensated at the
+            # place, where the tight tolerance matters
+            seg(
+                MotionSegment.TRACK_CART, 0.0, 0.0, cfg.contact, c.bp, dwell=cfg.seal_budget, tracked=frame, settle=0.005
+            ),
+        ]
+        self.in_pocket = False
+        gh = self.send_goal(pick, f"pick {c.key}", on_feedback=on_fb_pick)
+        if gh is None:
+            self.blacklist[c.key] = time.monotonic() + 15.0
+            return False, None
+        rf = gh.get_result_async()
+        sealed = False
+        # a contact that does not seal within a couple of seconds never will (cup on a seam, pushed product):
+        # give the product up instead of riding it down the belt
+        t_deadline = time.monotonic() + cfg.seal_timeout
+        while time.monotonic() < t_deadline:
+            with self.lock:
+                if ev["vac_on"] and self.vac_sealed and self.vac_t > ev["vac_on"]:
+                    sealed = True
+            if sealed or rf.done():
+                break
+            time.sleep(0.002)
+        t_sealed = time.monotonic()
+        if not sealed:
+            _ok, msg = (rf.result().result.success, rf.result().result.message) if rf.done() else (False, "no seal")
+            detail = self.gteval.no_seal_detail(c, ev["contact_gt"], c.x + c.vx * (t_sealed - tc))
+            self.get_logger().warn(
+                f"pick {c.key} failed: {msg} ({t_sealed - tc:.2f} s after start, x_arrive {x_arrive:.3f}, y {c.y:.3f})"
+                f"{detail}"
+            )
+            fl = dict(self.status.get("failures", {}))
+            fl["pick"] = fl.get("pick", 0) + 1
+            self.publish_status("running", attempts=attempts, failures=fl, last=f"pick {c.key} failed: {msg}")
+            self.blacklist[c.key] = time.monotonic() + 15.0
+            self.vacuum_cmd(False)
+            if not rf.done():
+                gh.cancel_goal_async()
+            time.sleep(0.05)
+            self.run_motion([seg(MotionSegment.PTP_CART, 0.0, 0.0, cfg.hover, 0.0, frame="tcp")], "retreat")
+            return False, None
+        tl["approach"] = (ev["contact"] or t_sealed) - tc
+        # the look-ahead must be in simulation seconds: below real time a wall-clock estimate is too long
+        self.approach_est = 0.8 * self.approach_est + 0.2 * ((ev["contact_sim"] or self.sim_now()) - tc_sim)
+        tl["seal_wait"] = t_sealed - (ev["contact"] or t_sealed)
+        with self.lock:
+            held = self.vac_attached
+        self.blacklist[c.key] = time.monotonic() + 15.0  # its track lives on by prediction: never pick the ghost
+        tp = self.track_pose(c.tid)
+        fk = self.fk_xy()
+        if tp is not None and fk is not None:
+            # the cup seals a few mm off the product centre (settle tolerance, tracker error, prediction during
+            # the occluded descent): measure it from the tracked centre and the cup (FK) and let the place
+            # compensate the measured offset instead of the vision estimate
+            off_meas = (tp.x - fk[0], tp.y - fk[1])
+            if math.hypot(*off_meas) < 0.03:
+                self.get_logger().info(
+                    f"grasp offset measured ({1e3 * off_meas[0]:+.0f},{1e3 * off_meas[1]:+.0f}) mm"
+                    f" (vision estimate ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm)"
+                )
+                c.off = off_meas
+        self.psi_seal = self.cup_yaw()
+        self.gteval.log_grasp_offset(c, held, tp, self.psi_seal)  # diagnostic (GT): where the cup really sealed
+        return True, held
+
+    def choose_pocket(self, c, trays):
+        """Phase 3: the tray is chosen now (the one selected before the pick has moved on). The nearest free pocket
+        that will still be reachable with margin; else one reachable right now; else hold the product up to 6 s for
+        a pocket to come in reach; as a last resort the pre-pick choice `trays[0]`."""
+        cfg = self.cfg
+
+        def reachable_pockets(margin):
+            fresh = []
+            for t in self.trays():
+                if t.tid is None or t.tilt > math.radians(3) or abs(t.z - BELT_Z) > 0.012:
+                    continue
+                if c.cls not in PRODUCT_FITS.get((t.spec or self.tray).name, []):
+                    continue
+                pk = self.free_pocket_moving(t, cfg.place_lead, margin=margin)
+                if pk is not None:
+                    px, py, _ = (t.spec or self.tray).pocket_world((t.x + t.vx * cfg.place_lead, t.y, t.z), t.yaw, pk)
+                    fresh.append((math.hypot(px - c.x, py - c.y), t, pk))
+            return fresh
+
+        fresh = reachable_pockets(0.5)
+        if not fresh:  # nothing with margin: the pockets that are still reachable right now, no margin
+            fresh = reachable_pockets(0.0)
+            if fresh:
+                self.get_logger().info("place: no pocket with reach margin, taking one reachable now")
+        t_wait0 = time.monotonic()
+        while not fresh and time.monotonic() - t_wait0 < 6.0:  # hold the product until a pocket comes in reach
+            if time.monotonic() - t_wait0 < 0.05:
+                self.get_logger().info("place: waiting for a reachable pocket (holding the product)")
+            time.sleep(0.05)
+            fresh = reachable_pockets(0.3)  # a pocket at the edge ends the place where the lift cannot be solved
+        if fresh:
+            _, tray, pocket = min(fresh, key=lambda f: f[0])  # shortest transfer
+            return tray, pocket
+        tray, pocket = trays[0]
+        self.get_logger().warn(
+            f"place: no reachable pocket in 6 s, falling back to {tray.key}[{pocket}] seen before the pick"
+        )
+        return tray, pocket
+
+    def place(self, c, held, tray, pocket, tl):
+        """Phase 4: transfer above the pocket walls, track the pocket down, release on contact, wait for the unseal.
+        The cup holds the product off-centre by the measured grasp offset: expressed in the product frame that
+        offset is constant through the J4 turn, so the cup aims at pocket - offset. Returns the motion result; sets
+        tl['transfer'] / tl['release'], latches the pocket and starts the (GT) placement measurement."""
+        cfg = self.cfg
+        h = PRODUCT_HEIGHT[c.cls]
+        tframe = f"tray_{tray.tid}"
+        spec = tray.spec or self.tray
+        ox, oy = spec.pocket_offset(pocket)
+        self.get_logger().info(
+            f"place decision {c.key} -> {tray.key}[{pocket}]: tray x {tray.x:.2f}, occupied"
+            f" {''.join('x' if v else '.' for v in tray.occupied)}{self.gteval.tray_frame_detail(tray)}"
+        )
+        cur = self.cup_yaw()
+        yaw_place = tray.yaw if cur is None else nearest_branch(tray.yaw, cur)
+        bq = yaw_place - tray.yaw
+        sgn = round(math.cos(bq - c.bp))  # +-1: the product frame relative to the tray frame once placed
+        cp, sp = math.cos(-c.yaw), math.sin(-c.yaw)
+        offx, offy = cp * c.off[0] - sp * c.off[1], sp * c.off[0] + cp * c.off[1]
+        if math.hypot(offx, offy) < 0.03:  # sanity: a bigger "offset" is a bad mask, not a real grasp offset
+            ox, oy = ox - sgn * offx, oy - sgn * offy
+        # release 10 mm above the pocket floor: the pocket walls (25 mm) still guide the product, and with 5 mm of
+        # clearance per side a cup that is a few mm off would otherwise press the product onto a wall and drag the
+        # tray along the belt
+        z_place = spec.base_thickness + h + 0.010
+        # the product hangs below the cup: approach above the pocket walls (flying to a far pocket crosses the
+        # others), then descend vertically in the tray frame. Clipping a wall at belt speed throws the tray.
+        z_clear = spec.base_thickness + spec.pocket_depth + 0.02 + h
+        rel = {"t": None}
+
+        def on_fb_place(fb, n=3):
+            if abs(fb.feedback.progress - 2.5 / n) < 1e-3 and rel["t"] is None:  # pocket contact reached: release
+                self.vacuum_cmd(False)
+                rel["t"] = time.monotonic()
+                self.gteval.log_release_yaw(held, tray, pocket, (ox, oy), self.psi_seal)
+
+        px_w, py_w, _zf = spec.pocket_world((tray.x + tray.vx * cfg.place_lead, tray.y, tray.z), tray.yaw, pocket)
+        place = [
+            seg(MotionSegment.VIA_CART, px_w, py_w, tray.z + z_clear, yaw_place, via_speed=0.35),
+            seg(MotionSegment.TRACK_CART, ox, oy, z_clear, bq, tracked=tframe),
+            # 3.5 mm on the measured arm: the steady command-measured lag while tracking is ~2 mm, a 2.5 mm
+            # tolerance hovered at the threshold for a second
+            seg(MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=0.08, tracked=tframe, settle=0.0035),
+        ]
+        t_place0 = time.monotonic()
+        ghp = self.send_goal(place, f"place {c.key} -> {tray.key}[{pocket}]", on_feedback=on_fb_place)
+        ok = False
+        if ghp is not None:
+            ok, _ = self.wait_result(ghp, f"place {c.key} -> {tray.key}[{pocket}]")
+        if rel["t"] is None:  # the contact feedback never came (failed place): make sure the cup lets go
+            self.vacuum_cmd(False)
+        tl["transfer"] = (rel["t"] or time.monotonic()) - t_place0
+        tl["release"] = time.monotonic() - (rel["t"] or time.monotonic())
+        if rel["t"] is not None:
+            # the vacuum lets go with a delay: leaving before it does drags the product along the departure
+            t_u0 = time.monotonic()
+            while time.monotonic() - t_u0 < 0.5:
+                with self.lock:
+                    if not self.vac_sealed:
+                        break
+                time.sleep(0.005)
+            self.get_logger().info(f"unsealed after {time.monotonic() - rel['t']:.3f} s (release command to unsealed)")
+        self.latched[(tray.key, pocket)] = time.monotonic() + 2.0
+        self.in_pocket = rel["t"] is not None  # the cup is down in the pocket: the next goal must lift first
+        threading.Thread(target=self.measure_placement, args=(c.key, tray, pocket, held), daemon=True).start()
+        return ok
 
     # ---------------- placement accuracy (ground truth, metric only) ----------------
     def joint_lift(self, dz):

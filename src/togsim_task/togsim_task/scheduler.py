@@ -14,6 +14,27 @@ PLACE_X_WINDOW = (
 )  # m, pocket x at arrival: the reach checks bound the far side, this keeps the cup off the base
 MIN_RADIUS_NOW = 0.30  # m, not folded against the base, now and at arrival
 
+# the cell's products and trays (heights: the cup contact height above the belt is product top - contact offset)
+PRODUCT_HEIGHT = {"product_bar": 0.0186, "product_carton": 0.025}
+PRODUCT_FITS = {"tray_2x4": ["product_carton"], "tray_bar_2x3": ["product_bar"]}
+BELT_Z = 0.52  # m, belt surface in the world
+
+
+@dataclass
+class CycleConfig:
+    """The constants of one continuous run, read once from the parameters at start."""
+
+    belt_speed: float
+    hover: float  # m above the product top where the tracked descent starts
+    x_window: tuple  # m, pick window along the infeed (x at arrival)
+    lead: float  # s, pick look-ahead: the fly-through point is predicted this far ahead
+    place_lead: float  # s, place look-ahead
+    seal_budget: float  # s, dwell at contact waiting for the seal (the place goal preempts it)
+    contact: float  # m, contact offset below the product top (press)
+    seal_timeout: float  # s, give the product up when the cup does not seal
+    fits: list  # every product class a known tray takes
+    park: list  # m, x y z of the park pose
+
 
 def reachable(x, y, rmin=REACH_MIN, rmax=REACH_MAX):
     """Inside the annulus the arm reaches without stretching or folding."""

@@ -11,6 +11,8 @@ import time
 from rclpy.node import Node
 from tf2_msgs.msg import TFMessage
 
+from togsim_task.scheduler import PRODUCT_HEIGHT
+
 
 def yaw_of(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
@@ -168,4 +170,116 @@ class GroundTruthEval:
             f"placement accuracy over {len(d)}: offset mean {1e3 * sum(d) / len(d):.1f} mm, "
             f"p95 {1e3 * d[int(0.95 * (len(d) - 1))]:.1f} mm | yaw mean {sum(y) / len(y):.1f} deg, "
             f"p95 {y[int(0.95 * (len(y) - 1))]:.1f} deg"
+        )
+
+    # ---------------- per-phase diagnostics (text for the log; "" / None without ground truth) ----------------
+    def occupancy_gt(self, t):
+        """Pocket occupancy of the GT tray nearest to tracked tray `t`, as 'x..x (tray_N)', or '?'."""
+        with self.lock:
+            gt = dict(self.gt)
+        loc = self.in_tray_frame((t.x, t.y), gt)
+        if loc is None:
+            return "?"
+        tp, tyaw = gt[loc[0]][0], gt[loc[0]][1]
+        spec = t.spec or self.tray
+        occ = [False] * spec.n_pockets
+        for pn, (pp, _, _, _) in gt.items():
+            if pn.startswith("product_") and abs(pp[2] - tp[2]) < 0.06:
+                k = spec.pocket_of_point(tp, tyaw, pp[0], pp[1])
+                if k is not None:
+                    occ[k] = True
+        return "".join("x" if v else "." for v in occ) + f" ({loc[0]})"
+
+    def nearest_product(self, x, y):
+        """(distance, name, dx, dy, entry) of the GT product nearest to the estimate (x, y), or None."""
+        with self.lock:
+            gt = dict(self.gt)
+        return min(
+            (
+                (math.hypot(g[0][0] - x, g[0][1] - y), n, g[0][0] - x, g[0][1] - y, g)
+                for n, g in gt.items()
+                if n.startswith("product_")
+            ),
+            default=None,
+        )
+
+    def no_seal_detail(self, c, contact_gt, xe):
+        """Why a pick did not seal: was the estimate wrong (top height, position) or the product unpickable?
+        `contact_gt` is nearest_product() at contact, `xe` the estimate's x at the failure."""
+        why = ""
+        if contact_gt is not None:
+            _d, nm, dx, dy, _g = contact_gt
+            why = f"; at contact GT {nm} was ({1e3 * dx:+.0f},{1e3 * dy:+.0f}) mm from the estimate"
+        near = self.nearest_product(xe, c.y)
+        if near is not None:
+            d, n, _dx, _dy, g = near
+            hgt = PRODUCT_HEIGHT.get("product_" + n.split("_")[1], 0.0)
+            why += (
+                f"; at failure nearest GT {n} {1e3 * d:.0f} mm from the estimate, top est {1e3 * c.top:.1f} vs GT"
+                f" {1e3 * (g[0][2] + hgt):.1f} mm, tilt {math.degrees(g[2]):.0f} deg"
+            )
+        return why
+
+    def log_grasp_offset(self, c, held, tp, psi):
+        """Where the cup really sealed relative to the product centre (GT) vs the offset the place compensates for
+        (`c.off`, measured from the track `tp` and FK), the pick yaw error and the cup command error."""
+        with self.lock:
+            g = self.gt.get(held)
+        if g is None or tp is None:
+            return
+        ax, ay = g[0][0] - tp.x, g[0][1] - tp.y
+        dyaw = math.degrees((c.yaw - g[1] + math.pi / 2) % math.pi - math.pi / 2)  # mod 180: axis ambiguity is fine
+        cupd = (
+            ""
+            if psi is None
+            else f", cup-cmd {math.degrees((psi - c.yaw + math.pi) % (2 * math.pi) - math.pi):+.0f} deg"
+        )
+        self.get_logger().info(
+            f"grasp offset {held}: actual ({1e3 * ax:+.0f},{1e3 * ay:+.0f}) mm, estimated"
+            f" ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm, pick yaw error {dyaw:+.0f} deg{cupd}"
+        )
+
+    def tray_frame_detail(self, tray):
+        """The tracked tray frame vs the real tray now, and the same message against GT at its own stamp (separates
+        a stale delivery from a lagging track)."""
+        loc = self.in_tray_frame((tray.x, tray.y))
+        if loc is None:
+            return ""
+        ferr = f", frame err ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm vs {loc[0]}"
+        st = getattr(tray, "stamp", None)
+        if st is not None:
+            with self.lock:
+                hist = list(self.gt_hist.get(loc[0], []))
+            if hist:
+                tg, xg, _ = min(hist, key=lambda e: abs(e[0] - st))
+                ferr += (
+                    f"; stamp age {self.sim_now() - st:.2f} s, raw x - GT x at stamp {1e3 * (tray.x_raw - xg):+.0f} mm"
+                    f" (GT dt {tg - st:+.2f}), vx {tray.vx:.3f}, predicted +{1e3 * (tray.x - tray.x_raw):.0f} mm,"
+                    f" rx age {getattr(tray, 'rx_age', -1.0):.2f} s"
+                )
+        return ferr
+
+    def log_release_yaw(self, held, tray, pocket, target, psi_seal):
+        """Who is rotated at release, the cup or the product? Cup vs tray, product vs tray and product vs cup (GT),
+        where the product is in the GT tray, and how far J4 turned since the seal."""
+        psi = self.cup_yaw()
+        with self.lock:
+            g = self.gt.get(held)
+        if psi is None or g is None:
+            return
+        wrap = lambda a: math.degrees((a + math.pi) % (2 * math.pi) - math.pi)  # noqa: E731
+        wrap180 = lambda a: math.degrees((a + math.pi / 2) % math.pi - math.pi / 2)  # noqa: E731
+        loc = self.in_tray_frame(g[0])
+        where = "" if loc is None else f", product at ({1e3 * loc[1]:+.0f},{1e3 * loc[2]:+.0f}) mm in GT {loc[0]}"
+        self.get_logger().info(
+            f"release yaw {held} -> {tray.key}[{pocket}]: cup-tray {wrap(psi - tray.yaw):+.0f} deg,"
+            f" product-tray {wrap180(g[1] - tray.yaw):+.0f} deg, product-cup {wrap180(g[1] - psi):+.0f} deg"
+            f"{where}; target pocket ({1e3 * target[0]:+.0f},{1e3 * target[1]:+.0f}) mm in {tray.key}"
+            + (
+                ""
+                if psi_seal is None
+                else f"; J4 turned {wrap(psi - psi_seal):+.0f} deg since seal"
+                + self.frame_err_now(tray.tid)
+                + self.fk_vs_gt(g[0])
+            )
         )

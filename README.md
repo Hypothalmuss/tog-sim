@@ -78,8 +78,11 @@ per run (cycles, attempts, cpm, motion time, placement mean/p95 from ground trut
 products for placement). Placement = released product vs the centre of the pocket it sits in (ground truth); the pocket
 clearance is 5 mm per side. The tuned perception gates live in
 [`src/togsim_perception/config/perception_tuning.yaml`](src/togsim_perception/config/perception_tuning.yaml) with
-their rationale; `run_cycle` keeps all ground-truth evaluation in `togsim_task/diagnostics.py` (`eval:=false` for a plain
-demo), and the scheduling rules in `togsim_task/scheduler.py` (unit-tested).
+their rationale. `run_cycle` is one cycle in four phase methods - `schedule` (what is pickable now and where it can
+go), `pick` (fly, track, seal; measures the grasp offset), `choose_pocket` (after the pick: the tray chosen before has
+moved on) and `place` (track the pocket, release, unseal) - with the run constants in a `CycleConfig`; the scheduling
+rules are in `togsim_task/scheduler.py` (unit-tested) and every ground-truth diagnostic in `togsim_task/diagnostics.py`
+(`eval:=false` for a plain demo).
 
 **Reference (3×40 cycles, cartons 60/min, `fast`, outfeed 0.06 m/s): 120/120 = 100 % [97–100], 13.4 [12.2–14.7]
 picks/min, placement 2.7 [2.4–3.0] mm mean, 5.8 [4.8–7.1] mm p95** — see the report for every configuration.

@@ -96,6 +96,7 @@ Motion profiles (`motion_profile:=fast|smooth`, `scripts/joint_metrics.py` sampl
 |---|---|---|---|---|
 | fast | 7–10 | 3.2–4.2 s | 40 / 45 / 51 | 457 / 491 / 1391 |
 | smooth | 6–7 | 4.4–4.5 s | 22 / 26 / 33 | 213 / 223 / 833 |
+| max (`profile_max.yaml`, bench only) | 13.7 (outfeed 0.06) | 2.4 s | 63 / 55 / 95 | 1627 / 1292 / 2592 |
 
 What made the difference (details in the commit log): tracked segments settle on the *measured* arm including the
 heading, the place approach clears the pocket walls, the grasp offset is measured at the seal and compensated at the

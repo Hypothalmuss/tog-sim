@@ -30,8 +30,9 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Continuous vision-driven pick & place from the *moving* belts (YOLO11n-seg → pick poses → conveyor tracker →
 `TRACK_CART` motions), recorded with `scripts/demo.sh vision 30` (`DEMO_CLASSES=product_carton DEMO_RATE=60.0
-DEMO_PROFILE=fast`): 10/10 cycles during the recording at ~10 picks/min including waits; products land within a few mm
-of the pocket centre (numbers in [Benchmarks](#benchmarks)). The operator HMI (`http://localhost:8080`) runs alongside.
+DEMO_PROFILE=fast DEMO_OUTFEED=0.06`): 7 cycles in the 40 s clip, the first four back-to-back at ~20 picks/min, then
+waits for the next tray; products land within a few mm of the pocket centre (numbers in [Benchmarks](#benchmarks)).
+The operator HMI (`http://localhost:8080`) runs alongside.
 
 ## Quick start (native)
 

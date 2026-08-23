@@ -35,7 +35,7 @@ class CycleConfig:
     seal_timeout: float  # s, give the product up when the cup does not seal
     fits: list  # every product class a known tray takes
     park: list  # m, x y z of the park pose
-    track_lag: float = 0.0  # s, the measured arm trails a tracked pocket by belt speed x this (place lead)
+    track_lag: float = 0.04  # s, the measured arm trails a tracked pocket by belt speed x this (place lead)
     release_dwell: float = 0.25  # s, tracked dwell at the pocket after the release command (covers the unseal delay)
 
 

@@ -18,8 +18,9 @@ run_cycle:
                               # a seam, pushed product) - give it up instead of riding it down the belt
     park: [-0.25, -0.25, 0.75]  # m, waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for |y| < 1.1;
                               # parked over the belt the arm hid products (bar recall 0.5-0.64)
-    track_lag_s: 0.0          # s, place lead along the belt = belt speed x this: the measured arm trails a tracked
-                              # pocket by ~2 mm at 0.05 m/s in every carton bench (0.04 would cancel it; benched as P5)
+    track_lag_s: 0.04         # s, place lead along the belt = belt speed x this: the measured arm trails a tracked
+                              # pocket by ~2 mm at 0.05 m/s. 2x40 bench on top of the dwell: along-belt bias -2.8 ->
+                              # -0.8 mm, placement 3.2 / 6.2 -> 2.7 [2.4-3.0] / 5.6 [4.6-6.5] mm (2x40, docs/benchmarks.md)
     release_dwell_s: 0.25     # s, the cup keeps tracking the pocket this long after the release command. At 0.08 the
                               # cup stopped tracking before the product had let go and left it 5-10 mm behind the
                               # pocket along the belt (-2 mm mean, -9 mm tail): 2x40 bench 3.7 / 8.0 mm -> 3.2 / 6.2 mm

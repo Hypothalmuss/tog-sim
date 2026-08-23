@@ -86,15 +86,15 @@ rules are in `togsim_task/scheduler.py` (unit-tested) and every ground-truth dia
 (`eval:=false` for a plain demo).
 
 **Reference (cartons 60/min, `fast`, outfeed 0.06 m/s, 2×40 cycles with every fix below): 80/80 = 100 % [95–100],
-13.6 [12.2–15.4] picks/min, placement 3.2 [2.8–3.7] mm mean, 6.2 [5.6–8.8] mm p95; the 3×40 baseline before the
-bar-tray work was 13.4 [12.2–14.7] picks/min, 2.7 [2.4–3.0] / 5.8 [4.8–7.1] mm** — see the report for every
-configuration and for the rejected levers.
+placement 2.7 [2.4–3.0] mm mean, 5.6 [4.6–6.5] mm p95, 12.1 [10.7–13.7] picks/min wall-clock at a real-time factor
+of 0.68 (13.4–14.6 in the runs at 0.7–0.75: the cell is tray-supply bound, see the Notes)** — see the report for
+every configuration and for the rejected levers.
 
-| scenario (vision) | success | picks/min | placement mean | p95 |
+| scenario (vision) | success | picks/min (wall-clock) | placement mean | p95 |
 |---|---|---|---|---|
-| cartons only, 60/min, `fast`, outfeed 0.06 m/s (2×40) | 80/80 | 13.6 [12.2–15.4] | 3.2 [2.8–3.7] mm | 6.2 [5.6–8.8] mm |
+| cartons only, 60/min, `fast`, outfeed 0.06 m/s (2×40, final defaults) | 80/80 | 12.1 [10.7–13.7] at rtf 0.68 | 2.7 [2.4–3.0] mm | 5.6 [4.6–6.5] mm |
 | bars only on `tray_bar_2x3`, 30/min (12 cycles) | 12/12, no tray disturbed | 11.9 | 4.4 mm | 6.1 mm |
-| cartons + bars 30/min on `tray_2x4` + `tray_bar_2x3` (2×20) | 40/42 = 95 % [84–99] | 7.2 [5.5–9.8] (supply-bound) | 5.1 [3.6–7.0] mm | 8.7 mm |
+| cartons + bars 30/min on `tray_2x4` + `tray_bar_2x3` (2×20, final defaults) | 40/40 = 100 % [91–100], no tray disturbed | 7.5 [5.7–10.1] (supply-bound) | 4.5 [3.8–5.2] mm | 8.1 [6.0–11.7] mm |
 
 Motion profiles (`motion_profile:=fast|smooth`, `scripts/joint_metrics.py` samples `/joint_states`, cartons 60/min):
 

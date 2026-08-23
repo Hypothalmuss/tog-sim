@@ -96,7 +96,7 @@ class RunCycle(Node):
         self.declare_parameter("pick_x_max", 0.50)
         self.declare_parameter("hover", 0.03)
         self.declare_parameter("seal_timeout_s", 2.5)
-        self.declare_parameter("track_lag_s", 0.0)  # s, cup behind a tracked pocket at belt speed (place x lead)
+        self.declare_parameter("track_lag_s", 0.04)  # s, cup behind a tracked pocket at belt speed (place x lead)
         self.declare_parameter("release_dwell_s", 0.25)  # s, keep tracking the pocket after the release command
         self.declare_parameter("outfeed_speed", 0.0)  # 0 = same as belt_speed
         self.declare_parameter("belt_speed", 0.10)

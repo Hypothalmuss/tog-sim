@@ -9,8 +9,13 @@
 <body>
 <header>
   <h1>tog-sim &mdash; pick &amp; place cell</h1>
-  <div id="state" class="pill idle">idle</div>
+  <div class="hdr-right">
+    <div id="health" class="health"></div>
+    <div id="state" class="pill idle">idle</div>
+    <button id="btn_estop" class="estop" title="stop the cycle and both belts">E-STOP</button>
+  </div>
 </header>
+<div id="alarms" class="alarms hidden"></div>
 <main>
   <section class="cards">
     <div class="card"><div class="label">cycles</div><div class="value" id="cycles">0</div><div class="sub" id="attempts">0 attempts</div></div>
@@ -28,10 +33,20 @@
         <label>perception
           <select id="run_perception"><option value="vision">vision</option><option value="gt">ground truth</option></select>
         </label>
-        <label>belt <input id="run_belt" type="number" value="0.10" step="0.01" min="0.02" max="0.30"> m/s</label>
+        <label>infeed <input id="run_belt" type="number" value="0.10" step="0.01" min="0.02" max="0.30"> m/s</label>
+        <label>outfeed <input id="run_outfeed" type="number" value="0.06" step="0.01" min="0.02" max="0.30"> m/s</label>
+        <label>recipe
+          <select id="run_recipe">
+            <option value="">custom</option>
+            <option value="cartons_fast">cartons 60/min, fast, outfeed 0.06</option>
+            <option value="mixed_smooth">bars + cartons 24/min, smooth</option>
+            <option value="gt_check">ground-truth check, 12 cycles</option>
+          </select>
+        </label>
         <button id="btn_start" class="primary">Start</button>
         <button id="btn_stop" class="danger">Stop</button>
       </div>
+      <div class="kv"><span>rate over time (picks/min)</span><canvas id="spark" width="260" height="44"></canvas></div>
     </div>
     <div class="panel">
       <h2>Conveyors</h2>
@@ -61,6 +76,9 @@
   <section class="row">
     <div class="panel"><h2>Events</h2><ul id="events" class="events"></ul></div>
     <div class="panel"><h2>run_cycle log</h2><pre id="log" class="log"></pre></div>
+  </section>
+  <section class="row">
+    <div class="panel wide"><h2>Run history</h2><table id="history" class="hist"><thead><tr><th>ended</th><th>recipe</th><th>cycles</th><th>cpm</th><th>placement mean / p95</th><th>failures</th></tr></thead><tbody></tbody></table></div>
   </section>
 </main>
 <script src="/static/app.js"></script>

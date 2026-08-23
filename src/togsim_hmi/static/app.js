@@ -38,8 +38,8 @@ function render(s) {
   const state = s.running ? (st.state === "finished" ? "finished" : st.state || "running") : (st.state === "finished" ? "finished" : "idle");
   $("state").textContent = state;
   $("state").className = "pill " + state;
-  $("cycles").textContent = st.cycles ?? 0;
-  $("attempts").textContent = `${st.attempts ?? 0} attempts`;
+  $("cycles").textContent = (st.cycles || 0);
+  $("attempts").textContent = `${(st.attempts || 0)} attempts`;
   $("cpm").textContent = fmt(st.cpm);
   const att = st.attempts || 0, cyc = st.cycles || 0;
   $("success").textContent = att ? `${Math.round((100 * cyc) / att)}%` : "–";
@@ -52,8 +52,8 @@ function render(s) {
   $("belt_in_m").textContent = `measured ${fmt(s.belts.infeed, 2)}`;
   $("belt_out_m").textContent = `measured ${fmt(s.belts.outfeed, 2)}`;
   renderTrays(s.trays || []);
-  $("prod_n").textContent = s.products.n ?? 0;
-  $("prod_pickable").textContent = s.products.pickable ?? 0;
+  $("prod_n").textContent = (s.products.n || 0);
+  $("prod_pickable").textContent = (s.products.pickable || 0);
   $("vacuum").textContent = s.vacuum.sealed ? `sealed (${s.vacuum.attached || "?"})` : "released";
   const j = s.joints || {};
   $("joints").textContent = Object.keys(j).length
@@ -61,6 +61,7 @@ function render(s) {
     : "–";
   $("events").innerHTML = (s.events || []).map(([t, e]) => `<li><span>${t}</span>${e}</li>`).join("");
   $("log").textContent = (s.log || []).join("\n");
+  renderAlarms(s.alarms); renderHealth(s.health); sparkline(s.cpm_hist); renderHistory(s.history);
 }
 
 async function poll() {
@@ -74,8 +75,62 @@ async function poll() {
   setTimeout(poll, 500);
 }
 
+const RECIPES = {
+  cartons_fast: { cycles: 40, perception: "vision", belt: 0.10, outfeed: 0.06 },
+  mixed_smooth: { cycles: 20, perception: "vision", belt: 0.10, outfeed: 0.10 },
+  gt_check: { cycles: 12, perception: "gt", belt: 0.10, outfeed: 0.10 },
+};
+$("run_recipe").onchange = () => {
+  const r = RECIPES[$("run_recipe").value];
+  if (!r) return;
+  $("run_cycles").value = r.cycles; $("run_perception").value = r.perception;
+  $("run_belt").value = r.belt.toFixed(2); $("run_outfeed").value = r.outfeed.toFixed(2);
+};
 $("btn_start").onclick = () =>
-  post("/api/run", { cycles: Number($("run_cycles").value), perception: $("run_perception").value, belt: Number($("run_belt").value) });
+  post("/api/run", {
+    cycles: Number($("run_cycles").value), perception: $("run_perception").value,
+    belt: Number($("run_belt").value), outfeed: Number($("run_outfeed").value),
+  });
+$("btn_estop").onclick = () => { if (confirm("Emergency stop: stop the cycle and both belts?")) post("/api/estop"); };
+function ack(id) { post("/api/ack", { id }); }
+function sparkline(hist) {
+  const c = $("spark"), ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (!hist || hist.length < 2) return;
+  const ys = hist.map((h) => h[1]), max = Math.max(5, ...ys);
+  ctx.strokeStyle = "#3498db"; ctx.lineWidth = 2; ctx.beginPath();
+  hist.forEach((h, i) => {
+    const x = (i / (hist.length - 1)) * (c.width - 4) + 2, y = c.height - 3 - (h[1] / max) * (c.height - 8);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+  ctx.fillStyle = "#8b9bab"; ctx.font = "11px sans-serif"; ctx.fillText(`${ys[ys.length - 1].toFixed(1)} now, max ${max.toFixed(0)}`, 4, 11);
+}
+function renderAlarms(alarms) {
+  const box = $("alarms");
+  const active = (alarms || []).filter((a) => a.active || !a.acked);
+  box.className = "alarms" + (active.length ? "" : " hidden");
+  box.innerHTML = active.map((a) =>
+    `<div class="alarm ${a.active ? "" : "inactive"}"><span><b>${a.t}</b> ${a.text}${a.active ? "" : " (cleared)"}</span>` +
+    `<button onclick="ack('${a.id}')">${a.acked ? "acked" : "acknowledge"}</button></div>`).join("") +
+    (active.length > 1 ? `<div class="alarm"><span></span><button onclick="ack('all')">acknowledge all</button></div>` : "");
+}
+function renderHealth(h) {
+  const limits = { joints: 2, products: 3, trays: 4, "infeed belt": 3, "outfeed belt": 3 };
+  $("health").innerHTML = Object.entries(limits).map(([k, lim]) => {
+    const age = h && h[k] !== undefined ? h[k] : null;
+    const cls = age === null ? "" : age > lim ? "bad" : "ok";
+    return `<span class="${cls}" title="${age === null ? "no data" : age + " s ago"}">${k}</span>`;
+  }).join("");
+}
+function renderHistory(rows) {
+  $("history").querySelector("tbody").innerHTML = (rows || []).map((r) => {
+    const rec = r.recipe || {};
+    const fl = Object.entries(r.failures || {}).map(([k, v]) => `${v} ${k}`).join(", ") || "–";
+    return `<tr><td>${r.ended}</td><td>${rec.perception || ""} ${rec.belt || ""}/${rec.outfeed || ""} m/s</td>` +
+      `<td>${r.cycles}/${r.attempts}</td><td>${fmt(r.cpm)}</td><td>${fmt(r.placement_mean_mm)} / ${fmt(r.placement_p95_mm)} mm</td><td>${fl}</td></tr>`;
+  }).join("");
+}
 $("btn_stop").onclick = () => post("/api/stop");
 $("btn_belts").onclick = () => post("/api/belts", { infeed: Number($("belt_in").value), outfeed: Number($("belt_out").value) });
 $("btn_belts_stop").onclick = () => post("/api/belts", { infeed: 0, outfeed: 0 });

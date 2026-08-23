@@ -25,16 +25,12 @@ from tf2_msgs.msg import TFMessage
 from togsim_msgs.action import ExecuteMotion
 from togsim_msgs.msg import MotionSegment, PickCandidateArray, TrayState, VacuumState
 from togsim_msgs.srv import SetVacuum
+from togsim_task.scheduler import REACH_MAX, REACH_MIN, candidate_reason, free_pocket, nearest_branch, reachable
 from togsim_task.trays import TraySpec
 
 PRODUCT_HEIGHT = {"product_bar": 0.0186, "product_carton": 0.025}
 PRODUCT_FITS = {"tray_2x4": ["product_carton"], "tray_bar_2x3": ["product_bar"]}
-REACH_MIN, REACH_MAX = 0.22, 0.62
 BELT_Z = 0.52
-
-
-def reachable(x, y):
-    return REACH_MIN < math.hypot(x, y) < REACH_MAX
 
 
 def yaw_of(q):
@@ -59,12 +55,6 @@ def seg(type_, x=0.0, y=0.0, z=0.0, yaw=0.0, tilt=0.0, via_speed=0.0, dwell=0.0,
     s.dwell_s = float(dwell)
     s.tracked_frame = tracked
     return s
-
-
-def nearest_branch(yaw, ref, period=math.pi):
-    """Representative of `yaw` modulo `period` closest to `ref`: products and pockets are symmetric under 180 deg, so
-    the cup only ever needs to turn by at most 90 deg."""
-    return yaw + round((ref - yaw) / period) * period
 
 
 class Candidate:
@@ -171,7 +161,9 @@ class RunCycle(Node):
         self.last_on_tray = time.monotonic()
         self.approach_est = 1.4  # s, pick start -> contact, refined online
         self.gt_tool = {}  # GT poses of tool-like links, if present in pose/info (calibration diagnostics)
-        self.idle_why = dict.fromkeys(("seen", "occluded", "window", "reach", "blacklist", "no_tray", "polls"), 0)
+        self.idle_why = dict.fromkeys(
+            ("seen", "occluded", "window", "reach", "blacklist", "no tray for class", "other", "no_tray", "polls"), 0
+        )
         self.create_subscription(JointState, "/joint_states", self.on_joint_state, 10)
         self.vac = self.create_client(SetVacuum, "/togsim/vacuum", callback_group=self.cb)
         self.infeed = self.create_publisher(Float64, "/togsim/conveyor/infeed/cmd_vel", 10)
@@ -484,31 +476,12 @@ class RunCycle(Node):
             cands = []
             why = self.idle_why  # why candidates are not pickable right now (diagnostic for the idle time)
             for c in self.candidates(fits):
-                x_arrive = c.x + c.vx * lead
-                x_done = x_arrive + c.vx * 1.3  # still reachable once the cup has settled and sealed
                 why["seen"] += 1
-                if c.occluded:
-                    why["occluded"] += 1
-                elif not (xmin < x_arrive < xmax):
-                    why["window"] += 1
-                elif not (reachable(x_done, c.y) and math.hypot(x_arrive, c.y) > 0.28 and math.hypot(c.x, c.y) > 0.30):
-                    why["reach"] += 1
-                elif blacklist.get(c.key, 0) >= now:
-                    why["blacklist"] += 1
-                if (
-                    c.tid is not None
-                    and c.cls in fits_now
-                    and xmin < x_arrive < xmax
-                    and -0.6 < c.y < -0.1
-                    and reachable(x_done, c.y)
-                    and math.hypot(x_arrive, c.y) > 0.28
-                    and math.hypot(c.x, c.y) > 0.30
-                    and BELT_Z + 0.008 < c.top < BELT_Z + 0.08  # a product on the belt, not the arm or a stacked one
-                    and not c.occluded
-                    and c.tilt < math.radians(4)
-                    and blacklist.get(c.key, 0) < now
-                ):
-                    cands.append((c, x_arrive))
+                reason = candidate_reason(c, lead, (xmin, xmax), fits_now, BELT_Z, blacklist, now)
+                if reason is None and c.tid is not None:
+                    cands.append((c, c.x + c.vx * lead))
+                elif reason is not None:
+                    why[reason if reason in why else "other"] += 1
             if not trays:
                 why["no_tray"] += 1
             why["polls"] += 1
@@ -531,7 +504,8 @@ class RunCycle(Node):
                 self.get_logger().info(
                     f"idle {tl['idle']:.1f} s: per poll {why['seen'] / n:.1f} tracked, {why['occluded'] / n:.1f} occluded,"
                     f" {why['window'] / n:.1f} outside x-window, {why['reach'] / n:.1f} unreachable,"
-                    f" {why['blacklist'] / n:.1f} blacklisted; no tray {100 * why['no_tray'] / n:.0f} % of polls"
+                    f" {why['blacklist'] / n:.1f} blacklisted, {why['no tray for class'] / n:.1f} no tray for class,"
+                    f" {why['other'] / n:.1f} other; no tray {100 * why['no_tray'] / n:.0f} % of polls"
                 )
             self.idle_why = dict.fromkeys(self.idle_why, 0)
             attempts += 1
@@ -1020,31 +994,7 @@ class RunCycle(Node):
 
     def free_pocket_moving(self, tray, lead, margin=0.5):
         """First free, unlatched pocket that will still be reachable `lead` (+ `margin`) seconds from now."""
-        now = time.monotonic()
-        # leading pockets first: they leave the reach first, and a tray that passes with empty trailing pockets is
-        # cheaper than one that passes with empty leading ones (only the trailing ones are still reachable late)
-        spec = tray.spec or self.tray
-        order = sorted(
-            range(spec.n_pockets),
-            key=lambda k: (-spec.pocket_offset(k)[0], abs(spec.pocket_offset(k)[1])),
-        )
-        for i in order:
-            if tray.occupied[i] or self.latched.get((tray.key, i), 0) > now:
-                continue
-            px, py, _ = spec.pocket_world((tray.x + tray.vx * lead, tray.y, tray.z), tray.yaw, i)
-            # comfortably inside the arc: not at the reach limit, not folded against the base, now and when the cup arrives
-            px0, py0, _ = spec.pocket_world((tray.x, tray.y, tray.z), tray.yaw, i)
-            # ... and a little later: settling the heading can make the place outlast the lead
-            px1, py1, _ = spec.pocket_world((tray.x + tray.vx * (lead + margin), tray.y, tray.z), tray.yaw, i)
-            if (
-                reachable(px, py)
-                and reachable(px1, py1)
-                and -0.20 < px < 0.52  # the reach checks bound the far side; this keeps the cup off the robot side
-                and math.hypot(px, py) > 0.30
-                and math.hypot(px0, py0) > 0.30
-            ):
-                return i
-        return None
+        return free_pocket(tray.spec or self.tray, tray, lead, margin, self.latched, time.monotonic())
 
     # ---------------- main loop ----------------
     def run(self):

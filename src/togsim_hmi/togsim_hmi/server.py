@@ -41,6 +41,16 @@ class HmiBridge(Node):
         self.events = deque(maxlen=60)
         self.proc = None
         self.proc_lines = deque(maxlen=200)
+        # alarms: id -> dict(text, t, active, acked); raised from status failures, stale topics, the e-stop
+        self.alarms = {}
+        self.seen_failures = {}
+        self.last_rx = {}  # topic -> monotonic time of the last message (node health)
+        self.cpm_hist = deque(maxlen=120)  # (elapsed s, cpm) for the sparkline
+        self.run_start = None
+        self.recipe = {}
+        self.history_path = os.path.expanduser("~/togsim_data/hmi_runs.json")
+        self.history = self._load_history()
+        self.create_timer(1.0, self.health_tick)
         self.create_subscription(String, "/togsim/hmi/status", self.on_status, 10)
         for b in ("infeed", "outfeed"):
             self.create_subscription(Float64, f"/togsim/conveyor/{b}/state", lambda m, b=b: self._belt(b, m), 5)
@@ -55,6 +65,58 @@ class HmiBridge(Node):
     def _belt(self, name, msg):
         with self.lock:
             self.belts[name] = round(float(msg.data), 3)
+            self.last_rx[f"{name} belt"] = time.monotonic()
+
+    # ---- alarms / health / history ----
+    def raise_alarm(self, aid, text):
+        a = self.alarms.get(aid)
+        if a is None or not a["active"]:
+            self.alarms[aid] = {"id": aid, "text": text, "t": time.strftime("%H:%M:%S"), "active": True, "acked": False}
+            self.events.append((time.strftime("%H:%M:%S"), f"ALARM {text}"))
+
+    def clear_alarm(self, aid):
+        a = self.alarms.get(aid)
+        if a is not None and a["active"]:
+            a["active"] = False
+
+    def ack_alarm(self, aid):
+        with self.lock:
+            for k, a in self.alarms.items():
+                if aid == "all" or k == aid:
+                    a["acked"] = True
+            self.alarms = {k: a for k, a in self.alarms.items() if a["active"] or not a["acked"]}
+
+    def health_tick(self):
+        now = time.monotonic()
+        running = self.proc is not None and self.proc.poll() is None
+        with self.lock:
+            for topic, limit in (("joints", 2.0), ("products", 3.0), ("trays", 4.0)):
+                t = self.last_rx.get(topic)
+                stale = t is None or now - t > limit
+                if stale and running:
+                    self.raise_alarm(f"stale_{topic}", f"no {topic} data for > {limit:.0f} s (node down?)")
+                elif not stale:
+                    self.clear_alarm(f"stale_{topic}")
+            if running and self.run_start is not None:
+                el = now - self.run_start
+                if el > 5.0:
+                    self.cpm_hist.append((round(el, 1), round(60.0 * int(self.status.get("cycles", 0)) / el, 2)))
+
+    def _load_history(self):
+        try:
+            with open(self.history_path) as f:
+                return json.load(f)[-50:]
+        except (OSError, ValueError):
+            return []
+
+    def _save_history(self, entry):
+        self.history = (self.history + [entry])[-50:]
+        try:
+            os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
+            with open(self.history_path, "w") as f:
+                json.dump(self.history, f)
+        except OSError:
+            pass
 
     def on_status(self, msg):
         try:
@@ -66,10 +128,29 @@ class HmiBridge(Node):
             last = st.get("last", "")
             if last and (not self.events or self.events[-1][1] != last):
                 self.events.append((time.strftime("%H:%M:%S"), last))
+            for kind, n in (st.get("failures") or {}).items():
+                if n > self.seen_failures.get(kind, 0):
+                    self.seen_failures[kind] = n
+                    self.raise_alarm(f"fail_{kind}_{n}", f"{kind} failure #{n}: {last}")
+            if st.get("state") == "finished" and self.run_start is not None:
+                self._save_history(
+                    {
+                        "ended": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "cycles": st.get("cycles", 0),
+                        "attempts": st.get("attempts", 0),
+                        "cpm": st.get("cpm", 0.0),
+                        "placement_mean_mm": st.get("placement_mean_mm"),
+                        "placement_p95_mm": st.get("placement_p95_mm"),
+                        "failures": st.get("failures", {}),
+                        "recipe": dict(self.recipe),
+                    }
+                )
+                self.run_start = None
 
     def on_tray(self, msg):
         p = msg.pose.pose.position
         with self.lock:
+            self.last_rx["trays"] = time.monotonic()
             self.trays[int(msg.tray_id)] = {
                 "id": int(msg.tray_id),
                 "x": round(p.x, 3),
@@ -82,6 +163,7 @@ class HmiBridge(Node):
 
     def on_products(self, msg):
         with self.lock:
+            self.last_rx["products"] = time.monotonic()
             self.products = {
                 "n": len(msg.candidates),
                 "pickable": sum(1 for c in msg.candidates if not c.occluded),
@@ -94,6 +176,7 @@ class HmiBridge(Node):
 
     def on_joints(self, msg):
         with self.lock:
+            self.last_rx["joints"] = time.monotonic()
             self.joints = {n: round(v, 3) for n, v in zip(msg.name, msg.position, strict=False)}
 
     # ---- commands ----
@@ -104,9 +187,10 @@ class HmiBridge(Node):
                 with self.lock:
                     self.events.append((time.strftime("%H:%M:%S"), f"{name} belt -> {float(v):.2f} m/s"))
 
-    def start_run(self, cycles=20, perception="vision", belt=0.10):
+    def start_run(self, cycles=20, perception="vision", belt=0.10, outfeed=0.0):
         if self.proc is not None and self.proc.poll() is None:
             return False, "already running"
+        self.recipe = {"cycles": int(cycles), "perception": perception, "belt": float(belt), "outfeed": float(outfeed)}
         cmd = [
             "ros2",
             "run",
@@ -122,6 +206,8 @@ class HmiBridge(Node):
             "-p",
             f"belt_speed:={float(belt)}",
             "-p",
+            f"outfeed_speed:={float(outfeed)}",
+            "-p",
             "use_sim_time:=true",
         ]
         self.proc_lines.clear()
@@ -131,6 +217,9 @@ class HmiBridge(Node):
         threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
         with self.lock:
             self.status = {"state": "starting", "cycles": 0, "attempts": 0, "cpm": 0.0, "failures": {}}
+            self.seen_failures = {}
+            self.cpm_hist.clear()
+            self.run_start = time.monotonic()
             self.events.append(
                 (time.strftime("%H:%M:%S"), f"run started: {cycles} cycles, {perception}, belt {belt} m/s")
             )
@@ -152,6 +241,14 @@ class HmiBridge(Node):
             self.events.append((time.strftime("%H:%M:%S"), "stop requested"))
         return True, "stopping"
 
+    def estop(self):
+        """Emergency stop: stop the cycle and both belts; latched alarm until acknowledged."""
+        self.stop_run()
+        self.set_belts(0.0, 0.0)
+        with self.lock:
+            self.raise_alarm("estop", "EMERGENCY STOP: cycle and belts stopped")
+        return True, "e-stop"
+
     def snapshot(self):
         now = time.monotonic()
         with self.lock:
@@ -168,6 +265,11 @@ class HmiBridge(Node):
                 "joints": dict(self.joints),
                 "events": list(self.events)[-20:][::-1],
                 "log": list(self.proc_lines)[-12:],
+                "alarms": sorted(self.alarms.values(), key=lambda a: a["t"], reverse=True),
+                "health": {k: round(now - t, 1) for k, t in self.last_rx.items()},
+                "cpm_hist": list(self.cpm_hist),
+                "history": list(self.history)[-10:][::-1],
+                "recipe": dict(self.recipe),
             }
 
 
@@ -199,8 +301,19 @@ def build_app(bridge):
             cycles=int(body.get("cycles", 20)),
             perception=str(body.get("perception", "vision")),
             belt=float(body.get("belt", 0.10)),
+            outfeed=float(body.get("outfeed", 0.0)),
         )
         return {"ok": ok, "msg": msg}
+
+    @app.post("/api/estop")
+    async def estop():
+        ok, msg = bridge.estop()
+        return {"ok": ok, "msg": msg}
+
+    @app.post("/api/ack")
+    async def ack(body: dict):
+        bridge.ack_alarm(str(body.get("id", "all")))
+        return {"ok": True}
 
     @app.post("/api/stop")
     async def stop():

@@ -34,6 +34,13 @@ DEMO_PROFILE=fast DEMO_OUTFEED=0.06`): 7 cycles in the 40 s clip, the first four
 waits for the next tray; products land within a few mm of the pocket centre (numbers in [Benchmarks](#benchmarks)).
 The operator HMI (`http://localhost:8080`) runs alongside.
 
+| Cartons + bars, 30 products/min, two tray models on the outfeed (`tray_2x4` and the 620 mm `tray_bar_2x3`) |
+|---|
+| ![mixed demo](docs/media/demo_mixed.gif) |
+
+Same stack with `DEMO_TRAYS=tray_2x4,tray_bar_2x3 DEMO_CLASSES=product_carton,product_bar DEMO_RATE=30.0`: every
+product class goes to a fitting tray; 8/8 cycles at 4.5 mm mean during the recording, no tray disturbed.
+
 ## Quick start (native)
 
 ```bash

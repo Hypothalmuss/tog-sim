@@ -14,9 +14,11 @@ tray_vacancy_node:
     blob_min_px: 120          # smallest pocket-floor blob used for the lattice fit / the tray-model choice
 conveyor_tracker:
   ros__parameters:
+    tray_lost_s: 8.0          # s, a tray track is kept (predicted on the belt model) this long after its last
+                              # observation: the 620 mm bar tray is last seen whole at x ~0.47 and its last pocket
+                              # is placed up to 6.5 s later (at 4.0 the frame vanished mid-transfer: 2 aborts / 40)
     gate_m: 0.06              # geometric association gate (unkeyed products)
     lost_s: 2.5               # products are hidden under the arm for most of a pick
-    tray_lost_s: 4.0          # trays are hidden during a place; the frame is predicted meanwhile
     mature_alpha: 0.25        # product observation weight once a track has 10 observations
     latency_s: 0.03           # capture-to-stamp latency (vision trails ground truth by ~3 mm at 0.09 m/s)
     tool_frame: tcp           # observations within 0.30 x 0.20 m of this frame are ignored (arm over the object)

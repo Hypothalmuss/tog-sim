@@ -29,10 +29,10 @@ if [ "$mode" = vision ]; then
   wait_for 90 timeout 3 ros2 topic echo --once /togsim/pick_candidates --field frame_seq || { echo "[m4] no pick candidates"; exit 1; }
 fi
 echo "[m4] conveyor_tracker source=$mode"
-setsid ros2 run togsim_perception conveyor_tracker --ros-args --params-file "$(ros2 pkg prefix togsim_perception)/share/togsim_perception/config/perception_tuning.yaml" -p use_sim_time:=true -p source:=$mode >"$out/tracker.log" 2>&1 </dev/null &
+setsid ros2 run togsim_perception conveyor_tracker --ros-args ${M4_TRAYS:+-p tray_model:=${M4_TRAYS%%,*}} --params-file "$(ros2 pkg prefix togsim_perception)/share/togsim_perception/config/perception_tuning.yaml" -p use_sim_time:=true -p source:=$mode >"$out/tracker.log" 2>&1 </dev/null &
 wait_for 60 timeout 3 ros2 topic echo --once /togsim/tracks/products --field frame_seq || { echo "[m4] no tracks"; exit 1; }
 sleep ${M4_WARMUP:-20}
 echo "[m4] run_cycle continuous perception:=$mode cycles:=$cycles belt $speed m/s"
-timeout ${M4_TIMEOUT:-900} ros2 run togsim_task run_cycle --ros-args --params-file "$(ros2 pkg prefix togsim_task)/share/togsim_task/config/task_tuning.yaml" -p perception:=$mode ${M4_TRAYS:+-p tray_model:=${M4_TRAYS%%,*}} -p continuous:=true -p cycles:="$cycles" -p belt_speed:=$speed -p outfeed_speed:=${M4_OUTFEED:-0.0} -p use_sim_time:=true >"$out/run_cycle.log" 2>&1
+timeout ${M4_TIMEOUT:-900} ros2 run togsim_task run_cycle --ros-args --params-file "$(ros2 pkg prefix togsim_task)/share/togsim_task/config/task_tuning.yaml" -p perception:=$mode ${M4_TRAYS:+-p tray_model:=${M4_TRAYS%%,*}} -p continuous:=true -p cycles:="$cycles" ${M4_RUN_ARGS} -p belt_speed:=$speed -p outfeed_speed:=${M4_OUTFEED:-0.0} -p use_sim_time:=true >"$out/run_cycle.log" 2>&1
 grep -E "cycle [0-9]+:|finished|no seal|failed|jam" "$out/run_cycle.log" | tail -8
 echo "[m4] done -> $out"

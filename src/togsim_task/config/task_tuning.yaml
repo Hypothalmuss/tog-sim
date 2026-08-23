@@ -20,8 +20,9 @@ run_cycle:
                               # parked over the belt the arm hid products (bar recall 0.5-0.64)
     track_lag_s: 0.0          # s, place lead along the belt = belt speed x this: the measured arm trails a tracked
                               # pocket by ~2 mm at 0.05 m/s in every carton bench (0.04 would cancel it; benched as P5)
-    release_dwell_s: 0.08     # s, the cup keeps tracking the pocket this long after the release command; the vacuum
-                              # lets go 0.1-0.16 s after it, and a cup that stopped tracking leaves the product 5-10 mm
-                              # behind the pocket along the belt (the -2 mm mean / -9 mm tail of the carton benches)
+    release_dwell_s: 0.25     # s, the cup keeps tracking the pocket this long after the release command. At 0.08 the
+                              # cup stopped tracking before the product had let go and left it 5-10 mm behind the
+                              # pocket along the belt (-2 mm mean, -9 mm tail): 2x40 bench 3.7 / 8.0 mm -> 3.2 / 6.2 mm
+                              # at the same picks/min (the 0.17 s lands in the tray-supply idle time)
     # rejected on the benches (docs/benchmarks.md): leaving the place during the unseal dwell (P1c, precision),
     # outfeed 0.05 m/s (P1a, fewer trays), tray pitch 0.45 m (P1b), max motion profile (P1d, 3x jerk for no gain)

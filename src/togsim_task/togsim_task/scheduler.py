@@ -36,7 +36,7 @@ class CycleConfig:
     fits: list  # every product class a known tray takes
     park: list  # m, x y z of the park pose
     track_lag: float = 0.0  # s, the measured arm trails a tracked pocket by belt speed x this (place lead)
-    release_dwell: float = 0.08  # s, tracked dwell at the pocket after the release command (covers the unseal delay)
+    release_dwell: float = 0.25  # s, tracked dwell at the pocket after the release command (covers the unseal delay)
 
 
 def reachable(x, y, rmin=REACH_MIN, rmax=REACH_MAX):

@@ -17,9 +17,9 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 | M0 Skeleton — packages, robot description, analytical IK + tests, CI | ✅ |
 | M1 Sim cell — conveyors, products, trays, ros2_control in Gazebo Fortress | ✅ |
 | M2 First closed loop (ground-truth perception) | ✅ 12/12 GT cycles, ~32 cpm motion-only |
-| M3 Vision — synthetic data, YOLO-seg, grasp pose, tray vacancy | ✅ 600 synthetic scenes → YOLO11n-seg (mask mAP50 0.98); vs ground truth: class acc 1.00, grasp height 0.4 mm, yaw 0.8°; tray pose 4 mm / 0.05°, pocket occupancy validated (`eval_pick_poses`, `eval_tray_state`) |
-| M4 Speed & moving-tray tracking, benchmark | ✅ `conveyor_tracker` (stable product/tray tracks → TF) + `TRACK_CART` picks/places on **moving belts, no belt stops**; vision benches 95–100 % success, placement mean 4–6 mm (see Benchmarks) |
-| M5 HMI | 🟡 `togsim_hmi`: FastAPI + vanilla JS operator panel (status, belts, start/stop, tray occupancy) |
+| M3 Vision — synthetic data, YOLO-seg, grasp pose, tray vacancy | ✅ 1773 synthetic scenes (a third with bar trays) → YOLO11n-seg (mask mAP50 0.98); vs ground truth: class acc 1.00, grasp height 0.4 mm, yaw 0.8°; tray pose 4 mm / 0.05°, pocket occupancy validated (`eval_pick_poses`, `eval_tray_state`) |
+| M4 Speed & moving-tray tracking, benchmark | ✅ `conveyor_tracker` (stable product/tray tracks → TF) + `TRACK_CART` picks/places on **moving belts, no belt stops**; 120/120 cartons at 13–14.5 picks/min, placement 2.7–3.7 mm mean with 95 % CIs; bars on the 620 mm tray 4.4 mm (see Benchmarks) |
+| M5 HMI | ✅ `togsim_hmi`: FastAPI + vanilla JS operator panel - status, belts, recipes, start/stop/e-stop, alarms with acknowledge, health, run history, tray occupancy |
 | M6 Polish, teach-in, stereo stretch, Docker | ⬜ |
 
 ## Demos
@@ -85,14 +85,16 @@ moved on) and `place` (track the pocket, release, unseal) - with the run constan
 rules are in `togsim_task/scheduler.py` (unit-tested) and every ground-truth diagnostic in `togsim_task/diagnostics.py`
 (`eval:=false` for a plain demo).
 
-**Reference (3×40 cycles, cartons 60/min, `fast`, outfeed 0.06 m/s): 120/120 = 100 % [97–100], 13.4 [12.2–14.7]
-picks/min, placement 2.7 [2.4–3.0] mm mean, 5.8 [4.8–7.1] mm p95** — see the report for every configuration.
+**Reference (cartons 60/min, `fast`, outfeed 0.06 m/s, 2×40 cycles with every fix below): 80/80 = 100 % [95–100],
+13.6 [12.2–15.4] picks/min, placement 3.2 [2.8–3.7] mm mean, 6.2 [5.6–8.8] mm p95; the 3×40 baseline before the
+bar-tray work was 13.4 [12.2–14.7] picks/min, 2.7 [2.4–3.0] / 5.8 [4.8–7.1] mm** — see the report for every
+configuration and for the rejected levers.
 
-| scenario (vision) | success | cpm | placement mean | p95 | yaw |
-|---|---|---|---|---|---|
-| cartons only, 60/min, `fast` profile, belts 0.10 m/s | 20/20, 20/21 | 10–14 | 4–6 mm | 5–12 mm | ~2° |
-| bars + cartons, 24/min, `smooth` profile | 20/21, 20/24 | 5–6 (carton arrivals 12/min) | 5–6 mm | 6–20 mm | 2–3° |
-| cartons only, 60/min, `fast`, **outfeed 0.06 m/s** (`M4_OUTFEED=0.06`, `outfeed_speed` param) | 20/22, 20/20 | 10–14.5 | 2.4–3.3 mm | 6.7–6.9 mm | 1–2° |
+| scenario (vision) | success | picks/min | placement mean | p95 |
+|---|---|---|---|---|
+| cartons only, 60/min, `fast`, outfeed 0.06 m/s (2×40) | 80/80 | 13.6 [12.2–15.4] | 3.2 [2.8–3.7] mm | 6.2 [5.6–8.8] mm |
+| bars only on `tray_bar_2x3`, 30/min (12 cycles) | 12/12, no tray disturbed | 11.9 | 4.4 mm | 6.1 mm |
+| cartons + bars 30/min on `tray_2x4` + `tray_bar_2x3` (2×20) | 40/42 = 95 % [84–99] | 7.2 [5.5–9.8] (supply-bound) | 5.1 [3.6–7.0] mm | 8.7 mm |
 
 Motion profiles (`motion_profile:=fast|smooth`, `scripts/joint_metrics.py` samples `/joint_states`, cartons 60/min):
 
@@ -103,16 +105,22 @@ Motion profiles (`motion_profile:=fast|smooth`, `scripts/joint_metrics.py` sampl
 | max (`profile_max.yaml`, bench only) | 13.7 (outfeed 0.06) | 2.4 s | 63 / 55 / 95 | 1627 / 1292 / 2592 |
 
 What made the difference (details in the commit log): tracked segments settle on the *measured* arm including the
-heading, the place approach clears the pocket walls, the grasp offset is measured at the seal and compensated at the
-place, tray tracks are dead-reckoned on a shared belt-speed estimate (objects slip ~10 % on the belts) and observations
-taken while the arm is over a tray are ignored. Throughput is bounded by the tray window: a tray is placeable for
+heading, transfers clear the pocket walls by 50 mm and the cup keeps tracking the pocket until the product has let
+go, the tracker tracks the product *centre* (a suction point jumps along an elongated product between frames) and
+the settle error measured at the seal is compensated at the place, tray tracks are dead-reckoned on a shared
+belt-speed estimate (trays ride the 0.06 m/s outfeed at 0.050 m/s) and observations taken while the arm is over a
+tray are ignored; the look-ahead and the belt-time waits scale with the measured real-time factor. Throughput is bounded by the tray window: a tray is placeable for
 ~3 s of its passage at 0.10 m/s, so cycles of ~3 s allow one or two placements per tray; a slower outfeed (0.06 m/s)
-widens the window and also improves precision (last row).
+widens the window and also improves precision (the benches above run at 0.06 m/s).
 
 Several tray models can share the outfeed (`tray_models:=tray_2x4,tray_bar_2x3` on `sim_full.launch.py` and
 `perception.launch.py`): the vacancy node picks the spec per mask from the pocket size and `run_cycle` places each
-product class only into a fitting tray. The 620 mm bar tray is longer than the place camera's view, so it is only
-placeable while fully visible (partial-tray lattice pose: open item).
+product class only into a fitting tray. Bars on the 620 mm `tray_bar_2x3` place at 4.4 mm mean / 6.1 mm p95
+(12/12, no tray disturbed, 30 bars/min); the tray is placeable while fully in the place camera's view. Getting there
+took five fixes, each confirmed against ground truth (the tracker now tracks the product centre instead of a
+suction point that jumps along a bar, transfers clear the pocket walls by 50 mm, the bar pocket is sized to the
+measured spread, the tray-pose gates handle a 200 mm pitch, the spawner keeps the tray pitch above the tray
+lengths) - the story is in the Notes of [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Operator HMI (M5)
 

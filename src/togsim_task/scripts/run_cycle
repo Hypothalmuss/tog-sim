@@ -97,7 +97,7 @@ class RunCycle(Node):
         self.declare_parameter("hover", 0.03)
         self.declare_parameter("seal_timeout_s", 2.5)
         self.declare_parameter("track_lag_s", 0.0)  # s, cup behind a tracked pocket at belt speed (place x lead)
-        self.declare_parameter("release_dwell_s", 0.08)  # s, keep tracking the pocket after the release command
+        self.declare_parameter("release_dwell_s", 0.25)  # s, keep tracking the pocket after the release command
         self.declare_parameter("outfeed_speed", 0.0)  # 0 = same as belt_speed
         self.declare_parameter("belt_speed", 0.10)
         # waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for every |y| < 1.1, so anywhere else within

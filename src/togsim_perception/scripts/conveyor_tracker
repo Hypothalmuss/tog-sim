@@ -110,10 +110,14 @@ class ConveyorTracker(Node):
             if tool is not None and math.hypot(p.x - tool[0], p.y - tool[1]) < 0.12:
                 continue  # under the arm: hidden or biased
 
+            # track the product CENTRE (grasp point + centre offset): the suction point of an elongated product
+            # jumps along it from frame to frame (a ridge of equal maxima), so a track fused from grasp points is an
+            # average that the latest centre offset does not describe - the cup sealed 14-21 mm from bar centres.
+            # The published grasp point is centre - latest offset, so track + offset is the centre by construction.
             obs.append(
                 Observation(
-                    p.x,
-                    p.y,
+                    p.x + c.centre_offset.x,
+                    p.y + c.centre_offset.y,
                     p.z,
                     math.radians(c.yaw_deg),
                     c.class_name,
@@ -236,7 +240,11 @@ class ConveyorTracker(Node):
         for tr in prods:
             if tr.n_obs < 2 and self.source != "gt":
                 continue  # wait for a confirmation frame before exposing a track
-            tfs.append(self._tf(now, f"prod_{tr.id}", tr.x, tr.y, tr.z, tr.yaw))
+            # the grasp point IS the fused centre: for a box-shaped product the centre is the best suction point
+            # (on the ridge of maximal inscribed radius) and, unlike the per-frame suction point, it does not jump
+            # along an elongated product between observations (the cup chased a target moving +-20 mm along bars)
+            gx, gy = tr.x, tr.y
+            tfs.append(self._tf(now, f"prod_{tr.id}", gx, gy, tr.z, tr.yaw))
             c = PickCandidate()
             if isinstance(tr.payload, PickCandidate):
                 c = PickCandidate()
@@ -247,7 +255,7 @@ class ConveyorTracker(Node):
                     tr.payload.score,
                     tr.payload.mask_area_px,
                 )
-                c.centre_offset = tr.payload.centre_offset
+                c.centre_offset.x = c.centre_offset.y = 0.0  # the grasp point is the centre (see above)
                 # not pickable while only predicted (the product may be gone: a picked product's track lives on for
                 # lost_s) or before the heading/position have settled on a few observations
                 if tr.age(t) > 0.4 or tr.n_obs < 4:
@@ -260,7 +268,7 @@ class ConveyorTracker(Node):
             c.class_name = tr.cls
             c.grasp_pose = PoseStamped()
             c.grasp_pose.header = arr.header
-            c.grasp_pose.pose.position.x, c.grasp_pose.pose.position.y, c.grasp_pose.pose.position.z = tr.x, tr.y, tr.z
+            c.grasp_pose.pose.position.x, c.grasp_pose.pose.position.y, c.grasp_pose.pose.position.z = gx, gy, tr.z
             c.grasp_pose.pose.orientation.z, c.grasp_pose.pose.orientation.w = (
                 math.sin(tr.yaw / 2),
                 math.cos(tr.yaw / 2),

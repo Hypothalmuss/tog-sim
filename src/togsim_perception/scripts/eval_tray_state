@@ -38,6 +38,7 @@ class EvalTrayState(Node):
         self.declare_parameter("out", os.path.expanduser("~/togsim_data/eval_tray_state.json"))
         self.frames = int(self.get_parameter("frames").value)
         self.by_x = {}  # GT tray x bin -> [n, sum dx, sum dy, sum d] (vision - GT)
+        self.records = []
         cfg = yaml.safe_load(open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml"))
         self.tray = TraySpec.from_yaml(cfg, self.get_parameter("tray_model").value)
         self.lock = threading.Lock()
@@ -98,8 +99,27 @@ class EvalTrayState(Node):
                 f"tray {int(msg.tray_id)} jump {1e3 * d:.0f} mm: vision ({p.x:.3f},{p.y:.3f}) vs GT {name} ({g[0]:.3f},{g[1]:.3f})"
                 f" at {t_ns * 1e-9:.2f}"
             )
+        dyaw = math.degrees((vyaw - g[3] + math.pi / 2) % math.pi - math.pi / 2)
         self.err_xy.append(d)
-        self.err_yaw.append(abs(math.degrees((vyaw - g[3] + math.pi / 2) % math.pi - math.pi / 2)))
+        self.err_yaw.append(abs(dyaw))
+        self.records.append(  # per frame, for plots and post-mortems (vision vs GT, mm / deg)
+            {
+                "t": round(t_ns * 1e-9, 3),
+                "id": int(msg.tray_id),
+                "model": getattr(msg, "model", ""),
+                "x": round(p.x, 4),
+                "y": round(p.y, 4),
+                "yaw": round(math.degrees(vyaw), 1),
+                "gt": name,
+                "gx": round(g[0], 4),
+                "gy": round(g[1], 4),
+                "gyaw": round(math.degrees(g[3]), 1),
+                "dx_mm": round(1e3 * (p.x - g[0]), 1),
+                "dy_mm": round(1e3 * (p.y - g[1]), 1),
+                "dyaw": round(dyaw, 1),
+                "tracked": bool(getattr(msg, "tracked", True)),
+            }
+        )
         self.err_z.append(abs(p.z - g[2]))
         self.ids.setdefault(name, set()).add(int(msg.tray_id))
         # GT occupancy: a product whose origin lies in pocket k and rests at tray height
@@ -120,7 +140,9 @@ class EvalTrayState(Node):
             else:
                 self.tn += 1
         if self.n % 50 == 0:
-            self.get_logger().info(f"{self.n}/{self.frames} frames, xy {1e3 * np.mean(self.err_xy):.1f} mm")
+            self.get_logger().info(
+                f"{self.n}/{self.frames} frames, xy {1e3 * np.mean(self.err_xy):.1f} mm, yaw {np.mean(self.err_yaw):.1f} deg"
+            )
         if self.n >= self.frames:
             self.done.set()
 
@@ -148,6 +170,7 @@ class EvalTrayState(Node):
             "occupancy_accuracy": (self.tp + self.tn) / tot if tot else 0.0,
             "occupancy_confusion": {"tp": self.tp, "fp": self.fp, "fn": self.fn, "tn": self.tn},
             "ids_per_gt_tray": {k: len(v) for k, v in self.ids.items()},
+            "records": self.records,
         }
 
 

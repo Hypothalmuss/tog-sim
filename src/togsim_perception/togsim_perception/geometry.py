@@ -53,13 +53,17 @@ def median_depth(depth: np.ndarray, mask: np.ndarray, erode_px: int = 2):
     return float(np.median(vals))
 
 
-def suction_point(mask: np.ndarray):
-    """Best cup position: among the pixels with (near-)maximal inscribed-circle radius, the one closest to the
-    centroid (elongated products have a whole ridge of maxima). Returns (u, v, radius_px)."""
+def suction_point(mask: np.ndarray, prefer=None):
+    """Best cup position: among the pixels with (near-)maximal inscribed-circle radius, the one closest to `prefer`
+    (u, v) - the product centre from a source that does not share the mask's end errors, e.g. the detector's box
+    centre - or to the mask centroid (elongated products have a whole ridge of maxima). Returns (u, v, radius_px)."""
     dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
     max_val = float(dist.max())
     ys, xs = np.where(dist >= 0.95 * max_val)
-    cy, cx = np.argwhere(mask).mean(axis=0)
+    if prefer is not None:
+        cx, cy = float(prefer[0]), float(prefer[1])
+    else:
+        cy, cx = np.argwhere(mask).mean(axis=0)
     i = int(np.argmin((xs - cx) ** 2 + (ys - cy) ** 2))
     return int(xs[i]), int(ys[i]), max_val
 
@@ -165,10 +169,13 @@ def contact_depth(depth: np.ndarray, mask: np.ndarray, u: int, v: int, half: int
     return float(np.median(win)) if win.size else None
 
 
-def fit_pocket_lattice(points, offsets, init_xy, init_yaw, iters: int = 4, gate_m: float = 0.03):
-    """Fit the known pocket grid to observed pocket-floor centres (2-D Procrustes with nearest-neighbour assignment).
+def fit_pocket_lattice(points, offsets, init_xy, init_yaw, iters: int = 4, gate_m: float = 0.03, gate_xy=None):
+    """Fit the known pocket grid to observed pocket centres (2-D Procrustes with nearest-neighbour assignment).
 
-    points: (N, 2) observed pocket centres in the world, offsets: (M, 2) pocket centres in the tray frame.
+    points: (N, 2) observed pocket centres in the world (pocket floors, or products sitting in pockets), offsets:
+    (M, 2) pocket centres in the tray frame. Association gate: `gate_m` isotropic, or `gate_xy` = (gx, gy) per axis
+    in the tray frame - a lattice is only ambiguous by whole pitches, so the gate can open up to nearly half a pitch
+    per axis (a 200 x 65 mm pitch takes a 90 mm error along the tray and still none across).
     Returns (x, y, yaw, n_matched, rms_m); with fewer than 3 matches the initial pose is returned with n_matched < 3."""
     pts = np.asarray(points, dtype=float).reshape(-1, 2)
     offs = np.asarray(offsets, dtype=float).reshape(-1, 2)
@@ -178,12 +185,21 @@ def fit_pocket_lattice(points, offsets, init_xy, init_yaw, iters: int = 4, gate_
         c, s_ = math.cos(yaw), math.sin(yaw)
         pred = np.stack([x + c * offs[:, 0] - s_ * offs[:, 1], y + s_ * offs[:, 0] + c * offs[:, 1]], axis=1)
         pairs = []  # greedy unique assignment, nearest first
-        d = np.linalg.norm(pts[:, None, :] - pred[None, :, :], axis=2)
+        diff = pts[:, None, :] - pred[None, :, :]
+        d = np.linalg.norm(diff, axis=2)
+        if gate_xy is None:
+            inside = d <= gate_m
+        else:  # box gate in the tray frame
+            dx_t = c * diff[..., 0] + s_ * diff[..., 1]
+            dy_t = -s_ * diff[..., 0] + c * diff[..., 1]
+            inside = (np.abs(dx_t) <= gate_xy[0]) & (np.abs(dy_t) <= gate_xy[1])
         used_p, used_o = set(), set()
         for k in np.argsort(d, axis=None):
             i, j = divmod(int(k), len(offs))
-            if d[i, j] > gate_m:
-                break
+            if not inside[i, j]:
+                if gate_xy is None:
+                    break
+                continue
             if i in used_p or j in used_o:
                 continue
             used_p.add(i)

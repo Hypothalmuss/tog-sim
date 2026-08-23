@@ -12,6 +12,8 @@ import threading
 import time
 
 import rclpy
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -85,6 +87,15 @@ class ProductSpawner(Node):
             self.get_logger().error("ign_service_bridge not available: spawns will fail")
         self.counter = 0
         self.tray_counter = 0
+        self.last_tray_model = None
+        try:  # tray lengths: a pitch shorter than two half-trays plus a gap spawns them overlapping
+            self.tray_cfg = yaml.safe_load(
+                open(f"{get_package_share_directory('togsim_gazebo')}/config/trays.yaml")
+            ).get("trays", {})
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"trays.yaml not read ({e}): tray pitch not checked against tray lengths")
+            self.tray_cfg = {}
+        self.pitch_warned = False
         self.last_tray_x = None
         self.last_tray_t = 0.0
         self.create_sub(TFMessage, f"/world/{self.world}/pose/info", self.on_poses, 10)
@@ -178,11 +189,32 @@ class ProductSpawner(Node):
             z = 0.9
         return self.ign_create(f"model://{cls}", name, x, y, z, roll, pitch, yaw)
 
+    def tray_model(self, counter):
+        """Model of the counter-th tray: cycles through trays.models_csv, else trays.model."""
+        models = [m.strip() for m in str(self.cfg.get("trays.models_csv", "")).split(",") if m.strip()]
+        return models[(counter - 1) % len(models)] if models else self.cfg["trays.model"]
+
+    def tray_length(self, model):
+        t = self.tray_cfg.get(model)
+        return float(t["cols"] * t["pitch_x"] + 2 * t.get("margin", 0.01)) if t else 0.0
+
+    def tray_pitch(self):
+        """Centre spacing to the next tray: the configured pitch, raised to the two half lengths plus a 50 mm gap
+        (a 620 mm bar tray at the 550 mm default pitch spawned onto the previous one: merged masks, shoved trays)."""
+        pitch = float(self.cfg["trays.pitch"])
+        need = 0.5 * (self.tray_length(self.last_tray_model) + self.tray_length(self.tray_model(self.tray_counter + 1)))
+        if need > 0.0:
+            need += 0.05
+        if need > pitch and not self.pitch_warned:
+            self.pitch_warned = True
+            self.get_logger().warn(f"tray pitch {pitch:.2f} m is shorter than the trays: spacing raised to {need:.2f} m")
+        return max(pitch, need)
+
     def spawn_tray(self):
         self.tray_counter += 1
         name = f"tray_{self.tray_counter}"
-        models = [m.strip() for m in str(self.cfg.get("trays.models_csv", "")).split(",") if m.strip()]
-        model = models[(self.tray_counter - 1) % len(models)] if models else self.cfg["trays.model"]
+        model = self.tray_model(self.tray_counter)
+        self.last_tray_model = model
         return self.ign_create(
             f"model://{model}",
             name,
@@ -216,11 +248,9 @@ class ProductSpawner(Node):
             xs = [p[0] for p in trays.values()]
             last_x = min(xs) if xs else float("inf")
             speed = max(float(self.cfg["belts.outfeed_speed"]), 1e-3)
-            min_interval = float(self.cfg["trays.pitch"]) / speed  # one tray pitch of belt travel
-            if (
-                last_x - float(self.cfg["trays.spawn_x"]) >= float(self.cfg["trays.pitch"])
-                and now - self.last_tray_t >= min_interval
-            ):
+            pitch = self.tray_pitch()
+            min_interval = pitch / speed  # one tray pitch of belt travel
+            if last_x - float(self.cfg["trays.spawn_x"]) >= pitch and now - self.last_tray_t >= min_interval:
                 if self.spawn_tray():
                     self.last_tray_t = now
 

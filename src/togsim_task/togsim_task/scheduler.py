@@ -16,6 +16,7 @@ MIN_RADIUS_NOW = 0.30  # m, not folded against the base, now and at arrival
 
 # the cell's products and trays (heights: the cup contact height above the belt is product top - contact offset)
 PRODUCT_HEIGHT = {"product_bar": 0.0186, "product_carton": 0.025}
+PRODUCT_LENGTH = {"product_bar": 0.168, "product_carton": 0.07}  # m, long side
 PRODUCT_FITS = {"tray_2x4": ["product_carton"], "tray_bar_2x3": ["product_bar"]}
 BELT_Z = 0.52  # m, belt surface in the world
 
@@ -34,6 +35,8 @@ class CycleConfig:
     seal_timeout: float  # s, give the product up when the cup does not seal
     fits: list  # every product class a known tray takes
     park: list  # m, x y z of the park pose
+    track_lag: float = 0.0  # s, the measured arm trails a tracked pocket by belt speed x this (place lead)
+    release_dwell: float = 0.08  # s, tracked dwell at the pocket after the release command (covers the unseal delay)
 
 
 def reachable(x, y, rmin=REACH_MIN, rmax=REACH_MAX):

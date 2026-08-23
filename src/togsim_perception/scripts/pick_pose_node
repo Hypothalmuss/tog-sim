@@ -170,8 +170,19 @@ class PickPoseNode(Node):
             b = self.border
             if ys_.min() < b or xs_.min() < b or ys_.max() >= mask.shape[0] - b or xs_.max() >= mask.shape[1] - b:
                 continue  # partially outside the image: centroid, axis and suction point would be wrong
-            su, sv, r_px = suction_point(mask)
             cu, cv_, ang, long_px, short_px = principal_axis(mask)
+            # product centre: the detector's box centre - a rectangle's bounding box is centred on it at any yaw and
+            # the box does not inherit the mask's end errors (a thin bar's mask is often 20-40 mm short at an end,
+            # which moved the rectangle centre, and with it the suction point, 10-20 mm along the bar: the cup then
+            # sealed 21 mm from the centre on average). The mask rectangle is the fallback when the two disagree.
+            # The rectangle is still the better source ACROSS the axis (a truncated end does not move it), the box
+            # along it: take the box centre's along-axis component only.
+            bc = d.bbox.center.position
+            ax_, ay_ = math.cos(ang), math.sin(ang)
+            along = (float(bc.x) - cu) * ax_ + (float(bc.y) - cv_) * ay_
+            if abs(along) < 0.035 / max(z / self.k[0, 0], 1e-6):
+                cu, cv_ = cu + along * ax_, cv_ + along * ay_
+            su, sv, r_px = suction_point(mask, prefer=(cu, cv_))
             gsd = gsd_cache.setdefault(round(z, 2), z / self.k[0, 0])  # m per px at this depth
             margin_mm = (r_px * gsd - self.cup_r) * 1000.0
             # 3D suction point in world

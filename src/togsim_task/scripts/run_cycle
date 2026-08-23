@@ -31,6 +31,7 @@ from togsim_task.scheduler import (
     BELT_Z,
     PRODUCT_FITS,
     PRODUCT_HEIGHT,
+    PRODUCT_LENGTH,
     REACH_MAX,
     REACH_MIN,
     CycleConfig,
@@ -95,6 +96,8 @@ class RunCycle(Node):
         self.declare_parameter("pick_x_max", 0.50)
         self.declare_parameter("hover", 0.03)
         self.declare_parameter("seal_timeout_s", 2.5)
+        self.declare_parameter("track_lag_s", 0.0)  # s, cup behind a tracked pocket at belt speed (place x lead)
+        self.declare_parameter("release_dwell_s", 0.08)  # s, keep tracking the pocket after the release command
         self.declare_parameter("outfeed_speed", 0.0)  # 0 = same as belt_speed
         self.declare_parameter("belt_speed", 0.10)
         # waiting pose behind the base: both cameras cover x in [-0.08, 0.78] for every |y| < 1.1, so anywhere else within
@@ -431,6 +434,8 @@ class RunCycle(Node):
             seal_budget=max(0.8, float(p("track_dwell_s").value) * 3.0),  # the place goal preempts on seal
             contact=float(p("contact_offset_m").value),
             seal_timeout=float(p("seal_timeout_s").value),
+            track_lag=float(p("track_lag_s").value),
+            release_dwell=float(p("release_dwell_s").value),
             fits=sorted({cls for name in PRODUCT_FITS for cls in PRODUCT_FITS[name]}),  # any class a known tray takes
             park=[float(v) for v in p("park").value],
         )
@@ -640,16 +645,20 @@ class RunCycle(Node):
         tp = self.track_pose(c.tid)
         fk = self.fk_xy()
         if tp is not None and fk is not None:
-            # the cup seals a few mm off the product centre (settle tolerance, tracker error, prediction during
-            # the occluded descent): measure it from the tracked centre and the cup (FK) and let the place
-            # compensate the measured offset instead of the vision estimate
+            # the track is the grasp point (suction point), `c.off` the product centre relative to it (vision); the
+            # cup seals a few mm off the grasp point too (settle tolerance, tracker error, prediction during the
+            # occluded descent), measured here from the track and the cup (FK). The place compensates the sum:
+            # centre - cup = (centre - grasp point) + (grasp point - cup). Replacing the first by the second was
+            # invisible on cartons (suction point ~ centre) and put bars 30-50 mm off along their length.
             off_meas = (tp.x - fk[0], tp.y - fk[1])
             if math.hypot(*off_meas) < 0.03:
+                total = (c.off[0] + off_meas[0], c.off[1] + off_meas[1])
                 self.get_logger().info(
-                    f"grasp offset measured ({1e3 * off_meas[0]:+.0f},{1e3 * off_meas[1]:+.0f}) mm"
-                    f" (vision estimate ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) mm)"
+                    f"grasp offset: centre-grasp (vision) ({1e3 * c.off[0]:+.0f},{1e3 * c.off[1]:+.0f}) + grasp-cup"
+                    f" (measured) ({1e3 * off_meas[0]:+.0f},{1e3 * off_meas[1]:+.0f}) = ({1e3 * total[0]:+.0f},"
+                    f"{1e3 * total[1]:+.0f}) mm"
                 )
-                c.off = off_meas
+                c.off = total
         self.psi_seal = self.cup_yaw()
         self.gteval.log_grasp_offset(c, held, tp, self.psi_seal)  # diagnostic (GT): where the cup really sealed
         return True, held
@@ -705,7 +714,7 @@ class RunCycle(Node):
         spec = tray.spec or self.tray
         ox, oy = spec.pocket_offset(pocket)
         self.get_logger().info(
-            f"place decision {c.key} -> {tray.key}[{pocket}]: tray x {tray.x:.2f}, occupied"
+            f"place decision {c.key} -> {tray.key}[{pocket}]: tray x {tray.x:.2f} z {tray.z:.3f} yaw {math.degrees(tray.yaw):+.0f}, occupied"
             f" {''.join('x' if v else '.' for v in tray.occupied)}{self.gteval.tray_frame_detail(tray)}"
         )
         cur = self.cup_yaw()
@@ -714,15 +723,24 @@ class RunCycle(Node):
         sgn = round(math.cos(bq - c.bp))  # +-1: the product frame relative to the tray frame once placed
         cp, sp = math.cos(-c.yaw), math.sin(-c.yaw)
         offx, offy = cp * c.off[0] - sp * c.off[1], sp * c.off[0] + cp * c.off[1]
-        if math.hypot(offx, offy) < 0.03:  # sanity: a bigger "offset" is a bad mask, not a real grasp offset
+        # sanity: the centre can be at most half the product length from the suction point; beyond that the offset
+        # comes from a bad mask, not from the grasp
+        if math.hypot(offx, offy) < 0.5 * PRODUCT_LENGTH.get(c.cls, 0.07) + 0.01:
             ox, oy = ox - sgn * offx, oy - sgn * offy
+        if self.cfg.track_lag > 0.0:
+            # the measured arm trails the tracked pocket by belt speed x servo lag (~2 mm at 0.05 m/s in every carton
+            # bench): aim that much ahead along the belt, expressed in the tray frame
+            lead_m = tray.vx * self.cfg.track_lag
+            ox, oy = ox + math.cos(tray.yaw) * lead_m, oy - math.sin(tray.yaw) * lead_m
         # release 10 mm above the pocket floor: the pocket walls (25 mm) still guide the product, and with 5 mm of
         # clearance per side a cup that is a few mm off would otherwise press the product onto a wall and drag the
         # tray along the belt
         z_place = spec.base_thickness + h + 0.010
         # the product hangs below the cup: approach above the pocket walls (flying to a far pocket crosses the
         # others), then descend vertically in the tray frame. Clipping a wall at belt speed throws the tray.
-        z_clear = spec.base_thickness + spec.pocket_depth + 0.02 + h
+        # 50 mm: the blended fly-through arrives ~20 mm short in z when a long product crosses the near wall (GT tool
+        # pose at the shoves: bar bottom 3 mm below the wall top with the 20 mm figure), and a clipped wall drags the tray
+        z_clear = spec.base_thickness + spec.pocket_depth + 0.05 + h
         rel = {"t": None}
 
         def on_fb_place(fb, n=3):
@@ -737,7 +755,11 @@ class RunCycle(Node):
             seg(MotionSegment.TRACK_CART, ox, oy, z_clear, bq, tracked=tframe),
             # 3.5 mm on the measured arm: the steady command-measured lag while tracking is ~2 mm, a 2.5 mm
             # tolerance hovered at the threshold for a second
-            seg(MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=0.08, tracked=tframe, settle=0.0035),
+            # the dwell keeps the cup tracking the pocket while the vacuum lets go (0.1-0.16 s after the command): a
+            # cup that stops tracking before the unseal leaves the product 5-10 mm behind the pocket along the belt
+            seg(
+                MotionSegment.TRACK_CART, ox, oy, z_place, bq, dwell=self.cfg.release_dwell, tracked=tframe, settle=0.0035
+            ),
         ]
         t_place0 = time.monotonic()
         ghp = self.send_goal(place, f"place {c.key} -> {tray.key}[{pocket}]", on_feedback=on_fb_place)

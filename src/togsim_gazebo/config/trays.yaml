@@ -25,13 +25,16 @@ trays:
     mass: 0.35
     label: 3
   # bar tray: 2 rows x 3 columns, bars lie along x (168 x 42 mm)
+  # pocket clearance sized to the placement spread measured on bars (p95 ~10 mm across, yaw 2.6 deg at the ends):
+  # 11 mm per end, 10 mm per side; with 6 mm per side (pocket 186 x 54) one bar in four caught a wall during the
+  # tracked descent and the arm dragged the tray
   tray_bar_2x3:
     rows: 2
     cols: 3
     pitch_x: 0.200
-    pitch_y: 0.065
-    pocket_x: 0.186
-    pocket_y: 0.054
+    pitch_y: 0.072
+    pocket_x: 0.190
+    pocket_y: 0.062
     pocket_depth: 0.025
     wall: 0.004
     base_thickness: 0.010

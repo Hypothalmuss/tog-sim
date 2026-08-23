@@ -148,3 +148,34 @@ def test_fit_pocket_lattice_keeps_the_initial_yaw_branch():
     x, y, yaw, n, _ = fit_pocket_lattice(pts, offs, (tx, ty), tyaw + math.pi)
     assert n == 8 and abs(x - tx) < 1e-6 and abs(y - ty) < 1e-6
     assert abs(((yaw - (tyaw + math.pi) + math.pi) % (2 * math.pi)) - math.pi) < math.radians(1)
+
+
+def test_fit_pocket_lattice_per_axis_gate_takes_a_large_error_along_a_long_pitch():
+    # a 2x3 bar tray (200 x 65 mm pitch): the mask centroid of a long tray can be 60 mm off along it; the isotropic
+    # 30 mm gate finds no pocket, the per-axis gate (0.45 pitch) recovers the pose and still refuses a lateral error
+    rows, cols, px, py = 2, 3, 0.200, 0.065
+    offs = [
+        (-cols * px / 2 + (c + 0.5) * px, -rows * py / 2 + (r + 0.5) * py) for r in range(rows) for c in range(cols)
+    ]
+    tx, ty, tyaw = 0.26, -0.45, math.radians(2.0)
+    cy, sy = math.cos(tyaw), math.sin(tyaw)
+    pts = [(tx + cy * ox - sy * oy, ty + sy * ox + cy * oy) for ox, oy in offs]
+    gate = (0.45 * px, 0.45 * py)
+    x, y, yaw, n, rms = fit_pocket_lattice(pts, offs, (tx + 0.060, ty + 0.004), tyaw, gate_xy=gate)
+    assert n == 6 and abs(x - tx) < 0.002 and abs(y - ty) < 0.002 and rms < 0.002
+    _x, _y, _yaw, n_iso, _rms = fit_pocket_lattice(pts, offs, (tx + 0.060, ty + 0.004), tyaw)
+    assert n_iso < 3
+    # across the tray the gate is below half the short pitch: an error inside it snaps to the right row (beyond it
+    # any lattice fit is ambiguous, which is why the mask centroid anchors the fit and the node gates the correction)
+    _x, y_lat, _yaw, n_lat, _rms = fit_pocket_lattice(pts, offs, (tx, ty + 0.025), tyaw, gate_xy=gate)
+    assert n_lat == 6 and abs(y_lat - ty) < 0.002
+
+
+def test_suction_point_prefers_the_given_centre_on_a_ridge():
+    # a bar mask truncated at one end: its centroid is off the true centre; with the detector's box centre preferred,
+    # the suction point sits at the true centre instead of following the centroid
+    mask = np.zeros((100, 200), bool)
+    mask[45:56, 40:121] = True  # visible part of a bar whose true extent is u=40..160 (true centre u=100)
+    u0, _v0, _r = suction_point(mask)
+    u1, v1, _r = suction_point(mask, prefer=(100.0, 50.0))
+    assert abs(u0 - 80) <= 2 and abs(u1 - 100) <= 2 and v1 == 50

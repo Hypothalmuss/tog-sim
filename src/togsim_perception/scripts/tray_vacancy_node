@@ -223,6 +223,27 @@ class TrayVacancyNode(Node):
             # half hidden by the arm, gave poses up to 180 mm off with the axis flipped by 90 deg
             gsd = z_floor / self.k[0, 0]
             cu, cv_, ang, long_px, short_px = principal_axis(m)
+            # the products that sit on this tray: inside the mask's rectangle (a little dilated). Only those count
+            # for the visibility (every product on the infeed used to count, so a tray half hidden by the arm passed
+            # the gate) and their centres are pocket centres for the lattice fit, which the floors alone lose as the
+            # tray fills (a 2x3 tray has 5 floors after one placement)
+            rect = cv2.minAreaRect(cv2.findNonZero(m.astype(np.uint8)))
+            box = cv2.boxPoints((rect[0], (rect[1][0] + 16, rect[1][1] + 16), rect[2]))
+            region = np.zeros(inst_map.shape, np.uint8)
+            cv2.fillPoly(region, [np.round(box).astype(np.int32).reshape(-1, 1, 2)], 1)
+            on_tray = product_mask & region.astype(bool)
+            prod_pts = []
+            n_pc, _pl, pstats, pcents = cv2.connectedComponentsWithStats(on_tray.astype(np.uint8), connectivity=4)
+            for k in range(1, n_pc):
+                if pstats[k, cv2.CC_STAT_AREA] < self.tune["blob_min_px"]:
+                    continue
+                comp = _pl == k
+                z_p = median_depth(depth, comp, erode_px=1)
+                if z_p is None:
+                    continue
+                # back-projected at the product's own depth: its top centre is vertically above the pocket centre
+                pw = transform_points(pixel_to_point(pcents[k][0], pcents[k][1], z_p, self.k)[None, :], rot, trans)[0]
+                prod_pts.append((pw[0], pw[1]))
             # pocket floors: blobs at the floor depth separated by the (closer) walls. Computed before the spec choice
             # because the pocket size tells the tray model apart even on a partial mask (a 620 mm bar tray is never
             # fully in view and its visible part has the extents of the carton tray)
@@ -248,7 +269,8 @@ class TrayVacancyNode(Node):
                 )
             expected_px = (sp["total"][0] * sp["total"][1]) / (gsd * gsd)
             # 95 %: at 80 % visible the centroid of the visible part is already ~35 mm off the tray centre
-            full = (not partial) and (m | product_mask).sum() >= self.tune["visibility_min"] * expected_px
+            visible = (m | on_tray).sum() / expected_px
+            full = (not partial) and visible >= self.tune["visibility_min"]
             if not full:
                 continue
             p_cam = pixel_to_point(cu, cv_, z_floor, self.k)
@@ -265,14 +287,31 @@ class TrayVacancyNode(Node):
                 yaw += math.pi
             # refine: the pocket floors are blobs at the floor depth separated by the (closer) walls; fitting the known
             # pocket grid to their centres gives the tray pose from the pockets themselves, not from the mask outline
-            fx, fy, fyaw, n_fit, rms_fit = fit_pocket_lattice(blobs, sp["pocket_offsets"], (p_w[0], p_w[1]), yaw)
-            # the lattice is periodic: a fit shifted by a pitch looks just as good, so the mask pose anchors it - accept
-            # only a small correction of a fully visible tray with most pockets matched
+            # the lattice is periodic: a fit shifted by a pitch looks just as good, so the mask pose anchors it and the
+            # gates stay below half a pitch per axis (lattice_gate_m across the tray, up to 0.45 pitch along it: the
+            # mask centroid of a long tray is the less certain along its length)
+            gate_xy = (
+                max(self.tune["lattice_gate_m"], 0.45 * sp["pitch"][0]),
+                min(self.tune["lattice_gate_m"], 0.45 * sp["pitch"][1]),
+            )
+            # pocket floors are exact lattice points; a product in a pocket sits up to the clearance off its centre,
+            # so products only complete the fit when the floors alone are too few (a filling 2x3 tray)
+            min_fit = min(self.tune["lattice_min_fit"], len(sp["pocket_offsets"]) - 1)
+            pts = blobs if len(blobs) >= min_fit else blobs + prod_pts
+            fx, fy, fyaw, n_fit, rms_fit = fit_pocket_lattice(
+                pts, sp["pocket_offsets"], (p_w[0], p_w[1]), yaw, gate_xy=gate_xy
+            )
+            cy_, sy_ = math.cos(yaw), math.sin(yaw)
+            corr_t = (
+                cy_ * (fx - p_w[0]) + sy_ * (fy - p_w[1]),
+                -sy_ * (fx - p_w[0]) + cy_ * (fy - p_w[1]),
+            )  # correction in the tray frame
             if (
                 not partial
-                and n_fit >= self.tune["lattice_min_fit"]
+                and n_fit >= min_fit
                 and rms_fit < self.tune["lattice_rms_max"]
-                and math.hypot(fx - p_w[0], fy - p_w[1]) < self.tune["lattice_gate_m"]
+                and abs(corr_t[0]) < gate_xy[0]
+                and abs(corr_t[1]) < gate_xy[1]
             ):
                 # apply the correction through a per-track EMA so the pose does not jump between frames where the fit is
                 # accepted and frames where it is not (jumps spawn new track ids and break the tray_<id> frame mid-place)
@@ -353,7 +392,7 @@ class TrayVacancyNode(Node):
             self.pub.publish(msg)
             self.get_logger().debug(
                 f"tray obs id {tid} ({p_w[0]:.3f},{p_w[1]:.3f}) yaw {math.degrees(yaw):+.0f} vis"
-                f" {(m | product_mask).sum() / expected_px:.2f} fit n={n_fit} rms={1e3 * rms_fit:.1f}"
+                f" {visible:.2f} fit n={n_fit}/{len(blobs)}+{len(prod_pts)} rms={1e3 * rms_fit:.1f}"
                 f" corr=({1e3 * self.corr.get(tid, (0, 0, 0))[0]:+.0f},{1e3 * self.corr.get(tid, (0, 0, 0))[1]:+.0f}) t {stamp_s:.2f}"
             )
             if dbg is not None:

@@ -54,9 +54,12 @@ class GroundTruthEval:
                     tr, q = t.transform.translation, t.transform.rotation
                     prev = self.gt.get(n)
                     if n.startswith("tray_") and prev is not None and abs(tr.y - prev[0][1]) > 0.01:
+                        tool = next(iter(self.gt_tool.values()), None)  # where the tool was when the tray moved
+                        tool_txt = "" if tool is None else f", tool at ({tool[0]:.3f},{tool[1]:.3f},{tool[2]:.3f})"
                         self.get_logger().warn(
-                            f"{n} shoved: y {prev[0][1]:.3f} -> {tr.y:.3f} at x {tr.x:.3f}, sim {self.sim_now():.2f},"
-                            f" during '{self.cur_goal}'"
+                            f"{n} shoved: y {prev[0][1]:.3f} -> {tr.y:.3f} at x {tr.x:.3f} z {tr.z:.3f}, sim"
+                            f" {self.sim_now():.2f}, during '{self.cur_goal}'{tool_txt},"
+                            f" vacuum holds '{self.vac_attached}'"
                         )
                     self.gt[n] = ((tr.x, tr.y, tr.z), yaw_of(q), tilt_of(q), now)
                     if n.startswith("tray_"):
